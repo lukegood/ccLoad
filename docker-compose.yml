@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   ccload:
-    image: ghcr.io/caidaoli/ccload:latest
+    image: docker.cnb.cool/linuxmore/ccload-diy:master-diy
     container_name: ccload
     user: root
     restart: unless-stopped
