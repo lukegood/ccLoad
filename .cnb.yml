@@ -1,0 +1,28 @@
+master-diy:
+  push:
+    - name: ccLoad image
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 8
+
+      services:
+        - docker
+
+      stages:
+        - name: Build and publish image
+          script: |
+            set -eu
+
+            IMAGE="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+
+            echo "Building ${IMAGE}:${CNB_COMMIT_SHORT}"
+
+            docker buildx build \
+              --progress=plain \
+              --platform linux/amd64,linux/arm64 \
+              --build-arg "VERSION=${CNB_COMMIT_SHORT}" \
+              --build-arg "COMMIT=${CNB_COMMIT}" \
+              -t "${IMAGE}:${CNB_COMMIT_SHORT}" \
+              -t "${IMAGE}:master-diy" \
+              --push \
+              .

@@ -1,0 +1,34 @@
+name: Sync to CNB
+
+on:
+  push:
+    branches:
+      - master-diy
+    tags:
+      - "v*"
+
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync to CNB
+        uses: docker://tencentcom/git-sync
+        env:
+          PLUGIN_TARGET_URL: "https://cnb.cool/linuxmore/ccload-diy"
+          PLUGIN_AUTH_TYPE: "https"
+          PLUGIN_USERNAME: "cnb"
+          PLUGIN_PASSWORD: ${{ secrets.CNB_TOKEN }}
+
+          # Only maintain master-diy as the synchronized branch.
+          PLUGIN_BRANCH: "master-diy"
+
+          # Tags are required for CNB tag_push pipelines.
+          PLUGIN_PUSH_TAGS: "true"
