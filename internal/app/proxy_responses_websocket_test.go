@@ -2569,7 +2569,8 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 				t.Errorf("native upstream %s=%q, want %q; headers=%v", name, got, want, r.Header)
 			}
 		}
-		for _, name := range []string{"Accept", "Content-Type", "X-Arbitrary-Client", "X-Forwarded-For"} {
+		// responses-lite 在 WebSocket 上只走 client_metadata，握手不带 HTTP 头。
+		for _, name := range []string{"Accept", "Content-Type", "X-Arbitrary-Client", "X-Forwarded-For", "X-Openai-Internal-Codex-Responses-Lite"} {
 			if got := r.Header.Get(name); got != "" {
 				t.Errorf("native upstream unexpected %s=%q; headers=%v", name, got, r.Header)
 			}
@@ -2623,20 +2624,21 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 		env.engine,
 		"test-api-key",
 		http.Header{
-			"Content-Type":                          []string{"text/plain"},
-			"OpenAI-Beta":                           []string{"other-feature"},
-			"Originator":                            []string{"client-attacker"},
-			"Session-Id":                            []string{"ws-session"},
-			"Thread-Id":                             []string{"worker-thread"},
-			"User-Agent":                            []string{"client-attacker"},
-			"Version":                               []string{"1.2.3"},
-			"X-Arbitrary-Client":                    []string{"drop-me"},
-			"X-Client-Request-Id":                   []string{"request-1"},
-			"X-Codex-Beta-Features":                 []string{"feature-1"},
-			"X-Codex-Turn-Metadata":                 []string{`{"turn_id":"turn-1"}`},
-			"X-Codex-Turn-State":                    []string{"turn-state-1"},
-			"X-Forwarded-For":                       []string{"203.0.113.10"},
-			"X-ResponsesAPI-Include-Timing-Metrics": []string{"true"},
+			"Content-Type":                           []string{"text/plain"},
+			"OpenAI-Beta":                            []string{"other-feature"},
+			"Originator":                             []string{"client-attacker"},
+			"Session-Id":                             []string{"ws-session"},
+			"Thread-Id":                              []string{"worker-thread"},
+			"User-Agent":                             []string{"client-attacker"},
+			"Version":                                []string{"1.2.3"},
+			"X-Arbitrary-Client":                     []string{"drop-me"},
+			"X-Client-Request-Id":                    []string{"request-1"},
+			"X-Codex-Beta-Features":                  []string{"feature-1"},
+			"X-Codex-Turn-Metadata":                  []string{`{"turn_id":"turn-1"}`},
+			"X-Codex-Turn-State":                     []string{"turn-state-1"},
+			"X-Forwarded-For":                        []string{"203.0.113.10"},
+			"X-Openai-Internal-Codex-Responses-Lite": []string{"true"},
+			"X-ResponsesAPI-Include-Timing-Metrics":  []string{"true"},
 		},
 	)
 	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -2676,6 +2678,11 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 	if !ok || len(secondInput) != 1 {
 		t.Fatalf("native incremental input=%#v, want only the current turn", second["input"])
 	}
+	// 握手头上的 lite 信号转成每个请求的 client_metadata。
+	secondMetadata, _ := second["client_metadata"].(map[string]any)
+	if secondMetadata["ws_request_header_x_openai_internal_codex_responses_lite"] != "true" {
+		t.Fatalf("native incremental client_metadata=%#v, want responses-lite key", second["client_metadata"])
+	}
 	if second["previous_response_id"] != "resp-native-1" {
 		t.Fatalf("native previous_response_id=%#v, want resp-native-1", second["previous_response_id"])
 	}
@@ -2699,7 +2706,7 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 			t.Errorf("Codex identity headers = %v", r.Header)
 		}
 		if got := r.Header.Get("Version"); got != "" {
-			t.Errorf("Version = %q, want absent for official client without Version", got)
+			t.Errorf("Version = %q, want absent like the client", got)
 		}
 		if got := r.Header.Get("X-Codex-Window-Id"); got != "" {
 			t.Errorf("X-Codex-Window-Id = %q, want omitted from native WebSocket", got)
@@ -2748,7 +2755,7 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 	downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
 		"User-Agent":        {clientUserAgent},
 		"Originator":        {"codex-tui"},
-		"X-Codex-Window-Id": {"client-thread:0"},
+		"X-Codex-Window-Id": {"019a3c5e-7f21-7c3a-9b4d-2f6e8a1c0d11:0"},
 	})
 	if err := downstream.WriteJSON(map[string]any{
 		"type": "response.create", "model": "gpt-test",
@@ -2777,6 +2784,226 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 	if err != nil || persistedCredential.PassiveUsage == nil || len(persistedCredential.PassiveUsage.Windows) != 1 ||
 		persistedCredential.PassiveUsage.Windows[0].UsedPercent != 25 {
 		t.Fatalf("persisted Codex WebSocket quota = (%#v, %v)", persistedCredential, err)
+	}
+}
+
+func TestNativeCodexWebsocketScopesTurnStateToIssuingAccount(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	echoed := make(chan gjson.Result, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade upstream websocket: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		for {
+			_, payload, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			echoed <- gjson.GetBytes(payload, "client_metadata.x-codex-turn-state")
+			_ = conn.WriteJSON(map[string]any{
+				"type":    "codex.response.metadata",
+				"headers": map[string]any{"x-codex-turn-state": "state-ws"},
+			})
+			_ = conn.WriteJSON(map[string]any{
+				"type": "response.metadata",
+				"headers": map[string]any{
+					"x-codex-turn-state": "state-lower",
+					"X-Codex-Turn-State": "state-upper",
+					"X-CODEX-TURN-STATE": []any{[]any{"state-array"}, "state-ignored"},
+				},
+			})
+			_ = conn.WriteJSON(map[string]any{
+				"type": "response.completed",
+				"response": map[string]any{
+					"id": "resp-turn-state", "output": []any{},
+					"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+				},
+			})
+		}
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "native-codex-turn-state", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", authType: model.AuthTypeCodexOAuth,
+		oauthCredential: codexProxyTestCredential(t, "at-turn-state", "rt-turn-state", "account-turn-state"), priority: 100,
+	}}, map[int]string{0: upstream.URL})
+	downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", nil)
+	send := func(turnState string) gjson.Result {
+		t.Helper()
+		request := map[string]any{
+			"type": "response.create", "model": "gpt-test",
+			"input": []any{map[string]any{"role": "user", "content": "hello"}},
+		}
+		if turnState != "" {
+			request["client_metadata"] = map[string]any{"x-codex-turn-state": turnState}
+		}
+		if err := downstream.WriteJSON(request); err != nil {
+			t.Fatalf("write downstream request: %v", err)
+		}
+		readWebsocketUntilType(t, downstream, "response.completed")
+		return <-echoed
+	}
+
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "hello"}},
+	}); err != nil {
+		t.Fatalf("write downstream request: %v", err)
+	}
+	metadata := readWebsocketUntilType(t, downstream, "codex.response.metadata")
+	headers, _ := metadata["headers"].(map[string]any)
+	tagged, _ := headers["x-codex-turn-state"].(string)
+	if tagged == "state-ws" || !strings.HasSuffix(tagged, "state-ws") {
+		t.Fatalf("relayed metadata turn-state = %q, want account-tagged state-ws", tagged)
+	}
+	metadata = readWebsocketUntilType(t, downstream, "response.metadata")
+	headers, _ = metadata["headers"].(map[string]any)
+	array, _ := headers["X-CODEX-TURN-STATE"].([]any)
+	if len(array) != 2 {
+		t.Fatalf("relayed metadata array = %#v, want two elements", array)
+	}
+	nested, _ := array[0].([]any)
+	if len(nested) != 1 {
+		t.Fatalf("relayed metadata nested array = %#v, want one element", nested)
+	}
+	for _, tc := range []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{name: "lowercase", value: headers["x-codex-turn-state"], want: "state-lower"},
+		{name: "mixed case", value: headers["X-Codex-Turn-State"], want: "state-upper"},
+		{name: "nested array first element", value: nested[0], want: "state-array"},
+	} {
+		value, _ := tc.value.(string)
+		if !strings.HasPrefix(value, "ccl1.") || !strings.HasSuffix(value, "."+tc.want) {
+			t.Errorf("%s turn-state = %q, want account-tagged %s", tc.name, value, tc.want)
+		}
+	}
+	if array[1] != "state-ignored" {
+		t.Errorf("non-first array value = %#v, want unchanged", array[1])
+	}
+	readWebsocketUntilType(t, downstream, "response.completed")
+	if first := <-echoed; first.Exists() {
+		t.Fatalf("first request echoed turn-state %q", first.String())
+	}
+
+	if got := send(tagged); got.String() != "state-ws" {
+		t.Fatalf("issuing account received turn-state %q, want original state-ws", got.Raw)
+	}
+	upperTagged, _ := headers["X-Codex-Turn-State"].(string)
+	if got := send(upperTagged); got.String() != "state-upper" {
+		t.Fatalf("issuing account received mixed-case turn-state %q, want original state-upper", got.Raw)
+	}
+	arrayTagged, _ := nested[0].(string)
+	if got := send(arrayTagged); got.String() != "state-array" {
+		t.Fatalf("issuing account received array turn-state %q, want original state-array", got.Raw)
+	}
+	if got := send("ccl1.0123456789abcdef.state-other"); got.Exists() {
+		t.Fatalf("other account's turn-state reached upstream as %q", got.Raw)
+	}
+	if got := send("untagged-state"); got.String() != "untagged-state" {
+		t.Fatalf("untagged turn-state reached upstream as %q, want unchanged", got.Raw)
+	}
+}
+
+// HTTP 客户端只从响应头取 turn-state；HTTP 续写重拨原生 WS 时，握手头里的令牌
+// 必须经合成响应带标签回到 HTTP 响应头。
+func TestHTTPResponsesTagsNativeCodexWebsocketHandshakeTurnState(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	completeTurn := func(conn *websocket.Conn, responseID string) {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			t.Errorf("read %s request: %v", responseID, err)
+			return
+		}
+		if err := conn.WriteJSON(map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": responseID, "output": []any{},
+				"usage": map[string]any{"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+			},
+		}); err != nil {
+			t.Errorf("write %s completion: %v", responseID, err)
+		}
+	}
+	serveWebsocket := func(responseID string, handshakeHeader http.Header, handshakes *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !websocket.IsWebSocketUpgrade(r) {
+				t.Errorf("%s upstream received HTTP request, want native websocket", responseID)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			conn, err := upgrader.Upgrade(w, r, handshakeHeader)
+			if err != nil {
+				t.Errorf("upgrade %s websocket: %v", responseID, err)
+				return
+			}
+			defer func() { _ = conn.Close() }()
+			handshakes.Add(1)
+			completeTurn(conn, responseID)
+			_, _, _ = conn.ReadMessage()
+		}))
+	}
+	var firstHandshakes, secondHandshakes atomic.Int32
+	first := serveWebsocket("resp-handshake-1", nil, &firstHandshakes)
+	defer first.Close()
+	second := serveWebsocket("resp-handshake-2", http.Header{"X-Codex-Turn-State": []string{"state-handshake"}}, &secondHandshakes)
+	defer second.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "handshake-first", upstreamProtocol: "codex", websockets: true, models: "gpt-test", priority: 100},
+		{
+			name: "handshake-oauth", upstreamProtocol: "codex", websockets: true, models: "gpt-test", priority: 90,
+			authType:        model.AuthTypeCodexOAuth,
+			oauthCredential: codexProxyTestCredential(t, "at-handshake", "rt-handshake", "account-handshake"),
+		},
+	}, map[int]string{0: first.URL, 1: second.URL})
+
+	downstream := dialResponsesWebsocketWithSessionID(t, env.engine, "handshake-turn-state")
+	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set handshake downstream deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "one"}},
+	}); err != nil {
+		t.Fatalf("write first handshake turn: %v", err)
+	}
+	readWebsocketUntilType(t, downstream, "response.completed")
+	_ = downstream.Close()
+
+	// 停用首个渠道：HTTP 续写仍挂着已建立的上游 WS，但目标换成 OAuth 渠道，必须重拨。
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil {
+		t.Fatalf("list handshake channels: %v", err)
+	}
+	for _, cfg := range configs {
+		if cfg.Name == "handshake-first" {
+			cfg.Enabled = false
+			if _, err := env.store.UpdateConfig(context.Background(), cfg.ID, cfg); err != nil {
+				t.Fatalf("disable first handshake channel: %v", err)
+			}
+		}
+	}
+	env.server.InvalidateChannelListCache()
+
+	response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+		"model": "gpt-test", "stream": true, "previous_response_id": "resp-handshake-1",
+		"input": []any{map[string]any{"role": "user", "content": "two"}},
+	}, map[string]string{"Session-Id": "handshake-turn-state"})
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "resp-handshake-2") {
+		t.Fatalf("HTTP continuation status=%d body=%s", response.Code, response.Body.String())
+	}
+	if firstHandshakes.Load() != 1 || secondHandshakes.Load() != 1 {
+		t.Fatalf("handshakes first=%d second=%d, want 1/1", firstHandshakes.Load(), secondHandshakes.Load())
+	}
+	tagged := response.Header().Get("X-Codex-Turn-State")
+	if !strings.HasPrefix(tagged, "ccl1.") || !strings.HasSuffix(tagged, ".state-handshake") {
+		t.Fatalf("HTTP turn-state header = %q, want account-tagged state-handshake", tagged)
 	}
 }
 
@@ -2825,7 +3052,7 @@ func TestNativeCodexWebsocketWindowHeaderRules(t *testing.T) {
 				customRequestRules: &model.CustomRequestRules{Headers: rules},
 			}}, map[int]string{0: upstream.URL})
 			downstream := dialResponsesWebsocketWithTokenAndHeaders(t, env.engine, "test-api-key", http.Header{
-				"X-Codex-Window-Id": {"client-thread:0"},
+				"X-Codex-Window-Id": {"019a3c5e-7f21-7c3a-9b4d-2f6e8a1c0d11:0"},
 			})
 			if err := downstream.WriteJSON(map[string]any{
 				"type": "response.create", "model": "gpt-test", "input": []any{},
@@ -5945,10 +6172,15 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 		if got := r.Header.Get("X-Codex-Turn-State"); got != "turn-state" {
 			t.Errorf("HTTP fallback X-Codex-Turn-State=%q, want %q; headers=%v", got, "turn-state", r.Header)
 		}
-		if got := r.Header.Get("X-Codex-Window-Id"); got != "client-thread:0" {
-			t.Errorf("HTTP fallback X-Codex-Window-Id=%q, want client-thread:0", got)
+		// Codex OAuth 发送账号作用域映射后的窗口 ID，代数后缀保持不变。
+		if got := r.Header.Get("X-Codex-Window-Id"); got == "019a3c5e-7f21-7c3a-9b4d-2f6e8a1c0d11:0" || !strings.HasSuffix(got, ":0") {
+			t.Errorf("HTTP fallback X-Codex-Window-Id=%q, want account-scoped <id>:0", got)
 		}
-		body, err := io.ReadAll(r.Body)
+		// WS 降级到 HTTP 后与官方 ChatGPT 登录的 HTTP 请求一致：请求体 zstd 压缩。
+		if got := r.Header.Get("Content-Encoding"); got != "zstd" {
+			t.Errorf("HTTP fallback Content-Encoding=%q, want zstd", got)
+		}
+		body, err := readTestUpstreamRequestBody(r)
 		if err != nil || !json.Valid(body) {
 			t.Errorf("same-channel HTTP replay body=%q err=%v", body, err)
 		}
@@ -6017,7 +6249,7 @@ func TestNativeCodexWebsocketRejectedHandshakeFallsBackToSameChannelHTTP(t *test
 		http.Header{
 			"OpenAI-Beta":                           []string{"other-feature"},
 			"X-Codex-Turn-State":                    []string{"turn-state"},
-			"X-Codex-Window-Id":                     []string{"client-thread:0"},
+			"X-Codex-Window-Id":                     []string{"019a3c5e-7f21-7c3a-9b4d-2f6e8a1c0d11:0"},
 			"X-ResponsesAPI-Include-Timing-Metrics": []string{"true"},
 		},
 	)

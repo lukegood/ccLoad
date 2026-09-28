@@ -278,9 +278,16 @@ func (s *Server) buildProxyRequest(
 	if err != nil {
 		return nil, err
 	}
+	// 重试回放的是已改写的 wire，沿用首轮映射；只有 OAuth 模拟路径改名。
+	if reqCtx != nil && reqCtx.anthropicToolAliases == nil && cfg.UsesAnthropicOAuth() && !callerOwnsAnthropicWire &&
+		(isAnthropicMessagesRequest(upstreamProtocol, requestPath) || isAnthropicCountTokensRequest(upstreamProtocol, requestPath)) {
+		body, reqCtx.anthropicToolAliases = aliasAnthropicMCPToolNames(body, anthropicMCPAliasSecret(cfg, apiKey))
+	}
 	mappedAnthropicSessionID := ""
 	if cfg.UsesAnthropicOAuth() &&
 		(isAnthropicMessagesRequest(upstreamProtocol, requestPath) || isAnthropicCountTokensRequest(upstreamProtocol, requestPath)) {
+		// 必须早于 refreshAnthropicCallerCCH：dateline 改写后调用方 CCH 要按新 body 重签。
+		body = normalizeAnthropicDateline(body)
 		identityHeaders := hdr
 		if oauthFingerprint != nil {
 			identityHeaders = cloneHeaders(hdr)
@@ -324,6 +331,17 @@ func (s *Server) buildProxyRequest(
 			body = injectCodexPromptCacheKey(body, codexSessionID)
 		}
 	}
+	// 1.9 Codex OAuth 账号作用域身份。重试回放的 wire body 已经映射过，不能再映射；
+	// Session-Id 兜底改为跟随最终 prompt_cache_key，首轮与回放保持一致。
+	codexIdentityNamespace := codexAccountIdentityNamespace(cfg)
+	if codexIdentityNamespace != "" && isCodexOAuthResponsesRequest(cfg, upstreamProtocol, requestPath) {
+		if reqCtx == nil || !reqCtx.replayBodyRulesApplied {
+			body = scopeCodexAccountIdentityBody(body, codexIdentityNamespace)
+		}
+		if codexSessionID != "" {
+			codexSessionID = readCodexPromptCacheKey(body)
+		}
+	}
 	if isZedResponsesRequest(cfg, upstreamProtocol) {
 		body, reqCtx.zedWire, err = finalizeZedResponsesBodyWithOptions(
 			s.protocolRegistry, body, reqCtx.originalBody, zedBodyRulesPreserveThinking(cfg.BodyRules()),
@@ -344,6 +362,8 @@ func (s *Server) buildProxyRequest(
 	if upstreamProtocol == protocol.Codex || (cfg.UsesCodexOAuth() &&
 		(requestPath == "/images/generations" || requestPath == "/images/edits")) {
 		copyCodexHTTPHeaders(req.Header, hdr)
+		// 只映射客户端原始头；自定义规则稍后写入的值按运维配置原样发送。
+		scopeCodexAccountIdentityHeaders(req.Header, codexIdentityNamespace)
 	} else {
 		copyRequestHeaders(req, hdr)
 	}
@@ -360,6 +380,15 @@ func (s *Server) buildProxyRequest(
 
 	// 5.5 Codex Responses 缓存提示：设置 Session-Id 头（仅客户端未自带时）
 	ensureCodexSessionHeader(req.Header, codexSessionID)
+
+	// 5.6 Codex OAuth 路由提示与 responses-lite 头：由最终 body 派生，早于自定义规则以便
+	// 运维覆盖或删除。WS 客户端的 lite 信号在 client_metadata 里，HTTP 上游只认请求头。
+	if isCodexOAuthResponsesRequest(cfg, upstreamProtocol, requestPath) {
+		setCodexRoutingHint(req.Header, body)
+		if codexResponsesLiteRequested(body, req.Header) {
+			req.Header.Set(codexResponsesLiteHeader, "true")
+		}
+	}
 
 	// 6. 自定义请求头规则（认证头黑名单保护）
 	applyHeaderRules(req.Header, cfg.HeaderRules())
@@ -1258,7 +1287,8 @@ func (s *Server) handleSuccessResponse(
 		resp.Body = wrapCodexSSEBody(resp.Body)
 	}
 	prepareOpenCodeResponsesResponse(resp, reqCtx.openCodeResponses, reqCtx.isStreaming)
-	if reqCtx.openCodeResponses != nil {
+	prepareAnthropicMCPToolAliasResponse(resp, reqCtx.anthropicToolAliases, reqCtx.isStreaming)
+	if reqCtx.openCodeResponses != nil || len(reqCtx.anthropicToolAliases) > 0 {
 		hdrClone.Del("Content-Length")
 	}
 	if isResponsesSSE && isSSE {
@@ -2189,7 +2219,7 @@ func (s *Server) handleResponse(
 func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey string, method string, plan protocol.TransformPlan, hdr http.Header, rawQuery string, baseURL string, w http.ResponseWriter, observer *ForwardObserver) (*fwResult, float64, error) {
 	return s.forwardOnceAsyncWithNativeCodexWebsocket(
 		ctx, cfg, apiKey, method, plan, hdr, rawQuery, baseURL, w, observer, nil, "", nil,
-		false, nil,
+		false, upstreamWireAliases{},
 	)
 }
 
@@ -2214,7 +2244,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	executionIdentity string,
 	translatedRequestOverride []byte,
 	replayBodyRulesApplied bool,
-	openCodeResponses *openCodeResponsesPlan,
+	wireAliases upstreamWireAliases,
 ) (*fwResult, float64, error) {
 	// 1. 创建请求上下文（处理超时）
 	upstreamStreaming := isStreamingRequest(plan.UpstreamPath, plan.TranslatedBody) || isCodeBuddyChatRequest(cfg, plan.UpstreamProtocol)
@@ -2232,7 +2262,8 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	reqCtx.anthropicClaudeCodeWire = translatedRequestOverride != nil &&
 		isAnthropicClaudeCodeMessagesRequest(cfg, plan.UpstreamProtocol, plan.UpstreamPath)
 	reqCtx.replayBodyRulesApplied = replayBodyRulesApplied
-	reqCtx.openCodeResponses = openCodeResponses
+	reqCtx.openCodeResponses = wireAliases.openCode
+	reqCtx.anthropicToolAliases = wireAliases.anthropicTools
 	reqCtx.executionIdentity = executionIdentity
 	defer reqCtx.cleanup() // [INFO] 统一清理：定时器 + context（总是安全）
 
@@ -2321,7 +2352,13 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 			cfg, replaySourceBody, replayBody,
 		)
 		replayReq := cloneRequestWithBody(httpReq, wsReplayBody)
-		prepareCodexWebsocketInputHeaders(replayReq.Header, hdr, cfg.HeaderRules())
+		// 规则删掉的头会从客户端头补回，补回值也必须是账号作用域映射后的。
+		wsHeaderSource := hdr
+		if namespace := codexAccountIdentityNamespace(cfg); namespace != "" {
+			wsHeaderSource = hdr.Clone()
+			scopeCodexAccountIdentityHeaders(wsHeaderSource, namespace)
+		}
+		prepareCodexWebsocketInputHeaders(replayReq.Header, wsHeaderSource, cfg.HeaderRules())
 		incrementalSourceBody := bytes.Clone(native.incrementalBody)
 		// The replay request and the incremental request do not necessarily share
 		// the same body provenance. A retry replay is built from an already
@@ -2340,7 +2377,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		if errBuild != nil {
 			return nil, 0, errBuild
 		}
-		prepareCodexWebsocketInputHeaders(incrementalReq.Header, hdr, cfg.HeaderRules())
+		prepareCodexWebsocketInputHeaders(incrementalReq.Header, wsHeaderSource, cfg.HeaderRules())
 		// buildProxyRequest applies body rules and prompt_cache_key; send the
 		// resulting wire body, not the pre-normalized caller input.
 		incrementalBody := stripInjectedCodexOAuthInstructionsForWebsocket(
@@ -2474,6 +2511,8 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		return errRes, errDur, errErr
 	}
 
+	tagCodexTurnStateHeader(resp.Header, codexAccountIdentityNamespace(cfg))
+
 	// 4. 处理响应(传递upstreamProtocol用于精确识别usage格式,传递渠道信息用于日志记录,传递观测回调)
 	var res *fwResult
 	var duration float64
@@ -2491,7 +2530,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 	if res != nil && (res.Status == http.StatusBadRequest || res.Status == http.StatusNotFound ||
 		!res.ResponseCommitted && len(res.SSEErrorEvent) > 0) {
 		res.upstreamRequestBody = bytes.Clone(sentBody)
-		res.openCodeResponses = reqCtx.openCodeResponses
+		res.wireAliases = upstreamWireAliases{openCode: reqCtx.openCodeResponses, anthropicTools: reqCtx.anthropicToolAliases}
 	}
 	if usedNativeWebsocket {
 		// Reconnects happen while handleResponse drains the upstream frames. Take
@@ -2508,7 +2547,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		log.Printf("[INFO] 渠道 %d WebSocket 重连握手失败，同 Key/URL 回退 HTTP: %v", cfg.ID, reconnectFallbackErr)
 		return s.forwardOnceAsyncWithNativeCodexWebsocket(
 			ctx, cfg, apiKey, method, plan, hdr, rawQuery, baseURL, w, observer, nil, executionIdentity, nil,
-			false, nil,
+			false, upstreamWireAliases{},
 		)
 	}
 	if res != nil {
@@ -2971,7 +3010,7 @@ func (s *Server) forwardAttempt(
 		ctx, cfg, selectedKey, reqCtx.requestMethod,
 		plan, forwardHeaders, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt, executionIdentity,
 		translatedRequestOverride,
-		false, nil,
+		false, upstreamWireAliases{},
 	)
 	// 传递 debug 数据到 proxyRequestContext（用于日志记录）
 	if res != nil && res.DebugData != nil {
@@ -2994,7 +3033,7 @@ func (s *Server) forwardAttempt(
 				s.activeRequests.Retry(reqCtx.activeReqID)
 				res, _, err = s.forwardOnceAsyncWithNativeCodexWebsocket(ctx, cfg, selectedKey, reqCtx.requestMethod,
 					plan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, nativeAttempt, executionIdentity, translatedRequestOverride,
-					false, nil)
+					false, upstreamWireAliases{})
 				duration = time.Since(reqCtx.attemptStartTime).Seconds()
 			}
 		}
@@ -3046,7 +3085,7 @@ func (s *Server) forwardAttempt(
 			retryPlan, reqCtx.header, reqCtx.rawQuery, baseURL, w, reqCtx.observer, retryAttempt, executionIdentity,
 			retryBody,
 			retryBodyRulesApplied,
-			res.openCodeResponses,
+			res.wireAliases,
 		)
 		plan = retryPlan
 		if res != nil && res.DebugData != nil {
@@ -3519,6 +3558,7 @@ func prepareCodexResponsesBodyForUpstream(cfg *model.Config, upstreamProtocol pr
 		return body
 	}
 	body = sanitizeCodexInputItemIDs(body)
+	body = normalizeCodexToolSchemas(body)
 	// Anyrouter rejects Codex's per-content classification metadata.
 	if cfg != nil && strings.Contains(strings.ToLower(cfg.Name), "anyrouter") {
 		for index, item := range gjson.GetBytes(body, "input").Array() {
@@ -4493,6 +4533,7 @@ func (s *Server) tryCodexOAuthChannel(
 		runtimeCfg := cfg.Clone()
 		runtimeCfg.CodexAccessToken = credential.AccessToken
 		runtimeCfg.CodexAccountID = credential.AccountID
+		runtimeCfg.CodexUserID = credential.ChatGPTUserID
 		runtimeCfg.CodexQuotaEpochAt = credential.QuotaCostUsage.EpochTime()
 		runtimeCfg.CodexAccountFedRAMP = credential.AccountFedRAMP
 		return runtimeCfg, credential.AccessToken, err

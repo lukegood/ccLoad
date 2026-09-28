@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1308,6 +1309,7 @@ func TestProxy_AnthropicOAuthPreservesNativePromptAcross400Retry(t *testing.T) {
 		"messages":   []any{map[string]any{"role": "user", "content": "hello"}},
 		"thinking":   map[string]any{"type": "enabled", "budget_tokens": 2048},
 		"max_tokens": 4096,
+		"tools":      []any{map[string]any{"name": "Bash", "input_schema": map[string]any{"type": "object"}}},
 	}, map[string]string{
 		"User-Agent":               "claude-cli/" + anthropicCLIVersion + " (external, cli)",
 		"X-App":                    "cli",
@@ -1328,6 +1330,9 @@ func TestProxy_AnthropicOAuthPreservesNativePromptAcross400Retry(t *testing.T) {
 		}
 		if got := gjson.GetBytes(body, "messages.#").Int(); got != 1 {
 			t.Fatalf("attempt %d messages=%d body=%s", index+1, got, body)
+		}
+		if got := gjson.GetBytes(body, "tools.0.name").String(); got != "Bash" {
+			t.Fatalf("attempt %d native tool renamed to %q", index+1, got)
 		}
 		userID := gjson.GetBytes(body, "metadata.user_id").String()
 		identity := gjson.Parse(userID)
@@ -1363,6 +1368,211 @@ func TestProxy_AnthropicOAuthPreservesNativePromptAcross400Retry(t *testing.T) {
 	if got := simulatedID.Get("device_id").String(); got != wantDeviceID {
 		t.Fatalf("simulated device_id=%q, native device_id=%q", got, wantDeviceID)
 	}
+}
+
+// OAuth 模拟路径把客户端工具改名为 Claude Code MCP 形态；同请求重试沿用同一套别名，
+// 响应在透传/协议转换前按结构还原，正文里的同名字符串不动。
+func TestProxy_AnthropicOAuthAliasesClientToolNames(t *testing.T) {
+	t.Parallel()
+
+	aliasPattern := regexp.MustCompile(`^mcp__[a-z]+_[a-z]+__[a-z]+_([A-Za-z0-9_-]+)$`)
+	tools := []any{
+		map[string]any{"name": "read_file", "input_schema": map[string]any{"type": "object"}},
+		map[string]any{"name": "mcp__github__get_issue", "input_schema": map[string]any{"type": "object"}},
+		map[string]any{"type": "web_search_20250305", "name": "web_search", "max_uses": 1},
+		map[string]any{"type": "custom", "name": "apply_patch", "input_schema": map[string]any{"type": "object"}},
+	}
+	history := []any{
+		map[string]any{"role": "user", "content": "read a.go"},
+		map[string]any{"role": "assistant", "content": []any{
+			map[string]any{"type": "tool_use", "id": "toolu_prev", "name": "read_file", "input": map[string]any{"path": "a.go"}},
+		}},
+		map[string]any{"role": "user", "content": []any{
+			map[string]any{"type": "tool_result", "tool_use_id": "toolu_prev", "content": "package a"},
+		}},
+	}
+	message := func(alias string) string {
+		return fmt.Sprintf(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6",`+
+			`"content":[{"type":"text","text":"calling %[1]s"},{"type":"tool_use","id":"toolu_1","name":%[2]q,"input":{"path":"b.go"}},`+
+			`{"type":"tool_use","id":"toolu_2","name":"mcp__github__get_issue","input":{}}],`+
+			`"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`, alias, alias)
+	}
+	stream := func(alias string) string {
+		return "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n" +
+			"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"" + alias + "\",\"input\":{}}}\n\n" +
+			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"b.go\\\"}\"}}\n\n" +
+			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+			"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	}
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "mimic-anthropic-oauth", upstreamProtocol: "anthropic", models: "claude-sonnet-4-6",
+		authType: model.AuthTypeAnthropicOAuth, oauthCredential: anthropicProxyTestCredential(t, "oauth-alias-token"),
+	}}, map[int]string{0: "https://api.anthropic.com"})
+	var mu sync.Mutex
+	var bodies [][]byte
+	rejectNext := false
+	env.server.client = &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		reject := rejectNext
+		rejectNext = false
+		mu.Unlock()
+		header := http.Header{"Content-Type": {"application/json"}}
+		if reject {
+			return &http.Response{StatusCode: http.StatusBadRequest, Header: header, Body: io.NopCloser(strings.NewReader(
+				`{"type":"error","error":{"type":"invalid_request_error","message":"thinking blocks are not supported"}}`))}, nil
+		}
+		if strings.HasSuffix(r.URL.Path, "/count_tokens") {
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(`{"input_tokens":7}`))}, nil
+		}
+		alias := gjson.GetBytes(body, "tools.0.name").String()
+		if gjson.GetBytes(body, "stream").Bool() {
+			header.Set("Content-Type", "text/event-stream")
+			return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(stream(alias)))}, nil
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: header, Body: io.NopCloser(strings.NewReader(message(alias)))}, nil
+	})}
+	send := func(path string, request map[string]any, headers map[string]string, reject bool) (*httptest.ResponseRecorder, [][]byte) {
+		t.Helper()
+		mu.Lock()
+		bodies, rejectNext = nil, reject
+		mu.Unlock()
+		response := doProxyRequest(t, env.engine, path, request, headers)
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return response, bodies
+	}
+	// 断言首个客户端工具的 wire 形态，返回它的别名。
+	assertWire := func(t *testing.T, body []byte) string {
+		t.Helper()
+		wireTools := gjson.GetBytes(body, "tools").Array()
+		if len(wireTools) != 4 {
+			t.Fatalf("wire tools: %s", body)
+		}
+		readFile, applyPatch := wireTools[0].Get("name").String(), wireTools[3].Get("name").String()
+		for name, semantic := range map[string]string{readFile: "read_file", applyPatch: "apply_patch"} {
+			if match := aliasPattern.FindStringSubmatch(name); match == nil || match[1] != semantic || len(name) > anthropicToolNameMaxLen {
+				t.Fatalf("alias %q does not carry %q: %s", name, semantic, body)
+			}
+		}
+		if strings.Split(readFile, "__")[1] != strings.Split(applyPatch, "__")[1] {
+			t.Fatalf("aliases use different MCP servers: %q %q", readFile, applyPatch)
+		}
+		if wireTools[3].Get("type").Exists() {
+			t.Fatalf("custom tool kept type: %s", wireTools[3].Raw)
+		}
+		if wireTools[1].Get("name").String() != "mcp__github__get_issue" ||
+			wireTools[2].Get("name").String() != "web_search" || wireTools[2].Get("type").String() != "web_search_20250305" {
+			t.Fatalf("MCP/server tools renamed: %s", body)
+		}
+		if strings.Contains(string(body), `"read_file"`) || strings.Contains(string(body), `"apply_patch"`) {
+			t.Fatalf("original tool name leaked to wire: %s", body)
+		}
+		return readFile
+	}
+
+	var messagesAlias string
+	t.Run("json with 400 retry", func(t *testing.T) {
+		response, sent := send("/v1/messages", map[string]any{
+			"model": "claude-sonnet-4-6", "max_tokens": 4096, "tools": tools, "messages": history,
+			"thinking": map[string]any{"type": "enabled", "budget_tokens": 2048},
+		}, nil, true)
+		if len(sent) != 2 || !gjson.GetBytes(sent[0], "thinking").Exists() || gjson.GetBytes(sent[1], "thinking").Exists() {
+			t.Fatalf("expected thinking-downgrade retry, got %d attempts", len(sent))
+		}
+		messagesAlias = assertWire(t, sent[0])
+		if retryAlias := assertWire(t, sent[1]); retryAlias != messagesAlias {
+			t.Fatalf("retry re-aliased: first=%q retry=%q", messagesAlias, retryAlias)
+		}
+		for _, body := range sent {
+			var toolUse gjson.Result
+			gjson.GetBytes(body, "messages").ForEach(func(_, message gjson.Result) bool {
+				message.Get("content").ForEach(func(_, block gjson.Result) bool {
+					if block.Get("type").String() == "tool_use" {
+						toolUse = block
+					}
+					return true
+				})
+				return true
+			})
+			if toolUse.Get("name").String() != messagesAlias || toolUse.Get("id").String() != "toolu_prev" {
+				t.Fatalf("history tool_use not aliased: %s", body)
+			}
+		}
+		out := gjson.Parse(response.Body.String())
+		if out.Get("content.1.name").String() != "read_file" || out.Get("content.2.name").String() != "mcp__github__get_issue" {
+			t.Fatalf("tool names not restored: %s", response.Body.String())
+		}
+		if out.Get("content.0.text").String() != "calling "+messagesAlias {
+			t.Fatalf("text content rewritten: %s", response.Body.String())
+		}
+	})
+
+	t.Run("stream", func(t *testing.T) {
+		response, sent := send("/v1/messages", map[string]any{
+			"model": "claude-sonnet-4-6", "max_tokens": 64, "stream": true, "tools": tools, "messages": history,
+			"tool_choice": map[string]any{"type": "tool", "name": "read_file"},
+		}, nil, false)
+		alias := assertWire(t, sent[0])
+		if gjson.GetBytes(sent[0], "tool_choice.name").String() != alias {
+			t.Fatalf("tool_choice not aliased: %s", sent[0])
+		}
+		if strings.Contains(response.Body.String(), alias) {
+			t.Fatalf("alias leaked to client stream: %s", response.Body.String())
+		}
+		restored := false
+		for _, frame := range strings.Split(response.Body.String(), "\n\n") {
+			_, data := parseSSEEventChunk([]byte(frame))
+			if block := gjson.GetBytes(data, "content_block"); block.Get("type").String() == "tool_use" {
+				restored = block.Get("name").String() == "read_file"
+			}
+		}
+		if !restored {
+			t.Fatalf("stream tool_use not restored: %s", response.Body.String())
+		}
+	})
+
+	t.Run("responses client", func(t *testing.T) {
+		response, sent := send("/v1/responses", map[string]any{
+			"model": "claude-sonnet-4-6", "stream": false, "input": "read b.go",
+			"tools": []any{map[string]any{"type": "function", "name": "read_file", "parameters": map[string]any{"type": "object"}}},
+		}, nil, false)
+		alias := gjson.GetBytes(sent[0], "tools.0.name").String()
+		if match := aliasPattern.FindStringSubmatch(alias); match == nil || match[1] != "read_file" {
+			t.Fatalf("converted tool not aliased: %s", sent[0])
+		}
+		var called []string
+		gjson.Get(response.Body.String(), "output").ForEach(func(_, item gjson.Result) bool {
+			if item.Get("type").String() == "function_call" {
+				called = append(called, item.Get("name").String())
+			}
+			return true
+		})
+		if !slices.Equal(called, []string{"read_file", "mcp__github__get_issue"}) {
+			t.Fatalf("function calls=%v body=%s", called, response.Body.String())
+		}
+	})
+
+	t.Run("count_tokens", func(t *testing.T) {
+		response, sent := send("/v1/messages/count_tokens", map[string]any{
+			"model": "claude-sonnet-4-6", "tools": tools, "messages": history,
+		}, nil, false)
+		if alias := assertWire(t, sent[0]); messagesAlias != "" && alias != messagesAlias {
+			t.Fatalf("count_tokens alias %q differs from messages alias %q", alias, messagesAlias)
+		}
+		if gjson.Get(response.Body.String(), "input_tokens").Int() != 7 {
+			t.Fatalf("count_tokens response: %s", response.Body.String())
+		}
+	})
 }
 
 // 只有邮箱、没有账号 UUID 的凭证：调用方自己的 device/account 不能原样发给该账号，
@@ -4790,6 +5000,10 @@ func TestProxy_CodexOAuthChannelRefreshes401AndReassemblesNonStream(t *testing.T
 		if got := r.Header.Get("Accept"); got != "text/event-stream" {
 			t.Errorf("Accept = %q, want text/event-stream", got)
 		}
+		// 官方 ChatGPT 登录的 HTTP /responses 请求体为 zstd；401 刷新后的重放同样压缩。
+		if got := r.Header.Get("Content-Encoding"); got != "zstd" {
+			t.Errorf("Content-Encoding = %q, want zstd", got)
+		}
 		if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-proxy" {
 			t.Errorf("ChatGPT-Account-ID = %q", got)
 		}
@@ -6123,7 +6337,10 @@ func TestProxy_XAIOAuthDoesNotReplayAfterCommittedSemanticOutput(t *testing.T) {
 }
 
 func TestProxy_CodexPreservesOfficialClientIdentity(t *testing.T) {
-	const clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
+	const (
+		clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
+		clientWindowID  = "019a3c5e-7f21-7c3a-9b4d-2f6e8a1c0d11:0"
+	)
 	for _, authType := range []string{model.AuthTypeAPIKey, model.AuthTypeCodexOAuth} {
 		t.Run(authType, func(t *testing.T) {
 			for _, version := range []string{"", "0.153.4"} {
@@ -6145,7 +6362,7 @@ func TestProxy_CodexPreservesOfficialClientIdentity(t *testing.T) {
 					env := setupProxyTestEnv(t, []testChannel{channel}, map[int]string{0: upstream.URL})
 					headers := map[string]string{
 						"User-Agent": clientUserAgent, "Originator": "codex-tui",
-						"X-Codex-Window-Id": "client-thread:0",
+						"X-Codex-Window-Id": clientWindowID,
 					}
 					if version != "" {
 						headers["Version"] = version
@@ -6162,12 +6379,26 @@ func TestProxy_CodexPreservesOfficialClientIdentity(t *testing.T) {
 					default:
 						t.Fatal("upstream request was not captured")
 					}
+					// Version 与客户端一致：缺失时不从 UA 补写，否则会凭空触发模型版本门控。
 					if got.Get("User-Agent") != clientUserAgent || got.Get("Version") != version {
 						t.Errorf("upstream identity = UA %q Version %q, want UA %q Version %q",
 							got.Get("User-Agent"), got.Get("Version"), clientUserAgent, version)
 					}
-					if windowID := got.Get("X-Codex-Window-Id"); windowID != "client-thread:0" {
-						t.Errorf("upstream X-Codex-Window-Id = %q, want client-thread:0", windowID)
+					windowID := got.Get("X-Codex-Window-Id")
+					if authType == model.AuthTypeAPIKey && windowID != clientWindowID {
+						t.Errorf("upstream X-Codex-Window-Id = %q, want %s", windowID, clientWindowID)
+					}
+					// Codex OAuth 不透传客户端原始 ID，只保留窗口代数后缀。
+					if authType == model.AuthTypeCodexOAuth && (windowID == clientWindowID || !strings.HasSuffix(windowID, ":0")) {
+						t.Errorf("upstream X-Codex-Window-Id = %q, want account-scoped <id>:0", windowID)
+					}
+					// 官方只对 ChatGPT 登录压缩请求体；API Key 渠道原样发送。
+					wantEncoding := ""
+					if authType == model.AuthTypeCodexOAuth {
+						wantEncoding = "zstd"
+					}
+					if got.Get("Content-Encoding") != wantEncoding {
+						t.Errorf("upstream Content-Encoding = %q, want %q", got.Get("Content-Encoding"), wantEncoding)
 					}
 				})
 			}
@@ -14171,6 +14402,65 @@ func TestProxy_ResponsesMetadataThenSSEError_RetriesNextChannel(t *testing.T) {
 	}
 }
 
+// 上游静默中止：response.incomplete 无 output 且 output_tokens=0，首包前按流中断切渠道；
+// content_filter 是确定性结果，原样返回不切渠道。
+func TestProxy_ResponsesEmptyIncompleteBeforeOutput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		reason     string
+		wantRetry  bool
+		wantInBody string
+	}{
+		{name: "silent abort retries next channel", reason: "max_output_tokens", wantRetry: true, wantInBody: "resp-ch2"},
+		{name: "content filter is returned", reason: "content_filter", wantRetry: false, wantInBody: "resp-ch1-incomplete"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstream1 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, `data: {"type":"response.created","response":{"id":"resp-ch1-incomplete","status":"in_progress"}}`+"\n\n")
+				_, _ = fmt.Fprint(w, `data: {"type":"response.incomplete","response":{"id":"resp-ch1-incomplete","status":"incomplete","incomplete_details":{"reason":"`+tc.reason+`"},"output":[],"usage":{"input_tokens":5,"output_tokens":0,"total_tokens":5}}}`+"\n\n")
+			}))
+			defer upstream1.Close()
+
+			var secondCalls atomic.Int32
+			upstream2 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				secondCalls.Add(1)
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp-ch2","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+			}))
+			defer upstream2.Close()
+
+			env := setupProxyTestEnv(t, []testChannel{
+				{name: "ch1-empty-incomplete", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-1", priority: 100},
+				{name: "ch2-ok", upstreamProtocol: "codex", models: "gpt-test", apiKey: "sk-2", priority: 50},
+			}, map[int]string{0: upstream1.URL, 1: upstream2.URL})
+
+			w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+				"model":  "gpt-test",
+				"stream": true,
+				"input":  "hi",
+			}, nil)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, body: %s", w.Code, w.Body.String())
+			}
+			if body := w.Body.String(); !strings.Contains(body, tc.wantInBody) {
+				t.Fatalf("body missing %q: %s", tc.wantInBody, body)
+			}
+			if got := secondCalls.Load() == 1; got != tc.wantRetry {
+				t.Fatalf("second channel called = %v, want %v", got, tc.wantRetry)
+			}
+		})
+	}
+}
+
 // Codex 上游在响应开始与终态之间会插入 `event: keepalive`（data: {"type":"keepalive",...}）。
 // 它既不是 ping 心跳，也不在 Responses 元数据事件列表里，修复前会被算成语义输出，
 // 导致 deferredWriter 提前 commit，随后的 server_is_overloaded 无法切渠道。
@@ -15695,6 +15985,127 @@ func TestProxy_AnthropicSessionAffinity(t *testing.T) {
 	heal("primary")
 	if got := send(session); got != "primary" {
 		t.Fatalf("session served by %s after primary recovered, want primary", got)
+	}
+}
+
+// Codex 会话按 Session-Id 粘在一个账号上；客户端回带的 turn-state 只发回签发它的账号，
+// 故障转移到其他账号时删除，不把 A 账号的 sticky routing 令牌泄露给 B 账号。
+func TestProxy_CodexSessionAffinityScopesTurnState(t *testing.T) {
+	type upstreamHit struct {
+		name      string
+		turnState []string
+	}
+	names := []string{"account-a", "account-b"}
+	var failing sync.Map // name → bool
+	hits := make(chan upstreamHit, 64)
+	upstreams := make(map[int]string, len(names))
+	channels := make([]testChannel, 0, len(names))
+	for index, name := range names {
+		upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if broken, _ := failing.Load(name); broken == true {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"boom"}}`)
+				return
+			}
+			hits <- upstreamHit{name: name, turnState: r.Header.Values("X-Codex-Turn-State")}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("X-Codex-Turn-State", "state-"+name)
+			_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp-`+name+`","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+		}))
+		defer upstream.Close()
+		upstreams[index] = upstream.URL
+		channels = append(channels, testChannel{
+			name: name, upstreamProtocol: "codex", models: "gpt-test", priority: 100,
+			authType:        model.AuthTypeCodexOAuth,
+			oauthCredential: codexProxyTestCredential(t, "at-"+name, "rt-"+name, name),
+		})
+	}
+	env := setupProxyTestEnv(t, channels, upstreams)
+	ctx := context.Background()
+	configs, err := env.store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs: %v", err)
+	}
+	channelIDs := make(map[string]int64, len(configs))
+	for _, cfg := range configs {
+		channelIDs[cfg.Name] = cfg.ID
+	}
+	send := func(sessionID, turnState string) (upstreamHit, string) {
+		t.Helper()
+		headers := map[string]string{}
+		if sessionID != "" {
+			headers["Session-Id"] = sessionID
+		}
+		if turnState != "" {
+			headers["X-Codex-Turn-State"] = turnState
+		}
+		response := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{
+			"model": "gpt-test", "stream": true, "input": "hi",
+		}, headers)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		select {
+		case hit := <-hits:
+			return hit, response.Header().Get("X-Codex-Turn-State")
+		default:
+			t.Fatal("request succeeded without reaching an upstream")
+			return upstreamHit{}, ""
+		}
+	}
+
+	rotated := map[string]bool{}
+	for range 4 {
+		hit, _ := send("", "")
+		rotated[hit.name] = true
+	}
+	if !rotated["account-a"] || !rotated["account-b"] {
+		t.Fatalf("requests without session hit %v, want rotation across both accounts", rotated)
+	}
+
+	session := uuid.NewString()
+	first, boundState := send(session, "")
+	bound := first.name
+	if boundState == "state-"+bound || !strings.HasSuffix(boundState, "state-"+bound) {
+		t.Fatalf("relayed turn-state = %q, want account-tagged state-%s", boundState, bound)
+	}
+	for range 2 {
+		hit, _ := send(session, boundState)
+		if hit.name != bound {
+			t.Fatalf("session moved from %s to %s while %s stayed healthy", bound, hit.name, bound)
+		}
+		if len(hit.turnState) != 1 || hit.turnState[0] != "state-"+bound {
+			t.Fatalf("issuing account received turn-state %q, want original state-%s", hit.turnState, bound)
+		}
+	}
+
+	other := "account-a"
+	if bound == other {
+		other = "account-b"
+	}
+	failing.Store(bound, true)
+	hit, otherState := send(session, boundState)
+	if hit.name != other || len(hit.turnState) != 0 {
+		t.Fatalf("failover hit %s with turn-state %q, want %s without turn-state", hit.name, hit.turnState, other)
+	}
+	if !strings.HasSuffix(otherState, "state-"+other) || otherState == "state-"+other {
+		t.Fatalf("failover relayed turn-state = %q, want account-tagged state-%s", otherState, other)
+	}
+
+	// 原账号恢复后会话留在新账号，客户端本 turn 仍回带旧账号的令牌，照样删除。
+	failing.Store(bound, false)
+	if err := env.server.cooldownManager.ClearAllCooldowns(ctx, channelIDs[bound]); err != nil {
+		t.Fatalf("ClearAllCooldowns(%s): %v", bound, err)
+	}
+	env.server.invalidateChannelRelatedCache(channelIDs[bound])
+	hit, _ = send(session, boundState)
+	if hit.name != other || len(hit.turnState) != 0 {
+		t.Fatalf("rebound session hit %s with turn-state %q, want %s without turn-state", hit.name, hit.turnState, other)
+	}
+	hit, _ = send(session, "untagged-state")
+	if hit.name != other || len(hit.turnState) != 1 || hit.turnState[0] != "untagged-state" {
+		t.Fatalf("untagged turn-state reached %s as %q, want unchanged on %s", hit.name, hit.turnState, other)
 	}
 }
 
