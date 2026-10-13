@@ -3,12 +3,15 @@ package protocol
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 )
 
 // Protocol identifies a client-facing or upstream request/response protocol.
 type Protocol string
+
+// SystemOne is the native System One decision protocol. It is excluded from
+// chat conversions: its client endpoint only passes through to System One channels.
+const SystemOne Protocol = "system_one"
 
 const (
 	// Anthropic is the Anthropic Messages protocol surface.
@@ -55,6 +58,8 @@ const (
 	// RequestFamilyAlphaSearch is the Codex /v1/alpha/search surface.
 	// It is native passthrough only — not a protocol-transform family.
 	RequestFamilyAlphaSearch RequestFamily = "alpha_search"
+	// RequestFamilySystemOne is the native /v1/systemone decision surface.
+	RequestFamilySystemOne RequestFamily = "system_one"
 )
 
 // TransformPlan captures the chosen transform metadata for one proxy attempt.
@@ -98,23 +103,6 @@ var supportedTransformFamiliesByClientAndUpstream = map[Protocol]map[Protocol][]
 		Anthropic: {RequestFamilyGenerateContent},
 		Codex:     {RequestFamilyGenerateContent},
 	},
-}
-
-// SupportedClientProtocolsForUpstream returns the documented client-facing protocols
-// that can be translated into the given upstream protocol.
-func SupportedClientProtocolsForUpstream(upstream Protocol) []Protocol {
-	supported := make([]Protocol, 0, len(supportedTransformFamiliesByClientAndUpstream))
-	for client, upstreams := range supportedTransformFamiliesByClientAndUpstream {
-		if len(upstreams[upstream]) == 0 {
-			continue
-		}
-		supported = append(supported, client)
-	}
-	if len(supported) == 0 {
-		return nil
-	}
-	slices.Sort(supported)
-	return supported
 }
 
 // SupportsTransform reports whether the runtime has a documented transform path for
@@ -195,6 +183,8 @@ func DetectRequestFamily(path string) RequestFamily {
 		return RequestFamilyEmbeddings
 	case strings.Contains(path, "/v1/images/"):
 		return RequestFamilyImages
+	case matchesCanonicalEndpoint(path, "/v1/systemone"):
+		return RequestFamilySystemOne
 	default:
 		return RequestFamilyUnknown
 	}

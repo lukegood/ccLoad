@@ -494,26 +494,24 @@ func TestChannelURLs_NormalizeRejectsInvalidData(t *testing.T) {
 	}
 }
 
-func TestConfig_AnthropicOAuthAuthType(t *testing.T) {
-	cfg := &Config{AuthType: AuthTypeAnthropicOAuth}
-	if NormalizeAuthType(AuthTypeAnthropicOAuth) != AuthTypeAnthropicOAuth ||
-		!cfg.UsesAnthropicOAuth() || !cfg.UsesOAuth() || cfg.UsesXAIOAuth() {
-		t.Fatalf("Anthropic OAuth auth type was not isolated: %+v", cfg)
+func TestSystemOneChannelURLs(t *testing.T) {
+	t.Parallel()
+	declared := ChannelURLs{{URL: "https://one.example", Protocols: []string{"openai"}}}
+	for _, tc := range []struct {
+		authType string
+		urls     ChannelURLs
+		valid    bool
+	}{
+		{AuthTypeSystemOne, ChannelURLs{{URL: "https://one.example"}, {URL: "https://two.example/v1"}}, true},
+		{AuthTypeSystemOne, declared, false},
+		{AuthTypeAPIKey, declared, true},
+	} {
+		if err := tc.urls.ValidateForAuthType(tc.authType); (err == nil) != tc.valid {
+			t.Fatalf("ValidateForAuthType(%s, %+v) error = %v, valid = %v", tc.authType, tc.urls, err, tc.valid)
+		}
 	}
-}
-
-func TestConfig_CursorOAuthAuthType(t *testing.T) {
-	cfg := &Config{AuthType: AuthTypeCursorOAuth}
-	if NormalizeAuthType(AuthTypeCursorOAuth) != AuthTypeCursorOAuth ||
-		!cfg.UsesCursorOAuth() || !cfg.UsesOAuth() || cfg.UsesZAIOAuth() {
-		t.Fatalf("Cursor OAuth auth type was not isolated: %+v", cfg)
-	}
-}
-
-func TestConfig_ZedOAuthAuthType(t *testing.T) {
-	cfg := &Config{AuthType: AuthTypeZedOAuth}
-	if NormalizeAuthType(AuthTypeZedOAuth) != AuthTypeZedOAuth ||
-		!cfg.UsesZedOAuth() || !cfg.UsesOAuth() || cfg.UsesCodexOAuth() {
-		t.Fatalf("Zed OAuth auth type was not isolated: %+v", cfg)
+	cfg := &Config{AuthType: AuthTypeSystemOne}
+	if !cfg.IsSystemOne() || cfg.UsesOAuth() || !UsesAPIKeyCredentials(cfg.AuthType) {
+		t.Fatal("System One must be a decision-only API key channel")
 	}
 }

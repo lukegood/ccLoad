@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/protocol/cliproxy/claude/gemini"
 	oaiclaude "ccLoad/internal/protocol/cliproxy/claude/openai/chat-completions"
 	oairespclaude "ccLoad/internal/protocol/cliproxy/claude/openai/responses"
@@ -29,7 +31,7 @@ func cliproxyOpenAIRequestToGemini(model string, raw []byte, stream bool) ([]byt
 	if err := cliproxyValidateOpenAIRequest(raw); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("openai request to gemini", raw, oaigemini.ConvertOpenAIRequestToGemini(model, raw, stream))
+	return cliproxyJSONRequest("openai request to gemini", model, raw, stream, oaigemini.ConvertOpenAIRequestToGemini)
 }
 
 func cliproxyGeminiResponseToOpenAIStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -41,7 +43,7 @@ func cliproxyGeminiResponseToOpenAINonStream(ctx context.Context, model string, 
 }
 
 func cliproxyGeminiRequestToOpenAI(model string, raw []byte, stream bool) ([]byte, error) {
-	return cliproxyJSONRequest("gemini request to openai", raw, openaigemini.ConvertGeminiRequestToOpenAI(model, raw, stream))
+	return cliproxyJSONRequest("gemini request to openai", model, raw, stream, openaigemini.ConvertGeminiRequestToOpenAI)
 }
 
 func cliproxyOpenAIResponseToGeminiStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -56,7 +58,7 @@ func cliproxyOpenAIRequestToAnthropic(model string, raw []byte, stream bool) ([]
 	if err := cliproxyValidateOpenAIRequest(raw); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("openai request to anthropic", raw, oaiclaude.ConvertOpenAIRequestToClaude(model, raw, stream))
+	return cliproxyJSONRequest("openai request to anthropic", model, raw, stream, oaiclaude.ConvertOpenAIRequestToClaude)
 }
 
 func cliproxyAnthropicResponseToOpenAIStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -75,7 +77,7 @@ func cliproxyAnthropicRequestToOpenAI(model string, raw []byte, stream bool) ([]
 	if err := cliproxyValidateAnthropicRequest(raw); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("anthropic request to openai", raw, claude.ConvertClaudeRequestToOpenAI(model, raw, stream))
+	return cliproxyJSONRequest("anthropic request to openai", model, raw, stream, claude.ConvertClaudeRequestToOpenAI)
 }
 
 func cliproxyOpenAIResponseToAnthropicStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -90,7 +92,7 @@ func cliproxyOpenAIRequestToCodex(model string, raw []byte, stream bool) ([]byte
 	if err := cliproxyValidateOpenAIRequest(raw); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("openai request to codex", raw, oaicodex.ConvertOpenAIRequestToCodex(model, raw, stream))
+	return cliproxyJSONRequest("openai request to codex", model, raw, stream, oaicodex.ConvertOpenAIRequestToCodex)
 }
 
 func cliproxyCodexResponseToOpenAIStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -109,7 +111,7 @@ func cliproxyAnthropicRequestToGemini(model string, raw []byte, stream bool) ([]
 	if err := cliproxyValidateAnthropicRequest(raw); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("anthropic request to gemini", raw, claudegemini.ConvertClaudeRequestToGemini(model, raw, stream))
+	return cliproxyJSONRequest("anthropic request to gemini", model, raw, stream, claudegemini.ConvertClaudeRequestToGemini)
 }
 
 func cliproxyGeminiResponseToAnthropicStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -136,7 +138,7 @@ func cliproxyGeminiResponseToAnthropicNonStream(ctx context.Context, model strin
 }
 
 func cliproxyGeminiRequestToAnthropic(model string, raw []byte, stream bool) ([]byte, error) {
-	return cliproxyJSONRequest("gemini request to anthropic", raw, gemini.ConvertGeminiRequestToClaude(model, raw, stream))
+	return cliproxyJSONRequest("gemini request to anthropic", model, raw, stream, gemini.ConvertGeminiRequestToClaude)
 }
 
 func cliproxyAnthropicResponseToGeminiStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -155,7 +157,7 @@ func cliproxyCodexRequestToGemini(model string, raw []byte, stream bool) ([]byte
 	if err := cliproxyValidateCodexRequest(raw, false); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("codex request to gemini", raw, openairespgemini.ConvertOpenAIResponsesRequestToGemini(model, raw, stream))
+	return cliproxyJSONRequest("codex request to gemini", model, raw, stream, openairespgemini.ConvertOpenAIResponsesRequestToGemini)
 }
 
 func cliproxyGeminiResponseToCodexStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -163,11 +165,13 @@ func cliproxyGeminiResponseToCodexStream(ctx context.Context, model string, orig
 }
 
 func cliproxyGeminiResponseToCodexNonStream(ctx context.Context, model string, original, translated, raw []byte) ([]byte, error) {
-	return cliproxyJSONResponse("gemini response to codex", raw, openairespgemini.ConvertGeminiResponseToOpenAIResponsesNonStream(ctx, model, original, translated, raw, nil))
+	var state any
+	response := openairespgemini.ConvertGeminiResponseToOpenAIResponsesNonStream(ctx, model, original, translated, raw, &state)
+	return cliproxyJSONResponseWithState("gemini response to codex", raw, response, state)
 }
 
 func cliproxyGeminiRequestToCodex(model string, raw []byte, stream bool) ([]byte, error) {
-	return cliproxyJSONRequest("gemini request to codex", raw, geminicodex.ConvertGeminiRequestToCodex(model, raw, stream))
+	return cliproxyJSONRequest("gemini request to codex", model, raw, stream, geminicodex.ConvertGeminiRequestToCodex)
 }
 
 func cliproxyCodexResponseToGeminiStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -186,7 +190,7 @@ func cliproxyCodexRequestToAnthropic(model string, raw []byte, stream bool) ([]b
 	if err := cliproxyValidateCodexRequest(raw, false); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("codex request to anthropic", raw, oairespclaude.ConvertOpenAIResponsesRequestToClaude(model, raw, stream))
+	return cliproxyJSONRequest("codex request to anthropic", model, raw, stream, oairespclaude.ConvertOpenAIResponsesRequestToClaude)
 }
 
 func cliproxyAnthropicResponseToCodexStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -198,14 +202,16 @@ func cliproxyAnthropicResponseToCodexNonStream(ctx context.Context, model string
 	if err != nil {
 		return nil, fmt.Errorf("normalize anthropic response to codex: %w", err)
 	}
-	return cliproxyJSONResponse("anthropic response to codex", normalized, oairespclaude.ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, model, original, translated, normalized, nil))
+	var state any
+	response := oairespclaude.ConvertClaudeResponseToOpenAIResponsesNonStream(ctx, model, original, translated, normalized, &state)
+	return cliproxyJSONResponseWithState("anthropic response to codex", normalized, response, state)
 }
 
 func cliproxyAnthropicRequestToCodex(model string, raw []byte, stream bool) ([]byte, error) {
 	if err := cliproxyValidateAnthropicRequest(raw); err != nil {
 		return nil, err
 	}
-	return cliproxyJSONRequest("anthropic request to codex", raw, claudecodex.ConvertClaudeRequestToCodex(model, raw, stream))
+	return cliproxyJSONRequest("anthropic request to codex", model, raw, stream, claudecodex.ConvertClaudeRequestToCodex)
 }
 
 func cliproxyCodexResponseToAnthropicStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -224,11 +230,7 @@ func cliproxyCodexRequestToOpenAI(model string, raw []byte, stream bool) ([]byte
 	if err := cliproxyValidateCodexRequest(raw, true); err != nil {
 		return nil, err
 	}
-	translated, err := openairesponses.ConvertOpenAIResponsesRequestToOpenAIChatCompletionsWithError(model, raw, stream)
-	if err != nil {
-		return nil, err
-	}
-	return cliproxyJSONRequest("codex request to openai", raw, translated)
+	return cliproxyJSONRequest("codex request to openai", model, raw, stream, openairesponses.ConvertOpenAIResponsesRequestToOpenAIChatCompletions)
 }
 
 func cliproxyOpenAIResponseToCodexStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -236,16 +238,26 @@ func cliproxyOpenAIResponseToCodexStream(ctx context.Context, model string, orig
 }
 
 func cliproxyOpenAIResponseToCodexNonStream(ctx context.Context, model string, original, translated, raw []byte) ([]byte, error) {
-	translatedResponse, err := openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStreamWithError(ctx, model, original, translated, raw, nil)
+	var state any
+	translatedResponse, err := openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStreamWithError(ctx, model, original, translated, raw, &state)
 	if err != nil {
 		return nil, err
 	}
-	return cliproxyJSONResponse("openai response to codex", raw, translatedResponse)
+	return cliproxyJSONResponseWithState("openai response to codex", raw, translatedResponse, state)
 }
 
-func cliproxyJSONRequest(label string, input []byte, output []byte) ([]byte, error) {
+func cliproxyJSONResponseWithState(label string, input, output []byte, state any) ([]byte, error) {
+	response, err := cliproxyJSONResponse(label, input, output)
+	return response, errors.Join(err, protocol.ResponseToolInputError(state))
+}
+
+func cliproxyJSONRequest(label, model string, input []byte, stream bool, convert func(string, []byte, bool) ([]byte, error)) ([]byte, error) {
 	if !json.Valid(input) {
 		return nil, fmt.Errorf("invalid %s JSON", label)
+	}
+	output, err := convert(model, input, stream)
+	if err != nil {
+		return nil, err
 	}
 	if len(output) == 0 || !json.Valid(output) {
 		return nil, fmt.Errorf("translate %s", label)
@@ -500,12 +512,27 @@ type cliproxyOpenAIToCodexStreamState struct {
 	response bool
 }
 
+func (s *cliproxyOpenAIToCodexStreamState) ToolInputError() error {
+	if s.response {
+		return nil
+	}
+	return protocol.ResponseToolInputError(s.chat)
+}
+
+func (s *cliproxyOpenAIToCodexStreamState) FinalizeToolInput() [][]byte {
+	if s.response {
+		return nil
+	}
+	chunks, _ := protocol.FinalizeResponseToolInput(s.chat)
+	return chunks
+}
+
 func cliproxyTranslateOpenAIToCodexStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
 	data, err := cliproxySSEDataEvent(raw)
 	if err != nil {
 		return nil, err
 	}
-	if len(data) == 0 {
+	if len(data) == 0 && len(raw) != 0 {
 		return nil, nil
 	}
 	if param == nil {
@@ -535,10 +562,8 @@ func cliproxyTranslateOpenAIToCodexStream(ctx context.Context, model string, ori
 		return nil, nil
 	}
 	chunks, err := openairesponses.ConvertOpenAIChatCompletionsResponseToOpenAIResponsesWithError(ctx, model, original, translated, data, &state.chat)
-	if err != nil {
-		return nil, err
-	}
-	return cliproxyFrameStreamChunks(cliproxyStreamCodex, chunks)
+	framed, frameErr := cliproxyFrameStreamChunks(cliproxyStreamCodex, chunks)
+	return framed, errors.Join(err, frameErr, state.ToolInputError())
 }
 
 func cliproxyTranslateOpenAIToAnthropicStream(ctx context.Context, model string, original, translated, raw []byte, param *any) ([][]byte, error) {
@@ -627,14 +652,15 @@ func cliproxyTranslateStream(ctx context.Context, model string, original, transl
 	if err != nil {
 		return nil, err
 	}
-	if len(data) == 0 {
+	if len(data) == 0 && len(raw) != 0 {
 		return nil, nil
 	}
 	if param == nil {
 		var local any
 		param = &local
 	}
-	return cliproxyFrameStreamChunks(target, translate(ctx, model, original, translated, data, param))
+	chunks, frameErr := cliproxyFrameStreamChunks(target, translate(ctx, model, original, translated, data, param))
+	return chunks, errors.Join(frameErr, protocol.ResponseToolInputError(*param))
 }
 
 func cliproxyFrameStreamChunks(target cliproxyStreamProtocol, chunks [][]byte) ([][]byte, error) {

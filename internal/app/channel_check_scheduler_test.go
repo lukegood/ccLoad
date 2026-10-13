@@ -260,7 +260,7 @@ func TestExecuteChannelTest_SuccessResetsCooldowns(t *testing.T) {
 		t.Fatalf("SetKeyCooldown failed: %v", err)
 	}
 
-	result := srv.executeChannelTest(ctx, created, 0, "sk-success", &testRequestOpenAI)
+	result := srv.executeChannelTestWithCooldown(ctx, created, 0, "sk-success", &testRequestOpenAI, true)
 	if success, _ := result["success"].(bool); !success {
 		t.Fatalf("expected success result, got %+v", result)
 	}
@@ -304,7 +304,7 @@ func TestExecuteChannelTest_FailureAppliesCooldown(t *testing.T) {
 		ModelEntries:          []model.ModelEntry{{Model: "gpt-4o-mini"}},
 	}, &model.APIKey{APIKey: "sk-failure", KeyStrategy: model.KeyStrategySequential})
 
-	result := srv.executeChannelTest(ctx, created, 0, "sk-failure", &testRequestOpenAI)
+	result := srv.executeChannelTestWithCooldown(ctx, created, 0, "sk-failure", &testRequestOpenAI, true)
 	if success, _ := result["success"].(bool); success {
 		t.Fatalf("expected failed result, got %+v", result)
 	}
@@ -367,7 +367,8 @@ func TestScheduledCheckCodexSSECostUsesRedirectedModel(t *testing.T) {
 		t.Fatalf("missing cost window: %+v", credential.QuotaCostUsage)
 	}
 	window := credential.QuotaCostUsage.Windows[0]
-	if window.Family != oauthcost.FamilySpark || window.StandardCostMicroUSD <= 0 {
+	cost := quotaCostViewAt(t, srv.store, cfg.ID, time.Now()).FindWindow(window.Key)
+	if window.Family != oauthcost.FamilySpark || cost == nil || cost.StandardCostMicroUSD <= 0 {
 		t.Fatalf("redirected detection must charge Spark: %+v", window)
 	}
 }

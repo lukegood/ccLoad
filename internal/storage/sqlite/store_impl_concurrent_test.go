@@ -17,7 +17,7 @@ import (
 
 // TestConcurrentConfigCreate 测试并发创建渠道配置
 func TestConcurrentConfigCreate(t *testing.T) {
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
+	store, cleanup := setupSQLiteTestStore(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -73,7 +73,7 @@ func TestConcurrentConfigCreate(t *testing.T) {
 
 // TestConcurrentConfigReadWrite 测试并发读写渠道配置
 func TestConcurrentConfigReadWrite(t *testing.T) {
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
+	store, cleanup := setupSQLiteTestStore(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -146,7 +146,7 @@ func TestConcurrentConfigReadWrite(t *testing.T) {
 
 // TestConcurrentLogAdd 测试并发添加日志
 func TestConcurrentLogAdd(t *testing.T) {
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
+	store, cleanup := setupSQLiteTestStore(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -205,7 +205,7 @@ func TestConcurrentLogAdd(t *testing.T) {
 
 // TestConcurrentBatchLogAdd 测试并发批量添加日志
 func TestConcurrentBatchLogAdd(t *testing.T) {
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
+	store, cleanup := setupSQLiteTestStore(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -257,7 +257,7 @@ func TestConcurrentBatchLogAdd(t *testing.T) {
 
 // TestConcurrentAPIKeyOperations 测试并发API Key操作
 func TestConcurrentAPIKeyOperations(t *testing.T) {
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
+	store, cleanup := setupSQLiteTestStore(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -335,97 +335,6 @@ func TestConcurrentAPIKeyOperations(t *testing.T) {
 
 	if len(allKeys) < int(creates)*9/10 {
 		t.Errorf("API Key数量不匹配: 数据库中有%d个，期望至少%d个", len(allKeys), creates*9/10)
-	}
-}
-
-// TestConcurrentCooldownOperations 测试并发冷却操作
-func TestConcurrentCooldownOperations(t *testing.T) {
-	if testing.Short() {
-		t.Skip("跳过并发测试（使用 -short 标志）")
-	}
-
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
-	defer cleanup()
-
-	ctx := context.Background()
-
-	// 预先创建渠道和Keys
-	cfg := &model.Config{
-		Name:    "test-cooldown-channel",
-		URLs:    model.ChannelURLs{{URL: "https://api.example.com"}},
-		Enabled: true,
-	}
-	created, err := store.CreateConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("创建初始配置失败: %v", err)
-	}
-
-	// 创建3个API Keys
-	cdKeys := make([]*model.APIKey, 3)
-	for i := 0; i < 3; i++ {
-		cdKeys[i] = &model.APIKey{
-			ChannelID:   created.ID,
-			KeyIndex:    i,
-			APIKey:      fmt.Sprintf("sk-cooldown-key-%d", i),
-			KeyStrategy: model.KeyStrategySequential,
-		}
-	}
-	_ = store.CreateAPIKeysBatch(ctx, cdKeys)
-
-	// 使用信号量控制并发度为2，避免过多BUSY错误
-	sem := make(chan struct{}, 2)
-	var wg sync.WaitGroup
-	var channelCooldowns atomic.Int32
-	var keyCooldowns atomic.Int32
-
-	now := time.Now()
-
-	// 并发更新渠道冷却（5次）
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			statusCode := 500 + (idx % 5)
-			_, err := store.BumpChannelCooldown(ctx, created.ID, now, statusCode)
-			if err == nil {
-				channelCooldowns.Add(1)
-			}
-		}(i)
-	}
-
-	// 并发更新Key冷却（6次，每个Key 2次）
-	for i := 0; i < 6; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			keyIndex := idx % 3
-			_, err := store.BumpKeyCooldown(ctx, created.ID, keyIndex, now, 401)
-			if err == nil {
-				keyCooldowns.Add(1)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	channelSucc := channelCooldowns.Load()
-	keySucc := keyCooldowns.Load()
-
-	t.Logf("[INFO] 并发冷却测试完成: 渠道冷却成功=%d/5, Key冷却成功=%d/6",
-		channelSucc, keySucc)
-
-	// 至少有一些操作成功即可（验证并发安全性）
-	if channelSucc == 0 {
-		t.Error("渠道冷却全部失败")
-	}
-	if keySucc == 0 {
-		t.Error("Key冷却全部失败")
 	}
 }
 

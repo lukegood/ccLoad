@@ -45,7 +45,7 @@ func TestLogModelPricesUsesFuzzyMatchedRow(t *testing.T) {
 		t.Fatalf("fuzzy route = %+v, ok=%v", selected, ok)
 	}
 	entry := &model.LogEntry{ChannelID: cfg.ID, Model: "gemini-3-flash", ActualModel: "middle", Cost: 1}
-	if got, ok := server.logModelPrices(ctx, []*model.LogEntry{entry})(entry); !ok || !got.Equal(price) {
+	if got, _, ok := server.logModelPrices(ctx, []*model.LogEntry{entry})(entry); !ok || !got.Equal(price) {
 		t.Fatalf("log price = %+v, identifiable=%v, want %+v", got, ok, price)
 	}
 }
@@ -73,7 +73,7 @@ func TestDashboardLogsForceTokenScopeAndExposeSafeChannelFields(t *testing.T) {
 
 	now := model.JSONTime{Time: time.Now()}
 	for _, entry := range []*model.LogEntry{
-		{Time: now, Model: "jev-latest", LogSource: model.LogSourceJev, StatusCode: 200, AuthTokenID: 42, Message: "private audit"},
+		{Time: now, Model: "count-model", LogSource: model.LogSourceCountTokens, StatusCode: 200, AuthTokenID: 42, Message: "private estimate"},
 		{
 			Time:                     now,
 			Model:                    "gpt-5.6",
@@ -175,8 +175,8 @@ func TestDashboardLogsForceTokenScopeAndExposeSafeChannelFields(t *testing.T) {
 		costBreakdown.CacheRead.Quantity != 250 || costBreakdown.CacheWrite.Quantity != 125 {
 		t.Fatalf("unexpected cost breakdown quantities: %+v", costBreakdown)
 	}
-	if costBreakdown.ServiceTierMultiplier != 2.5 {
-		t.Fatalf("service_tier_multiplier=%v, want 2.5", costBreakdown.ServiceTierMultiplier)
+	if costBreakdown.ServiceTierMultiplier != 2 {
+		t.Fatalf("service_tier_multiplier=%v, want 2", costBreakdown.ServiceTierMultiplier)
 	}
 	var message string
 	if err := json.Unmarshal(entry["message"], &message); err != nil {
@@ -484,7 +484,7 @@ func TestDashboardModelsMetricsAndStatsExposeOnlyScopedChannels(t *testing.T) {
 		t.Fatalf("models channels=%v, want %v", got, wantChannels)
 	}
 
-	metricsCtx, metricsW := newTestContext(t, newRequest(http.MethodGet, "/dashboard/metrics?range=today&bucket_min=5", nil))
+	metricsCtx, metricsW := newTestContext(t, newRequest(http.MethodGet, "/dashboard/metrics?range=today&bucket_min=5&by_channel=1", nil))
 	metricsCtx.Set(webIdentityContextKey, WebIdentity{Role: model.WebRoleAPIToken, AuthTokenID: 42})
 	server.HandleMetrics(metricsCtx)
 	metrics := mustParseAPIResponse[[]model.MetricPoint](t, metricsW.Body.Bytes()).Data
@@ -504,7 +504,7 @@ func TestDashboardModelsMetricsAndStatsExposeOnlyScopedChannels(t *testing.T) {
 		t.Fatalf("metrics channels=%v, want %v", metricChannels, want)
 	}
 
-	statsCtx, statsW := newTestContext(t, newRequest(http.MethodGet, "/dashboard/stats?range=today", nil))
+	statsCtx, statsW := newTestContext(t, newRequest(http.MethodGet, "/dashboard/stats?range=today&health_timeline=1", nil))
 	statsCtx.Set(webIdentityContextKey, WebIdentity{Role: model.WebRoleAPIToken, AuthTokenID: 42})
 	server.HandleStats(statsCtx)
 	statsData := mustParseAPIResponse[struct {
@@ -568,7 +568,7 @@ func TestDashboardModelsMetricsAndStatsExposeOnlyScopedChannels(t *testing.T) {
 
 	summaryCtx, summaryW := newTestContext(t, newRequest(http.MethodGet, "/dashboard/summary?range=today", nil))
 	summaryCtx.Set(webIdentityContextKey, WebIdentity{Role: model.WebRoleAPIToken, AuthTokenID: 42})
-	server.HandlePublicSummary(summaryCtx)
+	server.HandleDashboardSummary(summaryCtx)
 	summary := mustParseAPIResponse[struct {
 		TotalRequests int `json:"total_requests"`
 	}](t, summaryW.Body.Bytes()).Data

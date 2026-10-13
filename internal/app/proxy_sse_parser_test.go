@@ -36,7 +36,7 @@ func TestNativeImagesUsageAndCompletion(t *testing.T) {
 			imageUsage := parser.GetImageUsage()
 			res := &fwResult{InputTokens: input, OutputTokens: output, CacheReadInputTokens: cached, ImageUsage: &imageUsage}
 			// 30 text + 10 cached text + 40 image + 20 cached image + 50 output.
-			if cost := computeRequestCost("gpt-image-2.5-flare", "", res); !floatEquals(cost, 0.0020225) {
+			if cost := computeRequestCostWithPrice("gpt-image-2.5-flare", "", nil, res); !floatEquals(cost, 0.0020225) {
 				t.Fatalf("image cost=%g, want 0.0020225", cost)
 			}
 		})
@@ -724,6 +724,20 @@ data: {"type":"message_stop","usage":{"input_tokens":0,"output_tokens":0,"cache_
 			wantAggregate: 0,
 			want5m:        0,
 			want1h:        0,
+		},
+		{
+			// 真实 Anthropic 帧形状：message_delta 只重发 aggregate，不带 cache_creation
+			name: "aggregate-only delta matching known split keeps 1h",
+			sseData: `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":4,"cache_creation_input_tokens":10117,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":10117}}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":4,"cache_creation_input_tokens":10117,"cache_read_input_tokens":0,"output_tokens":4}}
+
+`,
+			wantAggregate: 10117,
+			want5m:        0,
+			want1h:        10117,
 		},
 		{
 			name: "aggregate-only falls back to 5m and clears 1h",

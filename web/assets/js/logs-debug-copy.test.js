@@ -201,7 +201,10 @@ async function withLoadedLogsPage(options, assertions) {
   };
 
   setGlobal('window', {
-    t: (key) => key === 'logs.sourceCheckinBadge' ? '签到' : key,
+    t: (key, params) => {
+      if (key === 'logs.sourceCheckinBadge') return '签到';
+      return params ? `${key} ${Object.values(params).join(' ')}` : key;
+    },
     initPageBootstrap() {},
     addEventListener: (type, handler) => {
       windowListeners[type] = handler;
@@ -237,6 +240,8 @@ async function withLoadedLogsPage(options, assertions) {
   setGlobal('TemplateEngine', { render: () => null });
   setGlobal('escapeHtml', (value) => String(value ?? ''));
   setGlobal('calculateTokenSpeed', () => null);
+  setGlobal('getCostDisplayInfo', (standardCost, effectiveCost) => ({standardCost, effectiveCost, hasMultiplier: false}));
+  setGlobal('formatCost', value => '$' + value);
   setGlobal('fetchDataWithAuth', async (url) => {
     if (url.startsWith('/dashboard/models?')) return { models: [], channels: [] };
     throw new Error(`unexpected fetchDataWithAuth call: ${url}`);
@@ -301,31 +306,23 @@ test('model filter options contain request models but not redirected models', as
   });
 });
 
-test('Jev audit messages use the shared debug-log entry and expose the decision summary', async () => {
+test('channelless count_tokens logs link to their debug-log entry', async () => {
   await withLoadedLogsPage({
-    logSource: 'jev',
+    logSource: 'count_tokens',
     entries: [{
       id: 42,
       time: Date.now(),
-      model: 'jev-latest',
+      model: 'claude-sonnet-5-5',
       status_code: 200,
       duration: 0.2,
-      log_source: 'jev',
-      message: JSON.stringify({
-        call_id: 'audit-42',
-        adopted: { category: 'quota' },
-        fallback: { reset: 'no_valid_reset' }
-      })
+      log_source: 'count_tokens'
     }]
   }, ({ tbody }) => {
-    assert.match(tbody.innerHTML, /log-source-badge[^>]*>Jev<\/span>/);
     assert.match(tbody.innerHTML, /debug-log-link has-upstream-detail[^>]*data-log-id="42"/);
-    assert.match(tbody.innerHTML, /call_id=audit-42, category=quota, fallback\.reset=no_valid_reset/);
-    assert.doesNotMatch(tbody.innerHTML, /<details>|jev-log-detail/);
   });
 });
 
-test('token channel visibility also controls actual model text, hover and redirect badge', async () => {
+test('token channel visibility also controls actual model text and hover', async () => {
   for (const [isTokenRole, showChannels] of [[true, false], [true, true], [false, false]]) {
     for (const modelField of ['actual_model', 'response_model']) {
       await withLoadedLogsPage({
@@ -339,17 +336,100 @@ test('token channel visibility also controls actual model text, hover and redire
       }, ({ tbody }) => {
         const html = tbody.innerHTML;
         assert.match(html, /requested-model/);
-        assert.match(html, /thinking-effort-badge/);
-        assert.match(html, /思考等级: high/);
-        assert.match(html, /思考\/推理Token: 123/);
         if (isTokenRole && !showChannels) {
-          assert.doesNotMatch(html, /private-upstream-model|model-actual|redirect-badge|实际模型:/);
+          assert.doesNotMatch(html, /private-upstream-model|model-actual|logs\.titleActualModel/);
         } else {
-          assert.match(html, /model-actual/);
-          assert.match(html, /实际模型: private-upstream-model/);
-          assert.match(html, /redirect-badge/);
+          assert.match(html, /logs\.titleActualModel private-upstream-model/);
         }
       });
     }
   }
+});
+
+test('small request costs keep significant digits instead of rounding to $0.000', () => {
+  const previousGlobals = new Map();
+  const setGlobal = (key, value) => {
+    previousGlobals.set(key, Object.getOwnPropertyDescriptor(global, key));
+    Object.defineProperty(global, key, { configurable: true, writable: true, value });
+  };
+  const noop = () => {};
+  const element = () => ({
+    style: { setProperty: noop },
+    dataset: {},
+    classList: { add: noop, remove: noop, toggle: noop, contains: () => false },
+    appendChild: noop,
+    setAttribute: noop,
+    getAttribute: () => null,
+    addEventListener: noop,
+    querySelectorAll: () => [],
+    querySelector: () => null
+  });
+  setGlobal('window', {
+    location: { pathname: '/', search: '', href: '' },
+    addEventListener: noop,
+    dispatchEvent: noop,
+    matchMedia: () => ({ matches: false, addEventListener: noop })
+  });
+  setGlobal('localStorage', { getItem: () => null, setItem: noop, removeItem: noop });
+  setGlobal('document', {
+    addEventListener: noop,
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    getElementById: () => null,
+    createElement: element,
+    body: element(),
+    documentElement: element()
+  });
+  setGlobal('CustomEvent', function CustomEvent() {});
+
+  try {
+    delete require.cache[require.resolve('./ui.js')];
+    require('./ui.js');
+    const { formatCost } = global.window;
+
+    assert.equal(formatCost(0.0002), '$0.0002');
+    assert.equal(formatCost(0.00012345), '$0.00012');
+    assert.equal(formatCost(0.005), '$0.005');
+    assert.equal(formatCost(0.0000004), '<$0.000001');
+    assert.equal(formatCost(1.23456), '$1.235');
+    assert.equal(formatCost(0), '$0');
+    assert.equal(formatCost(0.0002, 2), '$0.00');
+  } finally {
+    delete require.cache[require.resolve('./ui.js')];
+    for (const [key, descriptor] of previousGlobals) {
+      if (descriptor === undefined) delete global[key];
+      else Object.defineProperty(global, key, descriptor);
+    }
+  }
+});
+
+test('reasoning logs show a level change on the model badge and the judgment in the message', async () => {
+  const business = (client, sent, extra = {}) => ({time: Date.now(), model: 'business', thinking_effort: sent, status_code: 200, duration: 0, log_source: 'proxy',
+    reasoning_decision: {status: 'decided', trigger: 'user_input', client_effort: client, suggested_effort: sent, confidence: 0.6, ...extra}});
+  for (const isTokenRole of [false, true]) {
+    await withLoadedLogsPage({isTokenRole, entries: [
+      {...business('xhigh', 'low', {decision_channel_id: 1507, decision_model: 'private-judge', decision_id: 'corr-1', context_truncated: true}), reasoning_tokens: 72},
+      business('', 'high'),
+      business('max', 'xhigh'),
+      business('medium', 'medium'),
+      {time: Date.now(), model: 'judge', status_code: 200, duration: 0, log_source: 'proxy', client_protocol: 'system_one',
+        reasoning_decision: {status: 'decided', suggested_effort: 'xhigh', confidence: 0.554, duration_ms: 12, cost_unknown: true}},
+      {time: Date.now(), model: 'judge', status_code: 504, duration: 0, log_source: 'proxy', client_protocol: 'system_one',
+        reasoning_decision: {status: 'fallback', reason: 'timeout'}}]}, ({tbody}) => {
+      const badges = [...tbody.innerHTML.matchAll(/<sup[^>]*>([^<]*)<\/sup>/g)].map(match => match[1]);
+      assert.deepEqual(badges, ['xhigh→low 72', 'high', 'max→xhigh', 'medium']);
+      assert.doesNotMatch(tbody.innerHTML, /logs\.reasoning\.changed/);
+      assert.match(tbody.innerHTML, /logs.reasoning.judged xhigh(logs.reasoning.confidence 0.55)?/);
+      assert.match(tbody.innerHTML, /logs.reasoning.failed timeout/);
+      assert.match(tbody.innerHTML, /logs.costUnknown/);
+      assert.doesNotMatch(tbody.innerHTML, /private-judge|1507|corr-1|truncated|user_input/);
+    });
+  }
+});
+
+test('unknown decision cost does not replace known business request cost', async () => {
+  await withLoadedLogsPage({entries: [{time: Date.now(), model: 'business', status_code: 200, duration: 0, cost: 0.25, log_source: 'proxy', reasoning_decision: {cost_unknown: true}}]}, ({tbody}) => {
+    assert.doesNotMatch(tbody.innerHTML, /logs.costUnknown/);
+    assert.match(tbody.innerHTML, /0.25/);
+  });
 });

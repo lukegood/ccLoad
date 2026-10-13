@@ -30,13 +30,15 @@
   <script defer src="/web/assets/js/model-test-image.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/model-entry-parser.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/token-model-test.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/oauth-plan-badge.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/model-test-route-preview.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/model-test.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/logs-channel-editor.js?v=__VERSION__"></script>
   <script src="/web/assets/js/marked.min.js?v=__VERSION__"></script>
   <script src="/web/assets/js/purify.min.js?v=__VERSION__"></script>
   <script src="/web/assets/js/highlight.min.js?v=__VERSION__"></script>
 </head>
-<body>
+<body class="top-layout">
   <div class="app-container">
     <main class="main-content">
       <div class="content-area">
@@ -114,6 +116,14 @@
                 </svg>
                 <span data-i18n="modelTest.mode.model">按模型测试</span>
               </button>
+              <button id="modeTabPreview" type="button" class="mode-tab-btn" role="tab" aria-selected="false" aria-controls="routePreviewPanel" tabindex="-1" data-action="set-test-mode" data-mode="preview">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="6" cy="19" r="3"></circle>
+                  <path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"></path>
+                  <circle cx="18" cy="5" r="3"></circle>
+                </svg>
+                <span data-i18n="modelTest.mode.preview">选路预演</span>
+              </button>
             </div>
           </div>
 
@@ -131,7 +141,7 @@
                   data-i18n-placeholder="modelTest.modelInputPlaceholder"
                   placeholder="输入或选择模型"
                 >
-                <div id="chatModelSelectDropdown" class="filter-dropdown" role="listbox" aria-label="模型"></div>
+                <div id="chatModelSelectDropdown" class="filter-dropdown" role="listbox" data-i18n-aria-label="common.model" aria-label="模型"></div>
               </div>
             </label>
             <label class="chat-control chat-control--selector">
@@ -201,6 +211,35 @@
             <button id="chatClearBtn" type="button" class="btn btn-secondary" data-action="clear-chat" data-i18n="modelTest.chat.clear">清空</button>
           </div>
 
+          <div id="routePreviewPanel" class="hidden" role="tabpanel" aria-labelledby="modeTabPreview">
+            <form id="routePreviewForm" class="route-preview-toolbar">
+              <label class="model-test-control route-preview-control--token" for="routePreviewToken">
+                <span class="model-test-control__label" data-i18n="modelTest.routePreview.token">令牌</span>
+                <select id="routePreviewToken" class="filter-select"><option value="" data-i18n="modelTest.routePreview.noToken">不限令牌</option></select>
+              </label>
+              <label class="model-test-control route-preview-control--protocol" for="routePreviewProtocol">
+                <span class="model-test-control__label" data-i18n="modelTest.clientProtocol">请求协议</span>
+                <select id="routePreviewProtocol" class="filter-select"></select>
+              </label>
+              <label class="model-test-control route-preview-control--model" for="routePreviewModel">
+                <span class="model-test-control__label" data-i18n="common.model">模型</span>
+                <select id="routePreviewModel" class="filter-select" required></select>
+              </label>
+              <div class="model-test-run-controls">
+                <label class="model-test-toggle">
+                  <input id="routePreviewMultimodal" type="checkbox" class="control-checkbox control-checkbox--sm">
+                  <span data-i18n="modelTest.routePreview.multimodal">多模态请求</span>
+                </label>
+                <button id="routePreviewRun" type="submit" class="btn btn-primary model-test-toolbar-btn" data-i18n="modelTest.routePreview.run">开始预演</button>
+              </div>
+            </form>
+            <div class="route-preview-meta">
+              <span class="route-preview-hint" data-i18n="modelTest.routePreview.scope">普通生成候选预演，不发送请求；同档渠道轮转，表格顺序不代表实际首选。</span>
+              <span id="routePreviewStatus" class="model-test-progress" role="status" aria-live="polite"></span>
+            </div>
+            <div id="routePreviewResults"></div>
+          </div>
+
           <div id="modelTestTablePanel" role="tabpanel" aria-labelledby="modeTabChannel">
           <!-- 控制栏 -->
           <div class="model-test-toolbar">
@@ -221,7 +260,7 @@
                     data-i18n-placeholder="modelTest.modelInputPlaceholder"
                     placeholder="输入或选择模型"
                   >
-                  <div id="testModelSelectDropdown" class="filter-dropdown" role="listbox" aria-label="模型"></div>
+                  <div id="testModelSelectDropdown" class="filter-dropdown" role="listbox" data-i18n-aria-label="common.model" aria-label="模型"></div>
                 </div>
               </label>
               <div id="keySelectorLabel" class="model-test-control model-test-control--key">
@@ -307,7 +346,7 @@
             <div class="model-test-toolbar-section model-test-toolbar-section--meta">
               <label class="model-test-control model-test-control--name-filter">
                 <span class="model-test-control__label" data-i18n="common.search">搜索</span>
-                <input type="text" id="modelTestMobileNameFilter" value="" class="model-test-inline-input" autocomplete="off" spellcheck="false" placeholder="搜索模型名称...">
+                <input type="text" id="modelTestMobileNameFilter" value="" class="model-test-inline-input" autocomplete="off" spellcheck="false" data-i18n-placeholder="modelTest.filterModelPlaceholder" placeholder="搜索模型名称...">
               </label>
               <span id="testProgress" class="model-test-progress"></span>
             </div>
@@ -392,10 +431,11 @@
                       autocomplete="off"
                       spellcheck="false"
                       data-i18n-title="modelTest.chat.thinkingLevel"
+                      data-i18n-aria-label="modelTest.chat.thinkingLevel"
                       title="思考等级"
                       aria-label="思考等级"
                     >
-                    <div id="chatThinkingLevelDropdown" class="filter-dropdown" role="listbox" aria-label="思考等级"></div>
+                    <div id="chatThinkingLevelDropdown" class="filter-dropdown" role="listbox" data-i18n-aria-label="modelTest.chat.thinkingLevel" aria-label="思考等级"></div>
                   </div>
                 </div>
                 <button
@@ -429,7 +469,7 @@
                   <span class="chat-control__label" data-i18n="common.model">模型</span>
                   <div class="filter-combobox-wrapper image-test-model-combobox">
                     <input id="imageModelInput" class="filter-select filter-combobox" type="text" autocomplete="off" spellcheck="false" required data-i18n-placeholder="modelTest.modelInputPlaceholder" placeholder="输入或选择模型">
-                    <div id="imageModelDropdown" class="filter-dropdown" role="listbox" aria-label="模型"></div>
+                    <div id="imageModelDropdown" class="filter-dropdown" role="listbox" data-i18n-aria-label="common.model" aria-label="模型"></div>
                   </div>
                 </label>
                 <label class="chat-control chat-control--selector image-test-target-control">
@@ -511,11 +551,11 @@
   </div>
 
   <!-- 对话高级选项弹窗 -->
-  <div id="chatAdvancedOptionsModal" class="modal">
+  <div id="chatAdvancedOptionsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="chatAdvancedOptionsModalTitle">
     <div class="modal-content modal-content--md chat-advanced-modal-content">
       <div class="modal-header modal-header--compact">
-        <h2 class="modal-title" data-i18n="modelTest.chat.advancedTitle">高级选项</h2>
-        <button type="button" class="close-btn" data-action="close-chat-advanced-options" aria-label="Close">&times;</button>
+        <h2 id="chatAdvancedOptionsModalTitle" class="modal-title" data-i18n="modelTest.chat.advancedTitle">高级选项</h2>
+        <button type="button" class="close-btn" data-action="close-chat-advanced-options" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
       </div>
       <div class="chat-advanced-form">
         <label class="chat-advanced-field chat-advanced-field--full">
@@ -577,10 +617,10 @@
     <tr class="mobile-card-row model-test-row" data-channel-id="{{channelId}}" data-model="{{model}}" data-channel-base-name="{{channelBaseName}}" data-channel-enabled="{{channelEnabled}}" data-cost-multiplier="{{costMultiplier}}">
       <td class="model-test-col-select mobile-card-no-label" data-mobile-label="{{mobileLabelSelect}}"><input type="checkbox" class="row-checkbox channel-checkbox" checked></td>
       <td class="model-test-col-name truncate-cell" data-mobile-label="{{mobileLabelName}}">
-        <button type="button" class="channel-link" data-channel-id="{{channelId}}" title="{{channelName}}">{{channelName}}</button>
+        <span class="model-test-channel-name"><button type="button" class="channel-link" data-channel-id="{{channelId}}" title="{{channelName}}">{{channelName}}</button>{{{oauthPlanBadge}}}</span>
       </td>
       <td class="model-test-col-priority channel-priority" data-mobile-label="{{mobileLabelPriority}}"><div class="ch-priority-editor-wrap" data-channel-id="{{channelId}}"><input class="ch-priority-input" type="number" min="-99999" max="9999999" step="1" value="{{channelPriority}}" data-channel-id="{{channelId}}" data-original-priority="{{channelPriority}}"></div>{{{dynamicPriorityHtml}}}</td>
-      <td class="model-test-col-enabled" data-mobile-label="{{mobileLabelEnabled}}"><button class="channel-enable-switch {{toggleSwitchClass}}" data-channel-id="{{channelId}}" data-enabled="{{modelEnabled}}" role="switch" aria-checked="{{modelEnabled}}" title="{{toggleTitle}}" aria-label="{{toggleTitle}}"><span class="channel-enable-switch__knob" aria-hidden="true"></span></button></td>
+      <td class="model-test-col-enabled" data-mobile-label="{{mobileLabelEnabled}}"><button type="button" class="channel-enable-switch {{toggleSwitchClass}}" data-channel-id="{{channelId}}" data-enabled="{{modelEnabled}}" role="switch" aria-checked="{{modelEnabled}}" title="{{toggleTitle}}" aria-label="{{toggleTitle}}"><span class="channel-enable-switch__knob" aria-hidden="true"></span></button></td>
       <td class="model-test-col-first-byte first-byte-duration" data-mobile-label="{{mobileLabelFirstByte}}">-</td>
       <td class="model-test-col-duration duration" data-mobile-label="{{mobileLabelDuration}}">-</td>
       <td class="model-test-col-input input-tokens" data-mobile-label="{{mobileLabelInput}}">-</td>
@@ -599,11 +639,11 @@
   </template>
 
   <!-- 上游请求/响应详情弹窗 -->
-  <div id="upstreamDetailModal" class="modal">
+  <div id="upstreamDetailModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="upstreamDetailModalTitle">
     <div class="modal-content upstream-detail-modal-content">
       <div class="modal-header">
-        <h2 class="modal-title" data-i18n="channels.test.upstreamDetail">上游请求/响应详情</h2>
-        <button type="button" class="close-btn" data-action="close-upstream-detail">&times;</button>
+        <h2 id="upstreamDetailModalTitle" class="modal-title" data-i18n="channels.test.upstreamDetail">上游请求/响应详情</h2>
+        <button type="button" class="close-btn" data-action="close-upstream-detail" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
       </div>
       <div class="upstream-detail-tabs">
         <button type="button" class="upstream-tab active" data-tab="request" data-i18n="channels.test.tabRequest">Request</button>
@@ -623,11 +663,11 @@
   </div>
 
   <!-- 批量添加模型弹窗 -->
-  <div id="addModelsModal" class="modal">
+  <div id="addModelsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="addModelsModalTitle">
     <div class="modal-content modal-content--lg">
       <div class="modal-header modal-header--compact">
-        <h2 class="modal-title" data-i18n="modelTest.addModelsTitle">批量添加模型</h2>
-        <button id="addModelsCloseBtn" class="close-btn" aria-label="Close">&times;</button>
+        <h2 id="addModelsModalTitle" class="modal-title" data-i18n="modelTest.addModelsTitle">批量添加模型</h2>
+        <button id="addModelsCloseBtn" type="button" class="close-btn" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
       </div>
       <label class="model-test-add-field">
         <span class="model-test-add-label" data-i18n="modelTest.addModelsInputLabel">输入模型（逗号或换行分隔）</span>
@@ -651,26 +691,26 @@
         </ul>
       </div>
       <div class="confirm-actions confirm-actions--end">
-        <button id="addModelsCancelBtn" class="btn btn-secondary" data-i18n="common.cancel">取消</button>
-        <button id="addModelsConfirmBtn" class="btn btn-primary" data-i18n="modelTest.addModelsConfirm">确认添加</button>
+        <button id="addModelsCancelBtn" type="button" class="btn btn-secondary" data-i18n="common.cancel">取消</button>
+        <button id="addModelsConfirmBtn" type="button" class="btn btn-primary" data-i18n="modelTest.addModelsConfirm">确认添加</button>
       </div>
     </div>
   </div>
 
   <!-- 删除预览确认弹窗 -->
-  <div id="deletePreviewModal" class="modal">
+  <div id="deletePreviewModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="deletePreviewModalTitle">
     <div class="modal-content modal-content--lg">
       <div class="modal-header modal-header--compact">
-        <h2 class="modal-title" data-i18n="modelTest.deletePreviewTitle">确认删除模型</h2>
-        <button id="deletePreviewCloseBtn" class="close-btn" aria-label="Close">&times;</button>
+        <h2 id="deletePreviewModalTitle" class="modal-title" data-i18n="modelTest.deletePreviewTitle">确认删除模型</h2>
+        <button id="deletePreviewCloseBtn" type="button" class="close-btn" data-i18n-aria-label="common.close" aria-label="关闭">&times;</button>
       </div>
       <p class="modal-description" data-i18n="modelTest.deletePreviewDesc">将按以下分组删除，请确认：</p>
       <pre id="deletePreviewContent" class="delete-preview-text">-</pre>
       <p id="deletePreviewProgress" class="model-test-delete-preview-progress hidden">-</p>
       <pre id="deletePreviewRuntimeLog" class="delete-preview-text model-test-delete-preview-log hidden">-</pre>
       <div class="confirm-actions confirm-actions--end">
-        <button id="deletePreviewCancelBtn" class="btn btn-secondary" data-i18n="common.cancel">取消</button>
-        <button id="deletePreviewConfirmBtn" class="btn btn-danger" data-i18n="modelTest.deletePreviewConfirm">确认删除</button>
+        <button id="deletePreviewCancelBtn" type="button" class="btn btn-secondary" data-i18n="common.cancel">取消</button>
+        <button id="deletePreviewConfirmBtn" type="button" class="btn btn-danger" data-i18n="modelTest.deletePreviewConfirm">确认删除</button>
       </div>
     </div>
   </div>

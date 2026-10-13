@@ -74,7 +74,7 @@ func (s *Server) runScheduledChannelChecks(ctx context.Context, now time.Time) e
 	}
 	due := configs[:0]
 	for _, cfg := range configs {
-		if cfg.ScheduledCheckDueAt(now) && cfg.UpdatedAt.Before(now.Truncate(time.Minute)) {
+		if !cfg.IsSystemOne() && cfg.ScheduledCheckDueAt(now) && cfg.UpdatedAt.Before(now.Truncate(time.Minute)) {
 			due = append(due, cfg)
 		}
 	}
@@ -119,7 +119,7 @@ func (s *Server) runScheduledChannelCheck(ctx context.Context, cfg *model.Config
 		return
 	}
 	var rowAvailable func(modelRoutingSelection) bool
-	if cfg.GetAuthType() == model.AuthTypeAPIKey {
+	if !cfg.UsesOAuth() {
 		protocols := scheduledCheckUpstreamProtocols(cfg)
 		now := time.Now()
 		rowAvailable = func(selected modelRoutingSelection) bool {
@@ -159,7 +159,7 @@ func (s *Server) runScheduledChannelCheck(ctx context.Context, cfg *model.Config
 	}
 	logModel, logThinking := channelTestLogIdentity(req.Model, req.ThinkingEffort)
 	result := s.executeChannelTestWithCooldown(ctx, runtimeCfg, keySelection.keyIndex, keySelection.requestCredential, req, keySelection.updatePersistedCooldown)
-	s.persistDetectionLog(ctx, detectionLogFromResult(cfg, model.LogSourceScheduledCheck, logModel, channelTestActualModel(result, req.Model), keySelection.apiKey, "", logThinking, result))
+	s.persistDetectionLog(ctx, detectionLogFromResult(cfg, model.LogSourceScheduledCheck, logModel, channelTestActualModel(result, req.Model), keySelection, "", logThinking, result))
 	logScheduledChannelCheckResult(cfg, keySelection.keyIndex, req.Model, result)
 }
 
@@ -191,6 +191,7 @@ func (s *Server) prepareScheduledChannelCheckAuth(ctx context.Context, cfg *mode
 		apiKey:                  apiKey,
 		requestCredential:       apiKey,
 		updatePersistedCooldown: true,
+		costMultiplier:          apiKeyCostMultiplierAt(cfg, compatible, keyIndex),
 	}, err
 }
 

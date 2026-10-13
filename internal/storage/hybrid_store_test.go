@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"os"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,6 +40,38 @@ func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool
 	if !condition() {
 		t.Fatal("等待条件超时")
 	}
+}
+
+func createCodexQuotaChannel(t *testing.T, store Store, now time.Time) int64 {
+	t.Helper()
+	credentialJSON, err := (&codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: now.Add(time.Hour).Format(time.RFC3339),
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
+			Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
+			StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix(),
+		}}},
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateConfig(context.Background(), &model.Config{
+		Name: "oauth-ledger", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return created.ID
+}
+
+func allLedgerRows(t *testing.T, store *sqlstore.SQLStore) []sqlstore.OAuthQuotaLedgerReplicaRow {
+	t.Helper()
+	rows, err := store.ListOAuthQuotaLedgerRangeReplica(context.Background(), 0, math.MaxInt64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
 }
 
 func TestHybridStore_SQLiteSuccessDoesNotWaitForPrimary(t *testing.T) {
@@ -122,6 +156,7 @@ func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
 	}
 	updated := created.Clone()
 	updated.Name = "final"
+	updated.OAuthQuotaPassthrough = true
 	if _, err := hybrid.UpdateConfig(ctx, created.ID, updated); err != nil {
 		t.Fatalf("UpdateConfig: %v", err)
 	}
@@ -132,7 +167,7 @@ func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
 		disabled, disabledErr := primary.LoadDisabledURLs(ctx)
 		// The model cooldown replicates as its own queued entity, so waiting on
 		// the channel state alone can observe a queue that is still draining.
-		return cfgErr == nil && cfg.Name == "final" &&
+		return cfgErr == nil && cfg.Name == "final" && cfg.OAuthQuotaPassthrough &&
 			keysErr == nil && len(keys) == 1 && keys[0].Disabled && keys[0].Priority == -9 &&
 			disabledErr == nil && len(disabled[created.ID]) == 1 &&
 			hybrid.RuntimeMetrics().PrimarySyncPending == 0
@@ -195,7 +230,7 @@ func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	readCost := func(store *sqlstore.SQLStore) (int64, bool) {
+	readCost := func(store Store) (int64, bool) {
 		cfg, getErr := store.GetConfig(ctx, created.ID)
 		if getErr != nil {
 			return 0, false
@@ -204,7 +239,12 @@ func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing
 		if parseErr != nil {
 			return 0, false
 		}
-		window := oauthcost.Find(credential.QuotaCostUsage, "codex|secondary")
+		usage := oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage)
+		views, viewErr := store.OAuthQuotaCostViews(ctx, map[int64]*oauthcost.Usage{created.ID: usage}, now.Add(time.Minute))
+		if viewErr != nil {
+			return 0, false
+		}
+		window := views[created.ID].FindWindow("codex|secondary")
 		if window == nil {
 			return 0, false
 		}
@@ -229,13 +269,15 @@ func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated, costs, err := hybrid.CompareAndSwapOAuthUsage(ctx, created.ID, model.AuthTypeCodexOAuth, cfg.OAuthCredential, payload)
-	if err != nil || !updated || oauthcost.Find(costs, "codex|secondary").StandardCostMicroUSD != 2_250_000 {
-		t.Fatalf("quota window reconciliation = %t, %+v, %v", updated, costs, err)
+	updated, err := hybrid.CompareAndSwapOAuthUsage(ctx, created.ID, model.AuthTypeCodexOAuth, cfg.OAuthCredential, payload)
+	if err != nil || !updated {
+		t.Fatalf("quota window reconciliation = %t, %v", updated, err)
+	}
+	if cost, ok := readCost(hybrid); !ok || cost != 2_250_000 {
+		t.Fatalf("hybrid quota cost = (%d, %t), want 2250000", cost, ok)
 	}
 	waitForCondition(t, 3*time.Second, func() bool {
-		cost, ok := readCost(primary)
-		if !ok || cost != 2_250_000 {
+		if cost, ok := readCost(primary); !ok || cost != 2_250_000 {
 			return false
 		}
 		cfg, getErr := primary.GetConfig(ctx, created.ID)
@@ -249,6 +291,82 @@ func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing
 		logs, listErr := primary.ListLogs(ctx, now.Add(-time.Minute), 10, 0, nil)
 		return listErr == nil && len(logs) == 1
 	})
+}
+
+func TestHybridStore_FullReconcileMirrorsOAuthQuotaLedger(t *testing.T) {
+	ctx := context.Background()
+	sqlite := createTestSQLiteStore(t)
+	primary := createTestSQLiteStore(t)
+	release := make(chan struct{})
+	hybrid := newHybridStore(sqlite, primary, func(initCtx context.Context) error {
+		select {
+		case <-release:
+			return nil
+		case <-initCtx.Done():
+			return initCtx.Err()
+		}
+	})
+	hybrid.primarySync.configureReconcile(1, hybrid.reconcilePrimary, hybrid.markPrimaryReconcileDirty)
+	t.Cleanup(func() { _ = hybrid.Close() })
+
+	now := time.Now().UTC().Truncate(time.Second)
+	channelID := createCodexQuotaChannel(t, hybrid, now)
+	if _, err := primary.ExecContext(ctx,
+		`INSERT INTO oauth_quota_cost_ledger (channel_id, bucket_at, model, window_key, cost_microusd) VALUES (?, ?, ?, '', ?)`,
+		channelID, now.Add(-30*24*time.Hour).Unix(), "gpt-5.6-sol", 3_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := hybrid.AddLog(ctx, &model.LogEntry{
+		Time: model.JSONTime{Time: now.Add(-2 * time.Hour)}, ChannelID: channelID, Model: "gpt-5.6-sol",
+		StatusCode: 200, Cost: 1.25, CostMultiplier: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := allLedgerRows(t, sqlite)
+	if len(want) != 1 || want[0].CostMicroUSD != 1_250_000 {
+		t.Fatalf("SQLite ledger = %#v", want)
+	}
+	close(release)
+	waitForCondition(t, 5*time.Second, func() bool {
+		return reflect.DeepEqual(allLedgerRows(t, primary), want) && hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+}
+
+func TestHybridStore_OAuthQuotaLedgerEqualDespiteSQLCollationOrder(t *testing.T) {
+	ctx := context.Background()
+	sqlite := createTestSQLiteStore(t)
+	primary := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+
+	// 模拟主库排序规则：两行主键仍不同，但 ORDER BY 与 SQLite 的字节序相反。
+	if _, err := primary.ExecContext(ctx, `DROP TABLE oauth_quota_cost_ledger`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := primary.ExecContext(ctx, `CREATE TABLE oauth_quota_cost_ledger (
+		channel_id INTEGER NOT NULL, bucket_at INTEGER NOT NULL,
+		model TEXT COLLATE NOCASE NOT NULL, window_key TEXT NOT NULL DEFAULT '', cost_microusd INTEGER NOT NULL,
+		PRIMARY KEY (channel_id, bucket_at, model, window_key))`); err != nil {
+		t.Fatal(err)
+	}
+	for _, store := range []*sqlstore.SQLStore{sqlite, primary} {
+		for _, modelName := range []string{"B", "a"} {
+			if _, err := store.ExecContext(ctx, `INSERT INTO oauth_quota_cost_ledger
+				(channel_id, bucket_at, model, window_key, cost_microusd) VALUES (1, 100, ?, '', 1)`, modelName); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if reflect.DeepEqual(allLedgerRows(t, sqlite), allLedgerRows(t, primary)) {
+		t.Fatal("test setup did not produce different SQL order")
+	}
+	if _, err := primary.ExecContext(ctx, `CREATE TRIGGER prevent_ledger_rewrite BEFORE DELETE ON oauth_quota_cost_ledger
+		BEGIN SELECT RAISE(ABORT, 'unexpected ledger rewrite'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := hybrid.copyOAuthQuotaLedgerRange(ctx, 0, 101); err != nil {
+		t.Fatalf("identical ledger rows were rewritten: %v", err)
+	}
 }
 
 func TestHybridStore_CreateUpdateDeleteKeepsTombstone(t *testing.T) {
@@ -268,6 +386,7 @@ func TestHybridStore_CreateUpdateDeleteKeepsTombstone(t *testing.T) {
 	token := &model.AuthToken{
 		Token:                  "hybrid-delete-channel-token",
 		Description:            "hybrid channel restriction",
+		RPMLimit:               12,
 		IsActive:               true,
 		AllowedChannelIDs:      []int64{created.ID},
 		ChannelRestrictionMode: model.ChannelRestrictionModeAllow,
@@ -277,7 +396,7 @@ func TestHybridStore_CreateUpdateDeleteKeepsTombstone(t *testing.T) {
 	}
 	waitForCondition(t, 3*time.Second, func() bool {
 		primaryToken, tokenErr := primary.GetAuthToken(ctx, token.ID)
-		return tokenErr == nil && len(primaryToken.AllowedChannelIDs) == 1 &&
+		return tokenErr == nil && primaryToken.RPMLimit == 12 && len(primaryToken.AllowedChannelIDs) == 1 &&
 			hybrid.RuntimeMetrics().PrimarySyncPending == 0
 	})
 	if err := hybrid.DeleteConfig(ctx, created.ID); err != nil {
@@ -286,7 +405,7 @@ func TestHybridStore_CreateUpdateDeleteKeepsTombstone(t *testing.T) {
 	waitForCondition(t, 3*time.Second, func() bool {
 		_, getErr := primary.GetConfig(ctx, created.ID)
 		primaryToken, tokenErr := primary.GetAuthToken(ctx, token.ID)
-		return getErr != nil && tokenErr == nil && !primaryToken.IsActive && len(primaryToken.AllowedChannelIDs) == 0 &&
+		return getErr != nil && tokenErr == nil && primaryToken.RPMLimit == 12 && !primaryToken.IsActive && len(primaryToken.AllowedChannelIDs) == 0 &&
 			hybrid.RuntimeMetrics().PrimarySyncPending == 0
 	})
 	if _, err := hybrid.GetConfig(ctx, created.ID); err == nil {
@@ -320,7 +439,7 @@ func TestHybridStore_ChannelReplicaUpdateIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := hybrid.CreateAPIKeysBatch(ctx, []*model.APIKey{{
-		ChannelID: created.ID, KeyIndex: 0, APIKey: "key",
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "key", ModelScopeAuto: true,
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -355,6 +474,10 @@ func TestHybridStore_ChannelReplicaUpdateIsAtomic(t *testing.T) {
 		cfg, getErr := primary.GetConfig(ctx, created.ID)
 		return getErr == nil && cfg.Name == "after" && hybrid.RuntimeMetrics().PrimarySyncPending == 0
 	})
+	key, err := primary.GetAPIKey(ctx, created.ID, 0)
+	if err != nil || !key.ModelScopeAuto {
+		t.Fatalf("replica lost scope source: key=%+v err=%v", key, err)
+	}
 }
 
 func TestHybridStore_StaleNaturalKeysConvergeToSQLiteIDs(t *testing.T) {
@@ -588,7 +711,7 @@ func TestHybridStore_AuthoritativeSQLiteFailureIsReturned(t *testing.T) {
 }
 
 func TestPrimaryWriteBehindDoesNotClearNewGeneration(t *testing.T) {
-	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	w := newPrimaryWriteBehindWithInitializer(10*time.Millisecond, time.Second, nil)
 	t.Cleanup(w.close)
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -609,7 +732,7 @@ func TestPrimaryWriteBehindDoesNotClearNewGeneration(t *testing.T) {
 }
 
 func TestPrimaryWriteBehindRetriesFailedFinalState(t *testing.T) {
-	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	w := newPrimaryWriteBehindWithInitializer(10*time.Millisecond, time.Second, nil)
 	t.Cleanup(w.close)
 	var attempts atomic.Int64
 	w.enqueue("state", "retry", func(context.Context) error {
@@ -625,7 +748,7 @@ func TestPrimaryWriteBehindRetriesFailedFinalState(t *testing.T) {
 }
 
 func TestPrimaryWriteBehindDoesNotRetryBestEffortLogs(t *testing.T) {
-	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	w := newPrimaryWriteBehindWithInitializer(10*time.Millisecond, time.Second, nil)
 	t.Cleanup(w.close)
 	var attempts atomic.Int64
 	w.enqueueBestEffort("logs/latest", "logs", func(context.Context) error {
@@ -640,7 +763,7 @@ func TestPrimaryWriteBehindDoesNotRetryBestEffortLogs(t *testing.T) {
 }
 
 func TestPrimaryWriteBehindPublishesReconcileOnlyAfterDirtyMarker(t *testing.T) {
-	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	w := newPrimaryWriteBehindWithInitializer(10*time.Millisecond, time.Second, nil)
 	t.Cleanup(w.close)
 	dirtyStarted := make(chan struct{})
 	releaseDirty := make(chan struct{})
@@ -782,4 +905,27 @@ func TestHybridStore_ChannelManagementCASMarksDirtyOnlyOnSuccess(t *testing.T) {
 	if generationAfterStaleCAS != generationBeforeStaleCAS {
 		t.Fatalf("stale CAS marked channel dirty: generation %d -> %d", generationBeforeStaleCAS, generationAfterStaleCAS)
 	}
+}
+
+func TestHybridStoreDecisionMetadataReplicated(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+	metadata := &model.ReasoningDecision{Status: "applied", SuggestedEffort: "high", ClientEffort: "xhigh", CostUnknown: true}
+	entry := &model.LogEntry{Time: model.JSONTime{Time: time.Now()}, ClientProtocol: "system_one", ReasoningDecision: metadata,
+		Model: "jev-latest", StatusCode: 200, Cost: 0.1, InputTokens: 20}
+	if err := hybrid.AddLog(ctx, entry); err != nil {
+		t.Fatal(err)
+	}
+	filter := &model.LogFilter{ClientProtocol: "system_one"}
+	logs, err := hybrid.ListLogs(ctx, time.Time{}, 10, 0, filter)
+	if err != nil || len(logs) != 1 || logs[0].ReasoningDecision == nil || *logs[0].ReasoningDecision != *metadata {
+		t.Fatalf("SQLite metadata = %+v, error = %v", logs, err)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		logs, err := primary.ListLogs(ctx, time.Time{}, 10, 0, filter)
+		return err == nil && len(logs) == 1 && logs[0].ReasoningDecision != nil && *logs[0].ReasoningDecision == *metadata
+	})
 }

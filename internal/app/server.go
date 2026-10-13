@@ -63,8 +63,9 @@ type Server struct {
 	cooldownManager               *cooldown.Manager          // 统一冷却管理器
 	healthCache                   *HealthCache               // 渠道健康度缓存
 	costCache                     *CostCache                 // 渠道每日成本缓存
-	channelRPMLimiter             *channelRPMLimiter         // 渠道RPM限制器（内存滑动窗口）
+	channelRPMLimiter             *rpmLimiter                // 渠道RPM限制器（内存滑动窗口）
 	sessionAffinity               *sessionAffinityStore      // Anthropic/Codex 会话 → 渠道/Key 绑定
+	sameChannelFailures           sameChannelFailureCounter  // same_channel_retries 跨请求连续失败计数(零值可用)
 	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道并发限制器（内存计数）
 	statsCache                    *StatsCache                // 统计结果缓存层
 	updateManager                 *version.UpdateManager     // 版本检查与可选自动应用的唯一状态源
@@ -90,6 +91,7 @@ type Server struct {
 	codexService                  *codexauth.Service
 	codexCredentials              *codexCredentialManager
 	codexQuotaResetInFlight       sync.Map
+	anthropicQuotaResetInFlight   sync.Map
 	antigravityOAuth              *codexOAuthManager
 	antigravityCredentials        *antigravityCredentialManager
 	antigravityService            *antigravityauth.Service
@@ -162,7 +164,9 @@ type Server struct {
 	multimodalFallbackUpdateMu sync.Mutex
 	modelPricingUpdateMu       sync.Mutex
 	settingsUpdateMu           sync.Mutex
-	jevClient                  *http.Client
+	reasoningAuto              model.ReasoningAutoConfig
+	reasoningStates            reasoningStateStore
+	reasoningDecisionSlots     chan struct{}
 
 	// 登录速率限制器（用于传递给AuthService）
 	loginRateLimiter *util.LoginRateLimiter
@@ -232,6 +236,10 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 
 	// 从ConfigService读取运行时配置（启动时加载一次，修改后重启生效）
 	runtimeCfg := loadServerRuntimeConfig(configService)
+	reasoningAuto, reasoningErr := ParseReasoningAutoConfig(configService.GetString(reasoningAutoSettingKey, "{}"))
+	if reasoningErr != nil {
+		log.Fatalf("[FATAL] 无效的 reasoning_auto: %v", reasoningErr)
+	}
 	warnMigratedEnvSettings()
 
 	// 运行时配置必须归属具体 Server/存储实例，构造函数不修改进程级状态。
@@ -263,10 +271,12 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		startedAt:        startedAt,
-		store:            store,
-		configService:    configService,
-		loginRateLimiter: util.NewLoginRateLimiter(),
+		startedAt:              startedAt,
+		store:                  store,
+		configService:          configService,
+		reasoningAuto:          reasoningAuto,
+		reasoningDecisionSlots: make(chan struct{}, 16),
+		loginRateLimiter:       util.NewLoginRateLimiter(),
 
 		// 运行时配置（启动时加载，修改后重启生效）
 		maxKeyRetries:            runtimeCfg.MaxKeyRetries,
@@ -322,7 +332,7 @@ func newServer(store storage.Store, logBatchTimeout time.Duration) *Server {
 				defaultResponsesWebsocketConnectionPerSubjectLimit,
 			),
 		),
-		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
+		channelRPMLimiter:         newRPMLimiter(time.Now),
 		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
 		sessionAffinity:           newSessionAffinityStore(),
 	}
@@ -1614,7 +1624,10 @@ func (s *Server) getAllModelCooldowns(ctx context.Context) (map[int64]map[string
 }
 
 // InvalidateChannelListCache 使渠道列表缓存失效
-// 在渠道CRUD操作后调用，确保缓存一致性
+// 在渠道CRUD操作后调用，确保缓存一致性。
+// 不清协议能力学习结果：OAuth 刷新、额度元数据等运行时写库也走这里，全局清空会让
+// 所有渠道反复重新探测；URL/协议相关配置变更须用 protocolCapabilities.clearChannels
+// 只清受影响渠道。
 func (s *Server) InvalidateChannelListCache() {
 	if cache := s.getChannelCache(); cache != nil {
 		cache.InvalidateCache()
@@ -1623,8 +1636,6 @@ func (s *Server) InvalidateChannelListCache() {
 	if s.channelBalancer != nil {
 		s.channelBalancer.ResetAll()
 	}
-	// URL 或上游协议配置可能已变化，丢弃运行时学习结果。
-	s.protocolCapabilities.clear()
 }
 
 // InvalidateAPIKeysCache 使指定渠道的 API Keys 缓存失效
@@ -1782,8 +1793,6 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/channels/filter-options", s.HandleChannelsFilterOptions)
 		admin.GET("/channels/export", s.HandleExportChannelsCSV)
 		admin.POST("/channels/import", s.HandleImportChannelsCSV)
-		admin.POST("/oauth/credentials/import", s.HandleImportOAuthCredentials)
-		admin.POST("/oauth/credentials/import/stream", s.HandleImportOAuthCredentialsStream)
 		admin.POST("/oauth/credentials/import/jobs", s.HandleStartOAuthCredentialImportJob)
 		admin.GET("/oauth/credentials/import/jobs/:id", s.HandleOAuthCredentialImportJob)
 		admin.GET("/oauth/credentials/cleanup/options", s.HandleOAuthCredentialCleanupOptions)
@@ -1795,9 +1804,10 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/codex/oauth/cancel", s.HandleCancelCodexOAuth)
 		admin.POST("/codex/oauth/callback", s.HandleSubmitCodexOAuthCallback)
 		admin.POST("/codex/personal-access-token", s.HandleCreateCodexPersonalAccessToken)
-		admin.POST("/codex/credentials/import", s.HandleImportCodexCredential)
 		admin.POST("/channels/:id/codex-credential/refresh", s.HandleRefreshCodexCredential)
 		admin.POST("/channels/:id/oauth-usage", s.HandleOAuthUsage)
+		admin.GET("/channels/:id/anthropic-reset-credits", s.HandleAnthropicResetCredits)
+		admin.POST("/channels/:id/anthropic-reset-credits/redeem", s.HandleRedeemAnthropicResetCredits)
 		admin.POST("/channels/:id/codex-quota-reset", s.HandleResetCodexQuota)
 		admin.POST("/channels/oauth-usage/batch/stream", s.HandleOAuthUsageBatchStream)
 		admin.POST("/channels/usage/active/batch/stream", s.HandleActiveChannelUsageBatchStream)
@@ -1805,20 +1815,17 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/antigravity/oauth/status", s.HandleAntigravityOAuthStatus)
 		admin.POST("/antigravity/oauth/cancel", s.HandleCancelAntigravityOAuth)
 		admin.POST("/antigravity/oauth/callback", s.HandleSubmitAntigravityOAuthCallback)
-		admin.POST("/antigravity/credentials/import", s.HandleImportAntigravityCredential)
 		admin.POST("/channels/:id/antigravity-credential/refresh", s.HandleRefreshAntigravityCredential)
 		admin.POST("/xai/oauth/start", s.HandleStartXAIOAuth)
 		admin.GET("/xai/oauth/status", s.HandleXAIOAuthStatus)
 		admin.POST("/xai/oauth/cancel", s.HandleCancelXAIOAuth)
 		admin.POST("/xai/oauth/callback", s.HandleSubmitXAIOAuthCallback)
 		admin.POST("/xai/credentials/import/stream", s.HandleImportXAICredentialsStream)
-		admin.POST("/xai/credentials/import/jobs", s.HandleStartXAICredentialImportJob)
 		admin.POST("/channels/:id/xai-credential/refresh", s.HandleRefreshXAICredential)
 		admin.POST("/anthropic/oauth/start", s.HandleStartAnthropicOAuth)
 		admin.GET("/anthropic/oauth/status", s.HandleAnthropicOAuthStatus)
 		admin.POST("/anthropic/oauth/cancel", s.HandleCancelAnthropicOAuth)
 		admin.POST("/anthropic/oauth/callback", s.HandleSubmitAnthropicOAuthCode)
-		admin.POST("/anthropic/oauth/cookie", s.HandleAnthropicCookieAuth)
 		admin.POST("/channels/:id/anthropic-credential/refresh", s.HandleRefreshAnthropicCredential)
 		admin.POST("/zai/oauth/start", s.HandleStartZAIOAuth)
 		admin.POST("/codebuddy/oauth/start", s.HandleStartCodeBuddyOAuth)
@@ -1857,8 +1864,6 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channel-management/sub2api-login", s.HandleChannelManagementSub2APILogin)
 		admin.POST("/channels/:id/management-account/balance", s.HandleChannelManagementBalance)
 		admin.POST("/channels/:id/management-account/checkin", s.HandleChannelManagementCheckin)
-		admin.GET("/channels/:id/model-stats", s.HandleChannelModelStats)
-		admin.GET("/channels/:id/url-stats", s.HandleChannelURLStats)
 		admin.POST("/channels/:id/url-disable", s.HandleURLDisable)
 		admin.POST("/channels/:id/url-enable", s.HandleURLEnable)
 		admin.POST("/channels/:id/key-disable", s.HandleAPIKeyDisable)
@@ -1875,37 +1880,27 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/test-url", s.HandleChannelURLTest)
 		admin.POST("/channels/:id/chat", s.HandleChannelChat)
 		admin.POST("/channels/:id/images/generations", s.HandleChannelImageGeneration)
-		admin.POST("/channels/:id/cooldown", s.HandleSetChannelCooldown)
-		admin.POST("/channels/:id/keys/:keyIndex/cooldown", s.HandleSetKeyCooldown)
 		admin.DELETE("/channels/:id/keys/:keyIndex", s.HandleDeleteAPIKey)
 
-		// 统计分析
-		admin.GET("/logs", s.HandleErrors)
-		admin.GET("/logs/bootstrap", s.HandleLogsBootstrap)
+		// 日志与运行态
 		admin.POST("/debug-logs/merged-response", s.HandleMergeDebugResponse)
 		admin.GET("/debug-logs/:log_id", s.HandleGetDebugLog)
 		admin.GET("/active-requests", s.HandleActiveRequests) // 进行中请求（内存状态）
 		admin.GET("/runtime-metrics", s.HandleRuntimeMetrics)
 		admin.GET("/active-requests/:request_id/debug-log", s.HandleGetActiveRequestDebugLog)
 		admin.POST("/active-requests/:request_id/abort", s.HandleAbortActiveRequest) // 手动中断当前上游尝试（按上游断链处理）
-		admin.GET("/metrics", s.HandleMetrics)
-		admin.GET("/stats", s.HandleStats)
-		admin.GET("/stats/filter-options", s.HandleStatsFilterOptions)
-		admin.GET("/models", s.HandleGetModels)
 
 		// API访问令牌管理
 		admin.GET("/auth-tokens", s.HandleListAuthTokens)
 		admin.POST("/auth-tokens", s.HandleCreateAuthToken)
+		admin.POST("/route-preview", s.HandleRoutePreview)
 		admin.PUT("/auth-tokens/:id", s.HandleUpdateAuthToken)
 		admin.DELETE("/auth-tokens/:id", s.HandleDeleteAuthToken)
 
 		// 系统配置管理
 		admin.GET("/model-pricing", s.HandleGetModelPricing)
-		admin.POST("/typesafe/test", s.AdminTestTypeSafe)
 		admin.GET("/settings", s.AdminListSettings)
 		admin.GET("/settings/:key", s.AdminGetSetting)
-		admin.PUT("/settings/:key", s.AdminUpdateSetting)
-		admin.POST("/settings/:key/reset", s.AdminResetSetting)
 		admin.POST("/settings/batch", s.AdminBatchUpdateSettings)
 
 		// 手动触发完整更新流程（检查、下载、校验、替换、空闲后重启）
@@ -1917,7 +1912,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 	dashboard.Use(s.authService.RequireWebAuth())
 	{
 		dashboard.GET("/session", s.authService.HandleWebSession)
-		dashboard.GET("/summary", s.HandlePublicSummary)
+		dashboard.GET("/summary", s.HandleDashboardSummary)
 		dashboard.GET("/logs", s.HandleErrors)
 		dashboard.GET("/logs/bootstrap", s.HandleLogsBootstrap)
 		dashboard.GET("/metrics", s.HandleMetrics)
@@ -1995,6 +1990,9 @@ func (s *Server) stateCleanupLoop() {
 			if s.channelRPMLimiter != nil {
 				s.channelRPMLimiter.CleanupExpired()
 			}
+			if s.authService != nil {
+				s.authService.tokenRPMLimiter.CleanupExpired()
+			}
 			s.sessionAffinity.cleanupExpired(time.Now())
 		}
 	}
@@ -2024,7 +2022,7 @@ func (s *Server) AddLogAsync(entry *model.LogEntry) {
 }
 
 func (s *Server) recordURLRequestFromLog(entry *model.LogEntry) {
-	if s == nil || s.urlSelector == nil || entry == nil || entry.LogSource == model.LogSourceJev {
+	if s == nil || s.urlSelector == nil || entry == nil || entry.LogSource == model.LogSourceCountTokens {
 		return
 	}
 	s.urlSelector.RecordRequestResult(entry.ChannelID, entry.BaseURL, entry.StatusCode)

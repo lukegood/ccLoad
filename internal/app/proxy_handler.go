@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ccLoad/internal/config"
@@ -318,10 +319,23 @@ func (s *Server) selectRouteCandidates(ctx context.Context, c *gin.Context, orig
 	if clientProtocol == "" {
 		return nil, errUnknownClientProtocol
 	}
+	if clientProtocol == util.ProtocolSystemOne {
+		if requestMethod != http.MethodPost {
+			return nil, errUnknownClientProtocol
+		}
+		return s.selectSystemOneCandidates(ctx, originalModel)
+	}
 	if requestFamily == protocol.RequestFamilyAlphaSearch {
 		return s.selectAlphaSearchCandidates(ctx, originalModel)
 	}
 
+	_, effectivePath := clientRequestMetadata(c)
+	if isOrdinaryGenerationRequest(requestMethod, effectivePath, protocol.Protocol(clientProtocol)) {
+		return s.resolveGenerationCandidates(ctx, generationRouteInput{
+			Model: originalModel, ClientProtocol: clientProtocol,
+			TokenHash: channelRestrictionTokenFromContext(ctx),
+		})
+	}
 	return s.selectCandidatesByModelAndClientProtocol(ctx, originalModel, clientProtocol)
 }
 
@@ -350,9 +364,29 @@ func (s *Server) officialAnthropicCountTokensCandidates(cands []*model.Config) [
 	return selected
 }
 
-func (s *Server) handleLocalCountTokens(c *gin.Context, body []byte) {
-	c.Request.Body = io.NopCloser(bytes.NewReader(body))
-	s.handleCountTokens(c)
+// handleLocalCountTokens 用本地估算应答 count_tokens，并按 count_tokens 来源记一条无渠道日志。
+func (s *Server) handleLocalCountTokens(c *gin.Context, body []byte, entry *model.LogEntry) {
+	status, payload, inputTokens := localCountTokens(body)
+	respBody, _ := sonic.Marshal(payload)
+	c.Data(status, "application/json; charset=utf-8", respBody)
+
+	entry.LogSource = model.LogSourceCountTokens
+	entry.StatusCode = status
+	entry.InputTokens = inputTokens
+	entry.Duration = time.Since(entry.Time.Time).Seconds()
+	if s.configService.GetBool("debug_log_enabled", false) {
+		entry.DebugData = &model.DebugLogEntry{
+			CreatedAt:   time.Now().Unix(),
+			ReqMethod:   c.Request.Method,
+			ReqURL:      c.Request.URL.String(),
+			ReqHeaders:  encodeDebugHeaders(c.Request.Header),
+			ReqBody:     body,
+			RespStatus:  status,
+			RespHeaders: encodeDebugHeaders(c.Writer.Header()),
+			RespBody:    respBody,
+		}
+	}
+	s.AddLogAsync(entry)
 }
 
 // ============================================================================
@@ -399,6 +433,10 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 	defer release()
 
+	if !s.admitHTTPTokenRPM(c) {
+		return
+	}
+
 	// 特殊路由优先处理
 	if s.handleSpecialRoutes(c) {
 		return
@@ -420,6 +458,8 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 	all := incoming.body
+	// 后续改写都经 sjson 生成新切片，incoming.body 保持客户端原文。
+	originalReasoningBody := incoming.body
 	isStreaming := incoming.isStreaming
 	httpMetrics.observeRequest(isStreaming, len(all))
 
@@ -429,6 +469,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 	requestFamily := protocol.DetectRequestFamily(effectiveRequestPath)
+	reasoningModel := incoming.requestedModel // 多模态回退改写前的客户端模型名
 	countTokensRequest := requestFamily == protocol.RequestFamilyCountTokens
 	if requestFamily == protocol.RequestFamilyAlphaSearch {
 		all = sanitizeCodexAlphaSearchBody(all)
@@ -439,7 +480,13 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	// 模型冷却过滤、Key 白名单全部按模型名做决策，事后换模型只会换来
 	// 渠道未声明的模型 + 404 + 逐渠道失败。改 incoming 字段后下游全部自动跟随。
 	clientModel := incoming.originalModel
-	if fallback := s.multimodalFallbackModel(incoming.originalModel, requestHasNonTextContent(clientProtocol, all)); fallback != "" {
+	if isOrdinaryGenerationRequest(requestMethod, effectiveRequestPath, clientProtocol) {
+		incoming.requestedModel = s.generationRoutingModel(generationRouteInput{
+			Model: incoming.requestedModel, ClientProtocol: string(clientProtocol),
+			Multimodal: requestHasNonTextContent(clientProtocol, all),
+		})
+		incoming.originalModel = model.RoutingModelName(incoming.requestedModel)
+	} else if fallback := s.multimodalFallbackModel(incoming.originalModel, requestHasNonTextContent(clientProtocol, all)); fallback != "" {
 		incoming.originalModel = model.RoutingModelName(fallback)
 		incoming.requestedModel = fallback
 	}
@@ -455,13 +502,23 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 	tokenID, _ := c.Get("token_id")
 	tokenIDInt64, _ := tokenID.(int64)
+	localCountTokensLog := func(reason string) *model.LogEntry {
+		return &model.LogEntry{
+			Time:           model.JSONTime{Time: startTime},
+			Model:          clientModel,
+			AuthTokenID:    tokenIDInt64,
+			ClientProtocol: string(clientProtocol),
+			ClientIP:       c.ClientIP(),
+			Message:        "local: " + reason,
+		}
+	}
 
 	// count_tokens is an auxiliary, non-billable endpoint: an exhausted budget
 	// still gets an estimate. A model outside the token's whitelist must not
 	// reach a first-party account either, so it gets the local estimate too.
 	if countTokensRequest {
 		if !s.tokenModelAllowed(tokenHashStr, incoming.authorizationModel()) {
-			s.handleLocalCountTokens(c, all)
+			s.handleLocalCountTokens(c, all, localCountTokensLog("model restricted"))
 			return
 		}
 	} else if !s.enforceTokenLimits(c, tokenHashStr, incoming.authorizationModel()) {
@@ -526,6 +583,10 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		cands = s.appendAntigravityCreditsCandidates(ctx, cands, originalModel, string(clientProtocol), all)
 	}
 	if err != nil {
+		if errors.Is(err, errGenerationModelDenied) {
+			writeLocalProxyError(c, http.StatusForbidden, fmt.Sprintf("model '%s' is not allowed for this token", originalModel))
+			return
+		}
 		if errors.Is(err, errUnknownClientProtocol) {
 			writeLocalProxyError(c, http.StatusNotFound, "unsupported path")
 			return
@@ -536,7 +597,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if countTokensRequest {
 		cands = s.officialAnthropicCountTokensCandidates(cands)
 		if len(cands) == 0 {
-			s.handleLocalCountTokens(c, all)
+			s.handleLocalCountTokens(c, all, localCountTokensLog("no official channel"))
 			return
 		}
 	}
@@ -579,6 +640,16 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 				writeLocalProxyError(c, http.StatusForbidden, "no allowed upstream channel for this token")
 				return
 			}
+		}
+	}
+
+	// 客户端通过 x-ccload-channel-id / x-ccload-channel Header 指定渠道
+	reqChannelFilter := extractRequestedChannelFilter(c.Request)
+	if reqChannelFilter.hasFilter {
+		cands, _ = filterByRequestedChannel(cands, reqChannelFilter)
+		if len(cands) == 0 {
+			writeLocalProxyError(c, http.StatusNotFound, requestedChannelUnavailableMessage)
+			return
 		}
 	}
 	var sessionAffinityKey string
@@ -628,6 +699,19 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		reqCtx.nativeCodexWS = executionSession.upstream
 		reqCtx.nativeCodexBody = nativeRequestBody
 	}
+	if requestMethod == http.MethodPost && reasoningTurnEndpoint(effectiveRequestPath) && s.reasoningTarget(reqCtx) {
+		reasoningExplicit := hasExplicitThinkingSuffix(reasoningModel)
+		transcript := all
+		if len(executionSessionRequestBody) > 0 {
+			transcript = executionSessionRequestBody
+		} else if !reasoningExplicit {
+			if local := s.localReasoningTranscript(reqCtx); local != nil {
+				transcript = local
+			}
+		}
+		s.prepareReasoningTurn(ctx, reqCtx, transcript, originalReasoningBody, reasoningExplicit)
+		ctx = withReasoningRequest(ctx, reqCtx)
+	}
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
 			s.activeRequests.AddBytes(reqCtx.activeReqID, n)
@@ -640,6 +724,9 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		},
 		OnDebugCapture: func(dc *debugCapture) {
 			s.activeRequests.SetDebugCapture(reqCtx.activeReqID, dc)
+		},
+		OnThinkingEffort: func(sent, client string) {
+			s.activeRequests.SetThinkingEffort(reqCtx.activeReqID, sent, client)
 		},
 	}
 	defer func() {
@@ -656,7 +743,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 	if countTokensRequest && (lastResult == nil || !lastResult.isClientCanceled) {
-		s.handleLocalCountTokens(c, all)
+		s.handleLocalCountTokens(c, all, localCountTokensLog("upstream failed"))
 		return
 	}
 
@@ -817,7 +904,7 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 				continue
 			}
 		}
-		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+		result, err := s.tryChannelWithSameChannelRetries(ctx, cfg, reqCtx, w)
 		if errors.Is(err, errNoAvailableModelRow) {
 			continue
 		}
@@ -888,6 +975,94 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 	}
 
 	return lastResult, false
+}
+
+// pendingSameChannelCooldowns 收集同渠道重试期间暂缓落库的冷却输入。
+type pendingSameChannelCooldowns struct {
+	inputs []cooldown.ErrorInput
+}
+
+type pendingSameChannelCooldownsKey struct{}
+
+func pendingSameChannelCooldownsFrom(ctx context.Context) *pendingSameChannelCooldowns {
+	pending, _ := ctx.Value(pendingSameChannelCooldownsKey{}).(*pendingSameChannelCooldowns)
+	return pending
+}
+
+// sameChannelRetryableFailure 报告故障是否值得在同渠道原地重试：
+// 模型/渠道级的网络错误或 5xx（596 额度耗尽除外）。Key 级与客户端错误照常处理。
+func sameChannelRetryableFailure(action cooldown.Action, in cooldown.ErrorInput) bool {
+	if action != cooldown.ActionRetryModel && action != cooldown.ActionRetryChannel {
+		return false
+	}
+	return in.IsNetworkError || (in.StatusCode >= 500 && in.StatusCode != util.StatusQuotaExceeded)
+}
+
+type sameChannelFailureKey struct {
+	channelID int64
+	model     string
+}
+
+// sameChannelFailureCounter 跨请求记录渠道+模型的连续可重试故障次数（内存态，零值可用）。
+// 已提交响应的中途断流无法原地重试，只能靠客户端重发；未超过 same_channel_retries 时不冷却，
+// 让重发还能回到该渠道。任一成功清零。
+type sameChannelFailureCounter struct {
+	mu       sync.Mutex
+	failures map[sameChannelFailureKey]int
+}
+
+func (c *sameChannelFailureCounter) add(key sameChannelFailureKey, n int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failures == nil {
+		c.failures = make(map[sameChannelFailureKey]int)
+	}
+	c.failures[key] += n
+	return c.failures[key]
+}
+
+func (c *sameChannelFailureCounter) reset(key sameChannelFailureKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.failures, key)
+}
+
+// tryChannelWithSameChannelRetries 在渠道配置了 same_channel_retries 时，对未提交响应的
+// 可重试故障原地重试同一渠道。中间失败的冷却不落库，避免偶发故障把指数退避连翻几轮；
+// 放弃该渠道时按跨请求连续失败次数决定：超过 same_channel_retries 才提交最后一次尝试的冷却，成功则丢弃。
+func (s *Server) tryChannelWithSameChannelRetries(
+	ctx context.Context,
+	cfg *model.Config,
+	reqCtx *proxyRequestContext,
+	w http.ResponseWriter,
+) (*proxyResult, error) {
+	if cfg.SameChannelRetries <= 0 {
+		return s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+	}
+	for attempt := 0; ; attempt++ {
+		pending := &pendingSameChannelCooldowns{}
+		result, err := s.tryChannelWithKeys(context.WithValue(ctx, pendingSameChannelCooldownsKey{}, pending), cfg, reqCtx, w)
+		if attempt < cfg.SameChannelRetries && err == nil && len(pending.inputs) > 0 && ctx.Err() == nil &&
+			result != nil && !result.succeeded && !result.isClientCanceled && !result.operatorAborted {
+			log.Printf("[RETRY] 渠道 %s (ID=%d) 同渠道重试 %d/%d (status=%d)",
+				cfg.Name, cfg.ID, attempt+1, cfg.SameChannelRetries, result.status)
+			continue
+		}
+		if len(pending.inputs) == 0 {
+			return result, err
+		}
+		last := pending.inputs[len(pending.inputs)-1]
+		key := sameChannelFailureKey{channelID: cfg.ID, model: last.Model}
+		if failures := s.sameChannelFailures.add(key, attempt+1); failures <= cfg.SameChannelRetries {
+			log.Printf("[COOLDOWN] 渠道 %s (ID=%d) 连续失败 %d/%d 次，暂不冷却 (status=%d)",
+				cfg.Name, cfg.ID, failures, cfg.SameChannelRetries, last.StatusCode)
+			return result, err
+		}
+		for _, in := range pending.inputs {
+			s.applyCooldownDecision(ctx, cfg, in)
+		}
+		return result, err
+	}
 }
 
 func writeEmptyAlphaSearchResponse(w http.ResponseWriter) {

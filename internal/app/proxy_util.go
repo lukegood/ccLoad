@@ -161,13 +161,12 @@ func looksLikeJSON(body []byte) bool {
 // 的 provider body，映射只能从首轮带过来。
 type upstreamWireAliases struct {
 	openCode       *openCodeResponsesPlan
+	xaiTools       *xaiResponsesToolsPlan
 	anthropicTools anthropicMCPToolAliases
 }
 
 // fwResult 转发结果
 type fwResult struct {
-	jevNote             string
-	errorReceivedAt     time.Time
 	Status              int
 	UpstreamStatus      int // 原始上游 HTTP 状态码；Status 可被改写为 596-599 等内部分类码
 	Header              http.Header
@@ -215,6 +214,8 @@ type fwResult struct {
 	// OpenAI service_tier（2026-03新增）。请求中的 priority 是 Fast 模式标记，
 	// 计费时不能被上游回显的 default/standard 降档。
 	ServiceTier string
+	// RateCard 是 service_tier 倍率依据的价目，由渠道认证与 CodexHasCredits 决定。
+	RateCard util.OpenAIRateCard
 
 	// ThinkingEffort 记录请求或上游响应声明的思考等级；上游响应非空时覆盖请求值。
 	ThinkingEffort string
@@ -234,11 +235,11 @@ type ForwardObserver struct {
 	OnFirstByteRead     func(time.Duration) // 客户端首字节耗时回调（可选）
 	OnUpstreamWebsocket func(bool)          // 实际上游传输变化回调（可选）
 	OnDebugCapture      func(*debugCapture)
+	OnThinkingEffort    func(sent, client string) // 动态思考确定实际发送等级（可选）
 }
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
-	jevWait                 time.Duration
 	abortChannel            context.CancelCauseFunc // 覆盖当前渠道所有 Key/URL 和重试等待
 	antigravityCreditsTried map[string]bool
 	antigravityRateRetried  map[string]bool
@@ -272,6 +273,10 @@ type proxyRequestContext struct {
 	debugData               *model.DebugLogEntry   // Debug日志数据（debug开启时填充）
 	skipProxyLog            bool                   // 管理测试等外层会统一持久化日志的调用路径
 	thinkingEffort          string
+	reasoning               *reasoningTurn
+	reasoningExpected       string
+	reasoningApplied        string
+	reasoningApplyReason    string
 	routingSession          *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	sessionAffinityKey      string                     // Anthropic/Codex 会话绑定键（令牌+会话 ID），空表示不绑定
 	sessionAffinity         sessionAffinityTarget      // 请求开始时的会话绑定，channelID=0 表示无
@@ -343,6 +348,10 @@ type proxyResult struct {
 // - Gemini: 路径包含 :streamGenerateContent
 // - Claude/OpenAI: 请求体中 stream=true
 func isStreamingRequest(path string, body []byte) bool {
+	// System One 只有 JSON 响应。
+	if protocol.DetectRequestFamily(path) == protocol.RequestFamilySystemOne {
+		return false
+	}
 	// Gemini流式请求特征：路径包含 :streamGenerateContent
 	if strings.Contains(path, ":streamGenerateContent") {
 		return true
@@ -475,6 +484,10 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 			continue
 		}
 
+		// 不透传客户端指定的路由头（x-ccload-channel-id, x-ccload-channel，仅供 ccLoad 内部路由）
+		if strings.EqualFold(k, "X-CCLoad-Channel-ID") || strings.EqualFold(k, "X-CCLoad-Channel") {
+			continue
+		}
 		// 不透传认证头（由上游注入）
 		if strings.EqualFold(k, "Authorization") ||
 			strings.EqualFold(k, "X-Api-Key") ||
@@ -502,6 +515,8 @@ func injectAPIKeyHeaders(req *http.Request, apiKey string, upstreamProtocol stri
 	case util.ProtocolGemini:
 		// Gemini API: 仅使用 x-goog-api-key
 		req.Header.Set("x-goog-api-key", apiKey)
+	case util.ProtocolSystemOne:
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 	case util.ProtocolAnthropic:
 		req.Header.Set("x-api-key", apiKey)
 		if anthropicAPIKeyAuthorizationAllowed(req.URL) {
@@ -882,6 +897,7 @@ func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestConte
 	}
 	// 后缀来自客户端字面模型名，能力却属于重定向/模糊匹配后的实际上游模型。
 	bodyToSend = applyThinkingSuffixForModel(bodyToSend, reqCtx.clientProtocol, requestedModel, actualModel)
+	bodyToSend = applyAutomaticReasoning(bodyToSend, reqCtx, upstreamProtocol, actualModel)
 	// billing/CCH 块是真 Claude Code 请求的身份与签名载体。只有跨协议
 	// 转换时才能删除；Anthropic -> Anthropic 必须保留，供 OAuth finalizer
 	// 识别并保留原生 Claude Code prompt。
@@ -1033,14 +1049,11 @@ func extractThinkingEffortFromPayload(payload map[string]any) string {
 		return ""
 	}
 
-	if response, ok := payload["response"].(map[string]any); ok {
-		if effort := extractThinkingEffortFromPayload(response); effort != "" {
-			return effort
-		}
-	}
-	if message, ok := payload["message"].(map[string]any); ok {
-		if effort := extractThinkingEffortFromPayload(message); effort != "" {
-			return effort
+	for _, key := range []string{"response", "message", "provider_request", "request"} {
+		if nested, ok := payload[key].(map[string]any); ok {
+			if effort := extractThinkingEffortFromPayload(nested); effort != "" {
+				return effort
+			}
 		}
 	}
 
@@ -1272,16 +1285,10 @@ func appendRetryStrategyToMessage(message, strategy string) string {
 	return truncateErr(fmt.Sprintf("%s [%s]", message, strategy))
 }
 
-// computeRequestCost 是请求总成本的唯一口径：标准 token 成本加服务端工具成本（Responses 图像、Anthropic web_search）。
-// fast 模式专用模型走 CalculateFastModeCost（已含 fast 倍率）。
+// computeRequestCostWithPrice 是请求总成本的唯一口径：标准 token 成本加服务端工具成本（Responses 图像、Anthropic web_search）。
+// price 非空时用渠道模型价格替代标准 token 价格；工具费率只来自系统目录，不受渠道价格影响。
 // OpenAI service_tier 是价格倍率，不改变按 token 数选择的长上下文分档；
 // 非 OpenAI 白名单模型即使响应携带 service_tier 也不加倍率。
-func computeRequestCost(model string, serviceTier string, res *fwResult) float64 {
-	return computeRequestCostWithPrice(model, serviceTier, nil, res)
-}
-
-// computeRequestCostWithPrice 在 price 非空时用渠道模型价格替代标准 token 价格；
-// 工具费率只来自系统目录，不受渠道价格影响。
 func computeRequestCostWithPrice(model string, serviceTier string, price *util.CustomModelPrice, res *fwResult) float64 {
 	if res == nil {
 		return 0
@@ -1294,6 +1301,7 @@ func computeRequestCostWithPrice(model string, serviceTier string, price *util.C
 	return util.CalculateStandardCostBreakdownWithPrice(
 		model,
 		serviceTier,
+		res.RateCard,
 		price,
 		res.InputTokens,
 		res.OutputTokens,
@@ -1301,6 +1309,19 @@ func computeRequestCostWithPrice(model string, serviceTier string, price *util.C
 		res.Cache5mInputTokens,
 		res.Cache1hInputTokens,
 	).Total + res.ToolCostUSD
+}
+
+// openAIRateCard 选择 service_tier 倍率价目：Codex OAuth 按本次是否落入购买积分区分
+// 订阅额度与积分，其余渠道按 API 价目。
+func openAIRateCard(codexOAuth, codexHasCredits bool) util.OpenAIRateCard {
+	switch {
+	case !codexOAuth:
+		return util.OpenAIRateCardAPI
+	case codexHasCredits:
+		return util.OpenAIRateCardCodexCredits
+	default:
+		return util.OpenAIRateCardCodexAllowance
+	}
 }
 
 func requestedServiceTier(reqCtx *proxyRequestContext) string {

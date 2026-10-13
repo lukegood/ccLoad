@@ -48,8 +48,14 @@ function runtimeInlineURL(value) {
   return entry.exact ? `${entry.url}${INLINE_EXACT_URL_MARKER}` : entry.url;
 }
 
+// System One 是认证方式而非 URL 协议：其 URL 只走原生决策接口，不声明聊天协议。
+function isSystemOneChannelEditor() {
+  return typeof editingChannelAuthType !== 'undefined' && editingChannelAuthType === 'system_one';
+}
+
 function getValidInlineURLConfigs() {
-  return normalizeInlineURLConfigs(inlineURLTableData);
+  const configs = normalizeInlineURLConfigs(inlineURLTableData);
+  return isSystemOneChannelEditor() ? configs.map(entry => ({ ...entry, protocols: [] })) : configs;
 }
 
 function getValidInlineURLs() {
@@ -112,7 +118,6 @@ function createURLRow(index) {
     url: entry.url,
     mobileLabelUrl: window.t('channels.tableApiUrl'),
     mobileLabelProtocols: window.t('channels.urlProtocols'),
-    mobileLabelExactURL: window.t('channels.fullUrl'),
     mobileLabelActions: window.t('common.actions')
   };
 
@@ -233,6 +238,8 @@ function renderInlineURLTable() {
   }
 
   initInlineURLTableEventDelegation();
+  // 决策渠道的协议处理与 URL 协议是固定的，由表单级 class 隐藏相关控件。
+  document.getElementById('channelForm')?.classList?.toggle('channel-editor--system-one', isSystemOneChannelEditor());
 	updateInlineURLCount();
   updateURLStatsHeader();
 
@@ -397,11 +404,11 @@ function deleteInlineURL(index) {
   markChannelFormDirty();
 }
 
-function batchDeleteSelectedURLs() {
+async function batchDeleteSelectedURLs() {
   const count = selectedURLIndices.size;
   if (count === 0) return;
 
-  if (!confirm(window.t('channels.confirmBatchDeleteUrls', { count }))) {
+  if (!await window.showConfirm({ message: window.t('channels.confirmBatchDeleteUrls', { count }), danger: true })) {
     return;
   }
 
@@ -424,7 +431,7 @@ function batchDeleteSelectedURLs() {
 
 async function testInlineURL(index, buttonElement) {
   if (!editingChannelId) {
-    alert(window.t('channels.cannotGetChannelId'));
+    window.showNotification(window.t('channels.cannotGetChannelId'), 'warning');
     return;
   }
 
@@ -433,20 +440,22 @@ async function testInlineURL(index, buttonElement) {
     .map(r => r.model)
     .filter(m => m && m.trim());
   if (models.length === 0) {
-    alert(window.t('channels.configModelsFirst'));
+    window.showNotification(window.t('channels.configModelsFirst'), 'warning');
     return;
   }
 
   const firstModel = models[0];
-  const url = runtimeInlineURL(inlineURLTableData[index]);
+  const urlConfig = normalizeInlineURLConfig(inlineURLTableData[index]);
+  const url = runtimeInlineURL(urlConfig);
   if (!url) {
-    alert(window.t('channels.fillApiUrlFirst'));
+    window.showNotification(window.t('channels.fillApiUrlFirst'), 'warning');
     return;
   }
 
+  const isSystemOne = isSystemOneChannelEditor();
   const firstKey = (getValidInlineKeyRows()[0] || {}).api_key || '';
   if (!firstKey) {
-    alert(window.t('channels.emptyKeyCannotTest'));
+    window.showNotification(window.t('channels.emptyKeyCannotTest'), 'warning');
     return;
   }
 
@@ -461,9 +470,9 @@ async function testInlineURL(index, buttonElement) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: firstModel,
-        stream: true,
+        stream: !isSystemOne,
         content: 'test',
-        client_protocol: 'anthropic',
+        client_protocol: isSystemOne ? undefined : 'anthropic',
         key_index: 0,
         base_url: url
       })
@@ -496,16 +505,6 @@ function applyURLStats(stats) {
     }
   }
   renderInlineURLTable();
-}
-
-async function fetchURLStats(channelId) {
-  if (!channelId) return;
-  try {
-    const stats = await fetchDataWithAuth(`/admin/channels/${channelId}/url-stats`);
-    applyURLStats(stats);
-  } catch (e) {
-    console.error('Failed to fetch URL stats', e);
-  }
 }
 
 function formatURLStatus(stat) {
@@ -545,8 +544,8 @@ function formatURLRequests(stat) {
   const s = stat.requests || 0;
   const f = stat.failures || 0;
   if (s === 0 && f === 0) return '--';
-  if (f === 0) return `<span style="color: #16A34A;">${s}</span>`;
-  return `<span style="color: #16A34A;">${s}</span><span style="color: var(--neutral-300); margin: 0 2px;">/</span><span style="color: #DC2626;">${f}</span>`;
+  if (f === 0) return `<span style="color: var(--success-600);">${s}</span>`;
+  return `<span style="color: var(--success-600);">${s}</span><span style="color: var(--neutral-300); margin: 0 2px;">/</span><span style="color: var(--error-600);">${f}</span>`;
 }
 
 function updateURLStatsHeader() {
@@ -608,9 +607,9 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     applyURLStats,
     createURLRow,
-    fetchURLStats,
     normalizeInlineURLConfig,
     normalizeInlineURLConfigs,
-    runtimeInlineURL
+    runtimeInlineURL,
+    testInlineURL
   };
 }

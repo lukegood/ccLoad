@@ -14,7 +14,7 @@ import (
 )
 
 func TestMetrics_BasicQueriesAndFilters(t *testing.T) {
-	store := newTestStore(t, "metrics_basic.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	// 两个渠道：用于覆盖 type/name 过滤与交集逻辑
@@ -127,7 +127,7 @@ func TestMetrics_BasicQueriesAndFilters(t *testing.T) {
 			if e.Total != 2 || e.Success != 1 || e.Error != 1 {
 				t.Fatalf("openai stats=%+v, want total=2 success=1 error=1 (exclude 499)", e)
 			}
-			if e.ChannelName == "" || e.ChannelPriority == nil {
+			if e.ChannelName == "" || e.ChannelPriority == nil || e.ChannelAuthType != model.AuthTypeAPIKey {
 				t.Fatalf("expected channel info filled, got %+v", e)
 			}
 			if e.CostMultiplierMin == nil || *e.CostMultiplierMin != 0.85 || e.CostMultiplierMax == nil || *e.CostMultiplierMax != 0.85 {
@@ -147,6 +147,9 @@ func TestMetrics_BasicQueriesAndFilters(t *testing.T) {
 			}
 			if got, ok := payload["cost_multiplier_max"].(float64); !ok || got != 0.85 {
 				t.Fatalf("expected cost_multiplier_max=0.85 in stats payload, got %+v", payload)
+			}
+			if got := payload["channel_auth_type"]; got != model.AuthTypeAPIKey {
+				t.Fatalf("expected channel_auth_type=api_key in stats payload, got %+v", payload)
 			}
 		}
 	}
@@ -266,7 +269,7 @@ func TestMetrics_BasicQueriesAndFilters(t *testing.T) {
 }
 
 func TestMetrics_TokenSpeedUsesSuccessfulOutputAndEffectiveDuration(t *testing.T) {
-	store := newTestStore(t, "metrics_token_speed.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "speed-channel",
@@ -302,7 +305,7 @@ func TestMetrics_TokenSpeedUsesSuccessfulOutputAndEffectiveDuration(t *testing.T
 }
 
 func TestMetrics_UpstreamProtocolFilterUsesPersistedAttemptProtocol(t *testing.T) {
-	store := newTestStore(t, "metrics_upstream_protocol.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	nativeOpenAI, err := store.CreateConfig(ctx, &model.Config{
@@ -390,7 +393,7 @@ func TestMetrics_UpstreamProtocolFilterUsesPersistedAttemptProtocol(t *testing.T
 }
 
 func TestGetHealthTimeline_AppliesFullStatsFilter(t *testing.T) {
-	store := newTestStore(t, "health_timeline_full_filter.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	openaiCfg, err := store.CreateConfig(ctx, &model.Config{
@@ -466,7 +469,7 @@ func TestGetHealthTimeline_AppliesFullStatsFilter(t *testing.T) {
 }
 
 func TestMetrics_LastSuccessAndLastFailedRequest(t *testing.T) {
-	store := newTestStore(t, "metrics_last_success.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -531,7 +534,7 @@ func TestMetrics_LastSuccessAndLastFailedRequest(t *testing.T) {
 }
 
 func TestMetrics_ChannelLevelLastRequestIDsExposeTieBreakForFrontEndAggregation(t *testing.T) {
-	store := newTestStore(t, "metrics_last_request_ids.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -586,8 +589,67 @@ func TestMetrics_ChannelLevelLastRequestIDsExposeTieBreakForFrontEndAggregation(
 	}
 }
 
+func TestMetrics_ChannelPeakRPMMergesModelsPerMinute(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:     "peak-channel",
+		URLs:     model.ChannelURLs{{URL: "https://example.com"}},
+		Priority: 10,
+		Enabled:  true,
+		ModelEntries: []model.ModelEntry{
+			{Model: "gpt-4o"},
+			{Model: "gpt-4.1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+
+	// 两个分钟桶的渠道合计都是 3，单模型峰值都是 2；各模型峰值相加会得到错误的 4。
+	minuteA := time.Now().Add(-10 * time.Minute).Truncate(time.Minute).Add(10 * time.Second)
+	minuteB := minuteA.Add(5 * time.Minute)
+	logAt := func(at time.Time, modelName string, status int) *model.LogEntry {
+		return &model.LogEntry{Time: model.JSONTime{Time: at}, ChannelID: cfg.ID, Model: modelName, StatusCode: status, LogSource: model.LogSourceProxy}
+	}
+	if err := store.BatchAddLogs(ctx, []*model.LogEntry{
+		logAt(minuteA, "gpt-4o", 200),
+		logAt(minuteA, "gpt-4o", 200),
+		logAt(minuteA, "gpt-4.1", 500),
+		logAt(minuteA, "gpt-4.1", 499), // 客户端取消不计入 RPM
+		logAt(minuteB, "gpt-4o", 200),
+		logAt(minuteB, "gpt-4.1", 200),
+		logAt(minuteB, "gpt-4.1", 200),
+	}); err != nil {
+		t.Fatalf("BatchAddLogs failed: %v", err)
+	}
+
+	stats, err := store.GetStats(ctx, minuteA.Add(-time.Hour), minuteB.Add(time.Minute), nil, false)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+
+	seen := 0
+	for _, e := range stats {
+		if e.ChannelID == nil || int64(*e.ChannelID) != cfg.ID {
+			continue
+		}
+		seen++
+		if e.PeakRPM == nil || *e.PeakRPM != 2 {
+			t.Fatalf("model %s PeakRPM=%v, want 2", e.Model, e.PeakRPM)
+		}
+		if e.ChannelPeakRPM == nil || *e.ChannelPeakRPM != 3 {
+			t.Fatalf("model %s ChannelPeakRPM=%v, want channel-wide 3", e.Model, e.ChannelPeakRPM)
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("got %d entries for channel, want 2", seen)
+	}
+}
+
 func TestMetrics_LastSuccessAtIgnoresCurrentRange(t *testing.T) {
-	store := newTestStore(t, "metrics_last_success_all_time.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -636,7 +698,7 @@ func TestMetrics_LastSuccessAtIgnoresCurrentRange(t *testing.T) {
 }
 
 func TestMetrics_LastRequestAtIgnoresCurrentRange(t *testing.T) {
-	store := newTestStore(t, "metrics_last_request_all_time.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -691,7 +753,7 @@ func TestMetrics_LastRequestAtIgnoresCurrentRange(t *testing.T) {
 }
 
 func TestMetrics_LastStateIsChannelLevelWithoutModelFilter(t *testing.T) {
-	store := newTestStore(t, "metrics_last_state_channel_level.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -747,7 +809,7 @@ func TestMetrics_LastStateIsChannelLevelWithoutModelFilter(t *testing.T) {
 }
 
 func TestMetrics_LastStateRespectsModelFilter(t *testing.T) {
-	store := newTestStore(t, "metrics_last_state_model_filter.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -803,7 +865,7 @@ func TestMetrics_LastStateRespectsModelFilter(t *testing.T) {
 }
 
 func TestMetrics_LastStateIgnoresStatusCodeFilter(t *testing.T) {
-	store := newTestStore(t, "metrics_last_state_status_filter.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -867,7 +929,7 @@ func TestMetrics_LastStateIgnoresStatusCodeFilter(t *testing.T) {
 }
 
 func TestGetStats_PreservesZeroCostMultiplierForFreeChannels(t *testing.T) {
-	store := newTestStore(t, "metrics_zero_multiplier.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cfg, err := store.CreateConfig(ctx, &model.Config{
@@ -917,5 +979,45 @@ func TestGetStats_PreservesZeroCostMultiplierForFreeChannels(t *testing.T) {
 	}
 	if *stats[0].EffectiveCost != 0 {
 		t.Fatalf("expected effective_cost=0, got %v", *stats[0].EffectiveCost)
+	}
+}
+
+func TestAggregateRangeWithFilter_CountsRateLimitedWithinError(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "rate-limited-channel",
+		URLs:         model.ChannelURLs{{URL: "https://example.com"}},
+		Enabled:      true,
+		ModelEntries: []model.ModelEntry{{Model: "gpt-4o"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+
+	now := time.Now()
+	logs := []*model.LogEntry{
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 200, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 429, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 429, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 500, LogSource: model.LogSourceProxy},
+		{Time: model.JSONTime{Time: now}, ChannelID: cfg.ID, Model: "gpt-4o", StatusCode: 429, LogSource: model.LogSourceManualTest},
+	}
+	if err := store.BatchAddLogs(ctx, logs); err != nil {
+		t.Fatalf("BatchAddLogs failed: %v", err)
+	}
+
+	pts, err := store.AggregateRangeWithFilter(ctx, now.Add(-time.Minute), now.Add(time.Minute), time.Minute, &model.LogFilter{LogSource: model.LogSourceProxy})
+	if err != nil {
+		t.Fatalf("AggregateRangeWithFilter failed: %v", err)
+	}
+	success, errorCount, rateLimited := 0, 0, 0
+	for _, p := range pts {
+		success += p.Success
+		errorCount += p.Error
+		rateLimited += p.RateLimited
+	}
+	if success != 1 || errorCount != 3 || rateLimited != 2 {
+		t.Fatalf("success=%d error=%d rate_limited=%d, want 1/3/2", success, errorCount, rateLimited)
 	}
 }

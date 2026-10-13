@@ -59,6 +59,7 @@ function normalizeInlineKeyRow(row) {
       api_key: String(row.api_key || '').trim(),
       note: String(row.note || '').trim(),
       allowed_models: normalizeKeyAllowedModels(row.allowed_models),
+      model_scope_auto: row.model_scope_auto === true,
       cost_multiplier: normalizeKeyCostMultiplier(row.cost_multiplier),
       priority: Number(row.priority ?? 0)
     };
@@ -72,6 +73,7 @@ function normalizeInlineKeyRow(row) {
     api_key: String(row || '').trim(),
     note: '',
     allowed_models: [],
+    model_scope_auto: false,
     cost_multiplier: 1,
     priority: 0
   };
@@ -131,10 +133,6 @@ function getValidInlineKeyRows() {
   return getInlineKeyRows().filter(row => row.api_key);
 }
 
-function selectAvailableInlineKeys(rows, states) {
-  return [...new Set(selectModelFetchKeyEntries(rows, states, false).map(entry => entry.apiKey))];
-}
-
 function selectModelFetchKeyEntries(rows, states, allowCooldownFallback = true, allowScopeEmpty = false) {
   const statesByIndex = new Map(
     (Array.isArray(states) ? states : [])
@@ -187,22 +185,6 @@ function countConfiguredInlineKeys(rows) {
   return count;
 }
 
-function selectFirstEnabledInlineKey(rows, states) {
-  return selectAvailableInlineKeys(rows, states)[0] || '';
-}
-
-function selectModelsForInlineKeyTest(row, modelRows) {
-  const keyRow = normalizeInlineKeyRow(row);
-  const allowedModels = new Set(keyRow.allowed_models.map(name => name.toLowerCase()));
-  const rows = (Array.isArray(modelRows) ? modelRows : []).filter(modelRow => {
-    const name = routingKeyModelName(modelRow?.model);
-    return name && (allowedModels.size === 0 || allowedModels.has(name.toLowerCase()));
-  });
-  const enabledRows = rows.filter(modelRow => !modelRow.disabled);
-  return (enabledRows.length > 0 ? enabledRows : rows)
-    .map(modelRow => routingKeyModelName(modelRow.model));
-}
-
 function updateInlineKeyHiddenInput() {
   const hiddenInput = document.getElementById('channelApiKey');
   if (hiddenInput) {
@@ -219,6 +201,7 @@ function setInlineKeyTableDataFromAPI(apiKeys) {
         allowed_models: item.allowed_models || [],
         detected_models: item.detected_models || [],
         model_scope_empty: item.model_scope_empty === true,
+        model_scope_auto: item.model_scope_auto === true,
         cost_multiplier: item.cost_multiplier,
         priority: item.priority
       });
@@ -236,20 +219,11 @@ let keyModelScopeDetectionGeneration = 0;
 let keyModelScopeOpenedGeneration = 0;
 let keyModelScopeExtraModels = [];
 let keyModelScopeDetectedModels = [];
+let keyModelScopeAuto = false;
+let keyModelScopeAllowedModels = [];
 
-function resolveKeyScopeTarget(rows, row) {
-  const redirect = String(row?.redirect_model || '').trim();
-  let target = redirect || String(row?.model || '').trim();
-  if (redirect) {
-    const enabled = rows.filter(entry => !entry?.disabled);
-    const next = enabled.find(entry => String(entry.model || '').trim() === target) ||
-      enabled.find(entry => routingKeyModelName(entry.model) === target);
-    if (next?.redirect_model) target = String(next.redirect_model).trim();
-  }
-  return routingKeyModelName(target);
-}
-
-function configuredKeyModelScopeOptions() {
+// rewrite 仅探测命中需要；渲染只展示逻辑模型，按重定向目标即可。
+function configuredKeyModelScopeOptions(rewrite = null) {
   const options = [];
   const byModel = new Map();
   const rows = typeof redirectTableData !== 'undefined' && Array.isArray(redirectTableData)
@@ -265,9 +239,10 @@ function configuredKeyModelScopeOptions() {
       byModel.set(key, option);
       options.push(option);
     }
-    const upstream = resolveKeyScopeTarget(rows, row);
-    if (!option.upstreamModels.some(name => name.toLowerCase() === upstream.toLowerCase())) {
-      option.upstreamModels.push(upstream);
+    for (const upstream of editorFinalUpstreamModels(rows, row, rewrite)) {
+      if (!option.upstreamModels.some(name => name.toLowerCase() === upstream.toLowerCase())) {
+        option.upstreamModels.push(upstream);
+      }
     }
     option.disabled = option.disabled && Boolean(row?.disabled);
   }
@@ -322,6 +297,7 @@ function setVisibleKeyModelScopeChecked(checked) {
   for (const checkbox of visible) {
     checkbox.checked = Boolean(checked);
   }
+  keyModelScopeAuto = false;
   updateKeyModelScopeSelectionCount();
   setKeyModelScopeStatus();
   return true;
@@ -380,6 +356,8 @@ function openKeyModelScopeModal(index, trigger) {
   keyModelScopeOpenedGeneration = ++keyModelScopeDetectionGeneration;
   keyModelScopeExtraModels = normalizeKeyAllowedModels(row.allowed_models);
   keyModelScopeDetectedModels = normalizeKeyAllowedModels(row.detected_models);
+  keyModelScopeAuto = row.model_scope_auto;
+  keyModelScopeAllowedModels = normalizeKeyAllowedModels(row.allowed_models);
   keyModelScopeTrigger = trigger || document.activeElement;
   const scopeWasEmptied = row.model_scope_empty === true;
   renderKeyModelScopeOptions(row.allowed_models, scopeWasEmptied);
@@ -417,6 +395,8 @@ function closeKeyModelScopeModal(restoreFocus = true) {
   keyModelScopeDetectionGeneration++;
   keyModelScopeExtraModels = [];
   keyModelScopeDetectedModels = [];
+  keyModelScopeAuto = false;
+  keyModelScopeAllowedModels = [];
   keyModelScopeTrigger = null;
 }
 
@@ -435,6 +415,9 @@ function confirmKeyModelScope() {
   const index = keyModelScopeEditingIndex;
   const row = normalizeInlineKeyRow(inlineKeyTableData[index]);
   row.allowed_models = normalizeKeyAllowedModels(allowedModels);
+  row.model_scope_auto = !allowAll && keyModelScopeAuto &&
+    row.allowed_models.length === keyModelScopeAllowedModels.length &&
+    row.allowed_models.every(model => keyModelScopeAllowedModels.some(name => name.toLowerCase() === model.toLowerCase()));
   if (keyModelScopeDetectionGeneration > keyModelScopeOpenedGeneration && keyModelScopeDetectedModels.length > 0) {
     row.detected_models = [...keyModelScopeDetectedModels];
   }
@@ -469,6 +452,7 @@ async function detectKeyModelScope() {
     setKeyModelScopeStatus(window.t('channels.keyModelsDetectNeedsConfig'), true);
     return;
   }
+  const rewrite = currentEditorUpstreamModelRewrite();
 
   const button = document.getElementById('detectKeyModelScopeBtn');
   if (button) {
@@ -502,7 +486,7 @@ async function detectKeyModelScope() {
     let matched = 0;
     const matchedTargets = [];
     const checks = [];
-    const targetsByModel = new Map(configuredKeyModelScopeOptions().map(option =>
+    const targetsByModel = new Map(configuredKeyModelScopeOptions(rewrite).map(option =>
       [option.model.toLowerCase(), option.upstreamModels]));
     for (const checkbox of getKeyModelScopeCheckboxes()) {
       const logical = checkbox.value.toLowerCase();
@@ -521,6 +505,8 @@ async function detectKeyModelScope() {
     }
     for (const item of checks) item.checkbox.checked = item.hit;
     keyModelScopeDetectedModels = storedTargets;
+    keyModelScopeAllowedModels = checks.filter(item => item.hit).map(item => item.checkbox.value);
+    keyModelScopeAuto = true;
     const allowAll = document.getElementById('keyModelScopeAll');
     if (allowAll) allowAll.checked = false;
     syncKeyModelScopeControls();
@@ -545,11 +531,17 @@ function initKeyModelScopeModalEvents() {
   });
   modal.querySelector('[data-action="confirm-key-model-scope"]')?.addEventListener('click', confirmKeyModelScope);
   document.getElementById('detectKeyModelScopeBtn')?.addEventListener('click', detectKeyModelScope);
-  document.getElementById('keyModelScopeAll')?.addEventListener('change', syncKeyModelScopeControls);
+  document.getElementById('keyModelScopeAll')?.addEventListener('change', () => {
+    keyModelScopeAuto = false;
+    syncKeyModelScopeControls();
+  });
   document.getElementById('keyModelScopeToggleAll')?.addEventListener('change', event => {
     setVisibleKeyModelScopeChecked(event.target.checked);
   });
-  document.getElementById('keyModelScopeList')?.addEventListener('change', updateKeyModelScopeSelectionCount);
+  document.getElementById('keyModelScopeList')?.addEventListener('change', () => {
+    keyModelScopeAuto = false;
+    updateKeyModelScopeSelectionCount();
+  });
   document.getElementById('keyModelScopeSearch')?.addEventListener('input', event => {
     filterKeyModelScopeOptions(event.target.value);
   });
@@ -592,11 +584,9 @@ function getKeyTableViewportHeight(container = getKeyTableContainer()) {
 
 const CHANNEL_EDITOR_TABLE_LAYOUT = {
   KEY_MIN_ROWS: 1,
-  KEY_MAX_ROWS: 8,
-  DEFAULT_ROW_HEIGHT: 36
+  KEY_MAX_ROWS: 8
 };
 
-let channelEditorLayoutResizeBound = false;
 let channelEditorLayoutRafId = null;
 
 function clampChannelEditorRows(value, min, max) {
@@ -605,22 +595,11 @@ function clampChannelEditorRows(value, min, max) {
   return Math.min(max, Math.max(min, Math.ceil(numberValue)));
 }
 
-function getChannelEditorCSSPixelValue(styles, propertyName, fallback) {
-  const value = parseFloat(styles.getPropertyValue(propertyName));
-  return Number.isFinite(value) ? value : fallback;
-}
-
 function getVisibleKeyCountForLayout() {
   if (typeof getVisibleKeyIndices === 'function') {
     return getVisibleKeyIndices().length;
   }
   return Array.isArray(inlineKeyTableData) ? inlineKeyTableData.length : 0;
-}
-
-function ensureChannelEditorLayoutResizeSync() {
-  if (channelEditorLayoutResizeBound || typeof window === 'undefined') return;
-  window.addEventListener('resize', scheduleChannelEditorTableSizingSync, { passive: true });
-  channelEditorLayoutResizeBound = true;
 }
 
 function scheduleChannelEditorTableSizingSync() {
@@ -638,38 +617,16 @@ function scheduleChannelEditorTableSizingSync() {
 
 function syncChannelEditorTableSizing() {
   const body = document.querySelector('#channelModal .channel-editor-body');
-  const keyGroup = document.querySelector('#channelModal .channel-editor-group--keys');
-  const modelGroup = document.querySelector('#channelModal .channel-editor-group--models');
-  if (!body || !keyGroup || !modelGroup) return;
-
-  ensureChannelEditorLayoutResizeSync();
-  const bodyStyles = window.getComputedStyle(body);
-  const rowHeight = getChannelEditorCSSPixelValue(
-    bodyStyles,
-    '--channel-editor-table-row-height',
-    CHANNEL_EDITOR_TABLE_LAYOUT.DEFAULT_ROW_HEIGHT
-  );
+  if (!body) return;
 
   const visibleKeyCount = getVisibleKeyCountForLayout();
-  let keyRows = clampChannelEditorRows(
+  const keyRows = clampChannelEditorRows(
     visibleKeyCount || CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MIN_ROWS,
     CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MIN_ROWS,
     CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MAX_ROWS
   );
   body.style.setProperty('--channel-editor-key-visible-rows', String(keyRows));
-
-  const modelTable = modelGroup.querySelector('.inline-table-container');
-  if (modelTable && rowHeight > 0) {
-    const overflow = modelTable.getBoundingClientRect().bottom - body.getBoundingClientRect().bottom;
-    if (overflow > 0 && keyRows > CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MIN_ROWS) {
-      keyRows = clampChannelEditorRows(
-        keyRows - Math.ceil(overflow / rowHeight),
-        CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MIN_ROWS,
-        CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MAX_ROWS
-      );
-      body.style.setProperty('--channel-editor-key-visible-rows', String(keyRows));
-    }
-  }
+  getKeyTableContainer()?.classList.toggle('is-scrollable', visibleKeyCount > CHANNEL_EDITOR_TABLE_LAYOUT.KEY_MAX_ROWS);
 
   if (typeof requestAnimationFrame === 'function') {
     requestAnimationFrame(() => refreshVirtualKeyRows());
@@ -745,7 +702,7 @@ function buildCooldownHtml(index) {
     return tpl ? tpl.innerHTML.replaceAll('{{text}}', cooldownText) : window.t('channels.cooldownBadge', { time: cooldownText });
   }
   const normalTpl = document.getElementById('tpl-key-normal-status');
-  return normalTpl ? normalTpl.innerHTML : `<span style="color: var(--success-600); font-size: 12px;">✓ ${window.t('channels.statusNormal')}</span>`;
+  return normalTpl ? normalTpl.innerHTML : `<span class="key-status-normal">✓ ${window.t('channels.statusNormal')}</span>`;
 }
 
 /**
@@ -1045,8 +1002,7 @@ function initKeyTableEventDelegation() {
     if (actionBtn) {
       const action = actionBtn.dataset.action;
       const index = parseInt(actionBtn.dataset.index);
-      if (action === 'test') testSingleKey(index, actionBtn);
-      else if (action === 'copy') copyKeyToClipboard(index);
+      if (action === 'copy') copyKeyToClipboard(index);
       else if (action === 'delete') deleteInlineKey(index);
       else if (action === 'toggle-disabled') toggleKeyDisabled(index);
       else if (action === 'models') openKeyModelScopeModal(index, actionBtn);
@@ -1112,18 +1068,14 @@ function initKeyTableEventDelegation() {
     const btn = e.target.closest('.key-action-btn');
     if (btn) {
       const action = btn.dataset.action;
-      if (action === 'test') {
-        btn.style.background = '#eff6ff';
-        btn.style.borderColor = '#93c5fd';
-        btn.style.color = '#3b82f6';
-      } else if (action === 'copy') {
-        btn.style.background = '#f0fdf4';
-        btn.style.borderColor = '#86efac';
-        btn.style.color = '#16a34a';
+      if (action === 'copy') {
+        btn.style.background = 'var(--success-50)';
+        btn.style.borderColor = 'var(--success-300)';
+        btn.style.color = 'var(--success-600)';
       } else if (action === 'delete') {
-        btn.style.background = '#fef2f2';
-        btn.style.borderColor = '#fca5a5';
-        btn.style.color = '#dc2626';
+        btn.style.background = 'var(--error-50)';
+        btn.style.borderColor = 'var(--error-300)';
+        btn.style.color = 'var(--error-600)';
       }
     }
   });
@@ -1140,12 +1092,9 @@ function initKeyTableEventDelegation() {
 
 function renderInlineKeyTable() {
   const tbody = document.getElementById('inlineKeyTableBody');
-  const keyCount = document.getElementById('inlineKeyCount');
-  const virtualScrollHint = document.getElementById('virtualScrollHint');
 
   normalizeInlineKeyTableData();
   tbody.innerHTML = '';
-  keyCount.textContent = inlineKeyTableData.length;
   const sortButton = document.getElementById('sortKeysBtn');
   if (sortButton) sortButton.disabled = isChannelKeyEditorReadOnly() || getValidInlineKeyRows().length < 2;
 
@@ -1162,7 +1111,6 @@ function renderInlineKeyTable() {
     if (emptyRow) tbody.appendChild(emptyRow);
     cleanupVirtualScroll();
     virtualScrollState.enabled = false;
-    if (virtualScrollHint) virtualScrollHint.style.display = 'none';
     syncChannelEditorTableSizing();
     return;
   }
@@ -1179,7 +1127,6 @@ function renderInlineKeyTable() {
     if (emptyRow) tbody.appendChild(emptyRow);
     cleanupVirtualScroll();
     virtualScrollState.enabled = false;
-    if (virtualScrollHint) virtualScrollHint.style.display = 'none';
     syncChannelEditorTableSizing();
     return;
   }
@@ -1199,43 +1146,29 @@ function renderInlineKeyTable() {
 
     tbody.innerHTML = '';
     tbody.appendChild(fragment);
-
-    if (virtualScrollHint) virtualScrollHint.style.display = 'none';
-    updateSelectAllCheckbox();
-    updateBatchDeleteButton();
-
-    if (window.i18n && window.i18n.translatePage) {
-      window.i18n.translatePage();
+  } else {
+    virtualScrollState.enabled = true;
+    const shouldResetScroll = !virtualScrollState.filteredIndices ||
+      virtualScrollState.filteredIndices.length !== visibleIndices.length;
+    if (shouldResetScroll) {
+      virtualScrollState.scrollTop = 0;
     }
-    return;
-  }
+    virtualScrollState.filteredIndices = visibleIndices;
 
-  virtualScrollState.enabled = true;
-  const shouldResetScroll = !virtualScrollState.filteredIndices ||
-    virtualScrollState.filteredIndices.length !== visibleIndices.length;
-  if (shouldResetScroll) {
-    virtualScrollState.scrollTop = 0;
-  }
-  virtualScrollState.filteredIndices = visibleIndices;
+    const { visibleStart, visibleEnd } = calculateVisibleRange(visibleIndices.length);
+    virtualScrollState.visibleStart = visibleStart;
+    virtualScrollState.visibleEnd = visibleEnd;
 
-  const { visibleStart, visibleEnd } = calculateVisibleRange(visibleIndices.length);
-  virtualScrollState.visibleStart = visibleStart;
-  virtualScrollState.visibleEnd = visibleEnd;
+    renderVirtualRows(tbody, visibleStart, visibleEnd, visibleIndices);
+    initVirtualScroll();
 
-  renderVirtualRows(tbody, visibleStart, visibleEnd, visibleIndices);
-  initVirtualScroll();
-
-  // 同步容器滚动位置
-  if (shouldResetScroll) {
-    const tableContainer = tbody.closest('.inline-table-container');
-    if (tableContainer) {
-      tableContainer.scrollTop = 0;
+    // 同步容器滚动位置
+    if (shouldResetScroll) {
+      const tableContainer = tbody.closest('.inline-table-container');
+      if (tableContainer) {
+        tableContainer.scrollTop = 0;
+      }
     }
-  }
-
-  if (virtualScrollHint) {
-    const showHint = visibleIndices.length >= VIRTUAL_SCROLL_CONFIG.ENABLE_THRESHOLD;
-    virtualScrollHint.style.display = showHint ? 'inline' : 'none';
   }
 
   updateSelectAllCheckbox();
@@ -1243,7 +1176,7 @@ function renderInlineKeyTable() {
 
   // Translate dynamically rendered elements
   if (window.i18n && window.i18n.translatePage) {
-    window.i18n.translatePage();
+    window.i18n.translatePage(tbody);
   }
 }
 
@@ -1271,6 +1204,7 @@ function updateInlineKey(index, value) {
 
   row.api_key = nextValue;
   delete row.detected_models;
+  row.model_scope_auto = false;
   inlineKeyTableData[index] = row;
   markChannelFormDirty();
   updateInlineKeyHiddenInput();
@@ -1305,63 +1239,6 @@ function updateInlineKeyCostMultiplier(index, value) {
   row.cost_multiplier = nextValue;
   inlineKeyTableData[index] = row;
   markChannelFormDirty();
-}
-
-async function testSingleKey(keyIndex, testButton) {
-  if (!editingChannelId) {
-    alert(window.t('channels.cannotGetChannelId'));
-    return;
-  }
-
-  // 从 redirectTableData 获取模型列表（定义在 channels-state.js）
-  const models = selectModelsForInlineKeyTest(inlineKeyTableData[keyIndex], redirectTableData);
-  if (models.length === 0) {
-    alert(window.t('channels.configModelsFirst'));
-    return;
-  }
-
-  const firstModel = models[0];
-  const apiKey = getInlineKeyValue(keyIndex);
-
-  if (!apiKey || !apiKey.trim()) {
-    alert(window.t('channels.emptyKeyCannotTest'));
-    return;
-  }
-
-  if (!testButton) return;
-  const originalHTML = testButton.innerHTML;
-  testButton.disabled = true;
-  testButton.innerHTML = '<span style="font-size: 10px;">⏳</span>';
-
-  try {
-    const testResult = await fetchDataWithAuth(`/admin/channels/${editingChannelId}/test`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: firstModel,
-        stream: true,
-        content: 'test',
-        client_protocol: 'anthropic',
-        key_index: keyIndex,
-        api_key: apiKey.trim()
-      })
-    });
-
-    await refreshKeyCooldownStatus();
-
-    if (testResult.success) {
-      window.showNotification(window.t('channels.testKeySuccess', { index: keyIndex + 1 }), 'success');
-    } else {
-      const errorMsg = testResult.error || window.t('common.failed');
-      window.showNotification(window.t('channels.testKeyFailed', { index: keyIndex + 1, error: errorMsg }), 'error');
-    }
-  } catch (e) {
-    console.error('Test failed', e);
-    window.showNotification(window.t('channels.testRequestFailed', { index: keyIndex + 1, error: e.message }), 'error');
-  } finally {
-    testButton.disabled = false;
-    testButton.innerHTML = originalHTML;
-  }
 }
 
 async function refreshKeyCooldownStatus() {
@@ -1430,34 +1307,40 @@ function copyKeyToClipboard(index) {
   });
 }
 
-function deleteInlineKey(index) {
-  if (isChannelKeyEditorReadOnly()) return;
-  if (inlineKeyTableData.length === 1) {
-    alert(window.t('channels.keepOneKey'));
-    return;
-  }
+function deleteInlineKeysAtIndices(indices) {
+  const tableContainer = document.querySelector('#inlineKeyTableBody').closest('.inline-table-container');
+  const scrollTop = tableContainer ? tableContainer.scrollTop : 0;
 
-  if (confirm(window.t('channels.confirmDeleteKey', { index: index + 1 }))) {
-    const tableContainer = document.querySelector('#inlineKeyTableBody').closest('.inline-table-container');
-    const scrollTop = tableContainer ? tableContainer.scrollTop : 0;
-
+  indices.forEach(index => {
     inlineKeyTableData.splice(index, 1);
 
     currentChannelKeyCooldowns = currentChannelKeyCooldowns
       .filter(kc => kc.key_index !== index)
       .map(kc => kc.key_index > index ? { ...kc, key_index: kc.key_index - 1 } : kc);
+  });
 
-    selectedKeyIndices.clear();
-    updateBatchDeleteButton();
+  selectedKeyIndices.clear();
+  updateBatchDeleteButton();
 
-    renderInlineKeyTable();
-    markChannelFormDirty();
+  renderInlineKeyTable();
+  markChannelFormDirty();
 
-    setTimeout(() => {
-      if (tableContainer) {
-        tableContainer.scrollTop = Math.min(scrollTop, tableContainer.scrollHeight - tableContainer.clientHeight);
-      }
-    }, 50);
+  setTimeout(() => {
+    if (tableContainer) {
+      tableContainer.scrollTop = Math.min(scrollTop, tableContainer.scrollHeight - tableContainer.clientHeight);
+    }
+  }, 50);
+}
+
+async function deleteInlineKey(index) {
+  if (isChannelKeyEditorReadOnly()) return;
+  if (inlineKeyTableData.length === 1) {
+    window.showNotification(window.t('channels.keepOneKey'), 'warning');
+    return;
+  }
+
+  if (await window.showConfirm({ message: window.t('channels.confirmDeleteKey', { index: index + 1 }), danger: true })) {
+    deleteInlineKeysAtIndices([index]);
   }
 }
 
@@ -1505,9 +1388,9 @@ function updateBatchDeleteButton() {
     if (textSpan) textSpan.textContent = window.t('channels.deleteSelectedCount', { count });
     btn.style.cursor = 'pointer';
     btn.style.opacity = '1';
-    btn.style.background = 'linear-gradient(135deg, #fef2f2 0%, #fecaca 100%)';
-    btn.style.borderColor = '#fca5a5';
-    btn.style.color = '#dc2626';
+    btn.style.background = 'linear-gradient(135deg, var(--error-50) 0%, var(--error-200) 100%)';
+    btn.style.borderColor = 'var(--error-300)';
+    btn.style.color = 'var(--error-600)';
   } else {
     btn.disabled = true;
     if (textSpan) textSpan.textContent = window.t('channels.deleteSelected');
@@ -1535,44 +1418,22 @@ function updateSelectAllCheckbox() {
     visibleIndices.some(index => selectedKeyIndices.has(index));
 }
 
-function batchDeleteSelectedKeys() {
+async function batchDeleteSelectedKeys() {
   if (isChannelKeyEditorReadOnly()) return;
   const count = selectedKeyIndices.size;
   if (count === 0) return;
 
   if (inlineKeyTableData.length - count < 1) {
-    alert(window.t('channels.keepOneKey'));
+    window.showNotification(window.t('channels.keepOneKey'), 'warning');
     return;
   }
 
-  if (!confirm(window.t('channels.confirmBatchDeleteKeys', { count }))) {
+  if (!await window.showConfirm({ message: window.t('channels.confirmBatchDeleteKeys', { count }), danger: true })) {
     return;
   }
-
-  const tableContainer = document.querySelector('#inlineKeyTableBody').closest('.inline-table-container');
-  const scrollTop = tableContainer ? tableContainer.scrollTop : 0;
 
   const indicesToDelete = Array.from(selectedKeyIndices).sort((a, b) => b - a);
-
-  indicesToDelete.forEach(index => {
-    inlineKeyTableData.splice(index, 1);
-
-    currentChannelKeyCooldowns = currentChannelKeyCooldowns
-      .filter(kc => kc.key_index !== index)
-      .map(kc => kc.key_index > index ? { ...kc, key_index: kc.key_index - 1 } : kc);
-  });
-
-  selectedKeyIndices.clear();
-  updateBatchDeleteButton();
-
-  renderInlineKeyTable();
-  markChannelFormDirty();
-
-  setTimeout(() => {
-    if (tableContainer) {
-      tableContainer.scrollTop = Math.min(scrollTop, tableContainer.scrollHeight - tableContainer.clientHeight);
-    }
-  }, 50);
+  deleteInlineKeysAtIndices(indicesToDelete);
 }
 
 function filterKeysByStatus(status) {
@@ -1614,14 +1475,14 @@ function confirmInlineKeyImport() {
   const input = textarea.value.trim();
 
   if (!input) {
-    alert(window.t('channels.enterAtLeastOneKey'));
+    window.showNotification(window.t('channels.enterAtLeastOneKey'), 'warning');
     return;
   }
 
   const newKeys = parseKeys(input);
 
   if (newKeys.length === 0) {
-    alert(window.t('channels.noValidKeyParsed'));
+    window.showNotification(window.t('channels.noValidKeyParsed'), 'warning');
     return;
   }
 
@@ -1815,13 +1676,11 @@ async function toggleKeyDisabled(index) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     normalizeInlineKeyRow,
+    updateInlineKey,
     normalizeKeyAllowedModels,
     pruneKeyAllowedModels,
-    selectAvailableInlineKeys,
     selectModelFetchKeyEntries,
     countConfiguredInlineKeys,
-    selectFirstEnabledInlineKey,
-    selectModelsForInlineKeyTest,
     openKeyModelScopeModal,
     closeKeyModelScopeModal,
     confirmKeyModelScope,

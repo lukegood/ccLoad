@@ -12,6 +12,24 @@ import (
 	"ccLoad/internal/model"
 )
 
+// logs 上带 log_source 前缀的范围索引；按查询的范围列（time / minute_bucket）选用。
+const (
+	logsTimeRangeIndex   = "idx_logs_source_time"
+	logsMinuteRangeIndex = "idx_logs_source_minute"
+)
+
+// logsRangeIndexHint 返回紧跟在 "FROM logs [alias]" 后的 MySQL 索引提示。
+// log_source 几乎全是 proxy，MySQL 会把它当作 ref 等值前缀（估算半张表）并常选错索引，
+// 逐行回表后才过滤时间，耗时随总表行数线性增长。FORCE INDEX 把候选限定为
+// 能用上范围的来源索引与渠道索引，渠道/模型筛选仍可走渠道索引。
+// filter 语义与 ApplyLogFilter 一致（nil 即 proxy）；LogSourceAll 没有来源条件，强制来源索引只会更慢。
+func (s *SQLStore) logsRangeIndexHint(rangeIndex string, filter *model.LogFilter) string {
+	if !s.IsMySQL() || (filter != nil && filter.LogSource == model.LogSourceAll) {
+		return ""
+	}
+	return " FORCE INDEX (" + rangeIndex + ", idx_logs_channel_time_id, idx_logs_channel_model_time_id)"
+}
+
 // executeStatsQuery 构建并执行统计 SQL，返回行结果与渠道 ID 集合（供后续批量补全）。
 // withLastSuccess=true 时额外 SELECT/扫描 last_success_at 列；isEmpty 表示渠道过滤后无候选。
 func (s *SQLStore) executeStatsQuery(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, withLastSuccess bool) (stats []model.StatsEntry, channelIDsToFetch map[int64]bool, err error) {
@@ -40,7 +58,7 @@ func (s *SQLStore) executeStatsQuery(ctx context.Context, startTime, endTime tim
 			SUM(COALESCE(cache_creation_input_tokens, 0)) as total_cache_creation_input_tokens,
 			SUM(COALESCE(cost, 0.0)) as total_cost,
 			SUM(COALESCE(cost, 0.0) * COALESCE(cost_multiplier, 1)) as effective_cost
-		FROM logs`
+		FROM logs` + s.logsRangeIndexHint(logsTimeRangeIndex, filter)
 
 	startMs := startTime.UnixMilli()
 	endMs := endTime.UnixMilli()
@@ -147,6 +165,20 @@ func (s *SQLStore) executeStatsQuery(ctx context.Context, startTime, endTime tim
 // 消除 N+1：渠道过滤/名称解析用一次批量查询完成
 // [FIX] 2025-12: 排除499（客户端取消）避免污染成功率和调用次数统计
 func (s *SQLStore) GetStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) ([]model.StatsEntry, error) {
+	// 分钟桶 RPM 与主统计扫描同一批日志但互不依赖，大范围时两者都是秒级，并行查询。
+	rpmCtx, cancelRPM := context.WithCancel(ctx)
+	rpmDone := make(chan struct{})
+	var rpm statsRPM
+	var rpmErr error
+	go func() {
+		defer close(rpmDone)
+		rpm, rpmErr = s.queryStatsRPM(rpmCtx, startTime, endTime, filter, isToday)
+	}()
+	defer func() {
+		cancelRPM()
+		<-rpmDone
+	}()
+
 	stats, channelIDsToFetch, err := s.executeStatsQuery(ctx, startTime, endTime, filter, true)
 	if err != nil {
 		return nil, err
@@ -169,6 +201,7 @@ func (s *SQLStore) GetStats(ctx context.Context, startTime, endTime time.Time, f
 				if info, ok := channelInfos[int64(*stats[i].ChannelID)]; ok {
 					stats[i].ChannelName = info.Name
 					stats[i].ChannelPriority = &info.Priority
+					stats[i].ChannelAuthType = info.AuthType
 					if info.CostMultiplierMin != 1 || info.CostMultiplierMax != 1 {
 						min := info.CostMultiplierMin
 						max := info.CostMultiplierMax
@@ -193,11 +226,12 @@ func (s *SQLStore) GetStats(ctx context.Context, startTime, endTime time.Time, f
 	}
 
 	// 计算每个channel_id+model的RPM统计
-	if len(stats) > 0 {
-		if err := s.fillStatsRPM(ctx, stats, startTime, endTime, filter, isToday); err != nil {
-			// 降级处理：RPM计算失败不影响主要统计数据
-			log.Printf("[WARN] 计算RPM统计失败: %v", err)
-		}
+	<-rpmDone
+	if rpmErr != nil {
+		// 降级处理：RPM计算失败不影响主要统计数据
+		log.Printf("[WARN] 计算RPM统计失败: %v", rpmErr)
+	} else {
+		rpm.fill(stats, startTime, endTime, isToday)
 	}
 
 	return stats, nil
@@ -237,7 +271,7 @@ func (s *SQLStore) fillStatsLastSuccesses(ctx context.Context, stats []model.Sta
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestChannelSuccessQuery(entryIndexesByChannel, lastStateFilter, s.IsSQLite())
+	query, args := s.buildLatestChannelSuccessQuery(entryIndexesByChannel, lastStateFilter)
 	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -285,7 +319,7 @@ func (s *SQLStore) fillStatsLastSuccessesByEntry(ctx context.Context, stats []mo
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestEntrySuccessQuery(entryIndexes, lastStateFilter, s.IsSQLite())
+	query, args := s.buildLatestEntrySuccessQuery(entryIndexes, lastStateFilter)
 	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -339,7 +373,7 @@ func (s *SQLStore) fillStatsLastRequests(ctx context.Context, stats []model.Stat
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestChannelRequestQuery(entryIndexesByChannel, lastStateFilter, s.IsSQLite())
+	query, args := s.buildLatestChannelRequestQuery(entryIndexesByChannel, lastStateFilter)
 	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -394,7 +428,7 @@ func (s *SQLStore) fillStatsLastRequestsByEntry(ctx context.Context, stats []mod
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestEntryRequestQuery(entryIndexes, lastStateFilter, s.IsSQLite())
+	query, args := s.buildLatestEntryRequestQuery(entryIndexes, lastStateFilter)
 	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
@@ -440,41 +474,54 @@ func hasStatsModelFilter(filter *model.LogFilter) bool {
 	return filter != nil && (filter.Model != "" || filter.ModelLike != "")
 }
 
-func buildLatestChannelSuccessQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
-	return buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id"}, scalarProjection, func(qb *QueryBuilder) {
+func (s *SQLStore) buildLatestChannelSuccessQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter) (string, []any) {
+	return s.buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id"}, func(qb *QueryBuilder) {
 		qb.Where("status_code >= 200").
 			Where("status_code < 300")
 	})
 }
 
-func buildLatestChannelRequestQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
-	return buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, scalarProjection, func(qb *QueryBuilder) {
+func (s *SQLStore) buildLatestChannelRequestQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter) (string, []any) {
+	return s.buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, func(qb *QueryBuilder) {
 		qb.Where("status_code != 499")
 	})
 }
 
-func buildLatestEntrySuccessQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
-	return buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id"}, scalarProjection, func(qb *QueryBuilder) {
+func (s *SQLStore) buildLatestEntrySuccessQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter) (string, []any) {
+	return s.buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id"}, func(qb *QueryBuilder) {
 		qb.Where("status_code >= 200").
 			Where("status_code < 300")
 	})
 }
 
-func buildLatestEntryRequestQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
-	return buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, scalarProjection, func(qb *QueryBuilder) {
+func (s *SQLStore) buildLatestEntryRequestQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter) (string, []any) {
+	return s.buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, func(qb *QueryBuilder) {
 		qb.Where("status_code != 499")
 	})
 }
 
-func buildLatestChannelLogQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, selectColumns []string, scalarProjection bool, applyStatePredicate func(*QueryBuilder)) (string, []any) {
-	scopeSQL, scopeArgs := buildChannelScope(entryIndexesByChannel)
+func (s *SQLStore) buildLatestChannelLogQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, selectColumns []string, applyStatePredicate func(*QueryBuilder)) (string, []any) {
+	scopeSQL, scopeArgs := buildChannelScope(entryIndexesByChannel, s.IsPostgres())
+	return buildLatestLogQuery(scopeSQL, scopeArgs, filter, selectColumns, s.IsSQLite(), false, applyStatePredicate)
+}
+
+func (s *SQLStore) buildLatestEntryLogQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, selectColumns []string, applyStatePredicate func(*QueryBuilder)) (string, []any) {
+	scopeSQL, scopeArgs := buildEntryScope(entryIndexes, s.IsPostgres())
+	return buildLatestLogQuery(scopeSQL, scopeArgs, filter, selectColumns, s.IsSQLite(), true, applyStatePredicate)
+}
+
+func buildLatestLogQuery(scopeSQL string, scopeArgs []any, filter *model.LogFilter, selectColumns []string, scalarProjection, byEntry bool, applyStatePredicate func(*QueryBuilder)) (string, []any) {
+	scopeColumns := "scope.channel_id"
+	if byEntry {
+		scopeColumns += ", scope.model"
+	}
 	if scalarProjection {
-		// SQLite 会扁平化下面的相关 JOIN，并把 logs l 提到 scope 前做全表扫描。
-		// 标量投影让小 scope 驱动查询，每列都沿 channel_id,time,id 索引直接定位最新行。
-		projections, projectionArgs := buildLatestScalarProjections(selectColumns, filter, false, applyStatePredicate)
+		// SQLite 会扁平化相关 JOIN，并把 logs l 提到 scope 前做全表扫描。
+		// 标量投影让小 scope 驱动查询，每列沿 channel_id,time,id 索引定位最新行。
+		projections, projectionArgs := buildLatestScalarProjections(selectColumns, filter, byEntry, applyStatePredicate)
 		query := fmt.Sprintf(`
-			SELECT scope.channel_id, %s
-			FROM (%s) scope`, strings.Join(projections, ", "), scopeSQL)
+			SELECT %s, %s
+			FROM (%s) scope`, scopeColumns, strings.Join(projections, ", "), scopeSQL)
 		args := make([]any, 0, len(projectionArgs)+len(scopeArgs))
 		args = append(args, projectionArgs...)
 		args = append(args, scopeArgs...)
@@ -482,48 +529,19 @@ func buildLatestChannelLogQuery(entryIndexesByChannel map[int][]int, filter *mod
 	}
 
 	subQB := NewQueryBuilder("SELECT id FROM logs").
-		Where("channel_id = scope.channel_id").
-		Where("channel_id > 0")
-	applyStatePredicate(subQB)
-	subQB.ApplyFilter(filter)
-	subQuery, subArgs := subQB.BuildWithSuffix("ORDER BY time DESC, id DESC LIMIT 1")
-
-	query := fmt.Sprintf(`
-		SELECT scope.channel_id, %s
-		FROM (%s) scope
-		JOIN logs l ON l.id = (%s)`, strings.Join(selectColumns, ", "), scopeSQL, subQuery)
-
-	args := make([]any, 0, len(scopeArgs)+len(subArgs))
-	args = append(args, scopeArgs...)
-	args = append(args, subArgs...)
-	return query, args
-}
-
-func buildLatestEntryLogQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, selectColumns []string, scalarProjection bool, applyStatePredicate func(*QueryBuilder)) (string, []any) {
-	scopeSQL, scopeArgs := buildEntryScope(entryIndexes)
-	if scalarProjection {
-		projections, projectionArgs := buildLatestScalarProjections(selectColumns, filter, true, applyStatePredicate)
-		query := fmt.Sprintf(`
-			SELECT scope.channel_id, scope.model, %s
-			FROM (%s) scope`, strings.Join(projections, ", "), scopeSQL)
-		args := make([]any, 0, len(projectionArgs)+len(scopeArgs))
-		args = append(args, projectionArgs...)
-		args = append(args, scopeArgs...)
-		return query, args
+		Where("channel_id = scope.channel_id")
+	if byEntry {
+		subQB.Where("COALESCE(model, '') = scope.model")
 	}
-
-	subQB := NewQueryBuilder("SELECT id FROM logs").
-		Where("channel_id = scope.channel_id").
-		Where("COALESCE(model, '') = scope.model").
-		Where("channel_id > 0")
+	subQB.Where("channel_id > 0")
 	applyStatePredicate(subQB)
 	subQB.ApplyFilter(filter)
 	subQuery, subArgs := subQB.BuildWithSuffix("ORDER BY time DESC, id DESC LIMIT 1")
 
 	query := fmt.Sprintf(`
-		SELECT scope.channel_id, scope.model, %s
+		SELECT %s, %s
 		FROM (%s) scope
-		JOIN logs l ON l.id = (%s)`, strings.Join(selectColumns, ", "), scopeSQL, subQuery)
+		JOIN logs l ON l.id = (%s)`, scopeColumns, strings.Join(selectColumns, ", "), scopeSQL, subQuery)
 
 	args := make([]any, 0, len(scopeArgs)+len(subArgs))
 	args = append(args, scopeArgs...)
@@ -551,21 +569,27 @@ func buildLatestScalarProjections(selectColumns []string, filter *model.LogFilte
 	return projections, args
 }
 
-func buildChannelScope(entryIndexesByChannel map[int][]int) (string, []any) {
+// buildChannelScope / buildEntryScope 生成待查最新日志的 scope 行。
+// MySQL（loose index scan）和 SQLite（IN 列表逐个定位）能廉价地从 logs 去重；
+// PostgreSQL 没有 loose index scan，DISTINCT 会扫完这些渠道的全部历史索引，改为直接展开参数数组。
+func buildChannelScope(entryIndexesByChannel map[int][]int, postgres bool) (string, []any) {
 	channelIDs := make([]int, 0, len(entryIndexesByChannel))
 	for channelID := range entryIndexesByChannel {
 		channelIDs = append(channelIDs, channelID)
 	}
 	sort.Ints(channelIDs)
 
+	if len(channelIDs) == 0 {
+		return "SELECT channel_id FROM logs WHERE 1=0", nil
+	}
+	if postgres {
+		return "SELECT channel_id FROM unnest(CAST(? AS BIGINT[])) AS scope(channel_id)", []any{channelIDs}
+	}
 	placeholders := make([]string, len(channelIDs))
 	args := make([]any, 0, len(channelIDs))
 	for i, channelID := range channelIDs {
 		placeholders[i] = "?"
 		args = append(args, channelID)
-	}
-	if len(placeholders) == 0 {
-		return "SELECT channel_id FROM logs WHERE 1=0", args
 	}
 	return fmt.Sprintf(
 		"SELECT DISTINCT channel_id FROM logs WHERE channel_id IN (%s)",
@@ -573,7 +597,30 @@ func buildChannelScope(entryIndexesByChannel map[int][]int) (string, []any) {
 	), args
 }
 
-func buildEntryScope(entryIndexes map[statsRequestKey]int) (string, []any) {
+func buildEntryScope(entryIndexes map[statsRequestKey]int, postgres bool) (string, []any) {
+	if len(entryIndexes) == 0 {
+		return "SELECT channel_id, COALESCE(model, '') AS model FROM logs WHERE 1=0", nil
+	}
+	if postgres {
+		keys := make([]statsRequestKey, 0, len(entryIndexes))
+		for key := range entryIndexes {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i].channelID != keys[j].channelID {
+				return keys[i].channelID < keys[j].channelID
+			}
+			return keys[i].model < keys[j].model
+		})
+		channelIDs := make([]int, len(keys))
+		models := make([]string, len(keys))
+		for i, key := range keys {
+			channelIDs[i] = key.channelID
+			models[i] = key.model
+		}
+		return "SELECT channel_id, model FROM unnest(CAST(? AS BIGINT[]), CAST(? AS TEXT[])) AS scope(channel_id, model)", []any{channelIDs, models}
+	}
+
 	channelSet := make(map[int]struct{}, len(entryIndexes))
 	modelSet := make(map[string]struct{}, len(entryIndexes))
 	for key := range entryIndexes {
@@ -604,9 +651,6 @@ func buildEntryScope(entryIndexes map[statsRequestKey]int) (string, []any) {
 		modelPlaceholders[i] = "?"
 		args = append(args, modelName)
 	}
-	if len(channelPlaceholders) == 0 || len(modelPlaceholders) == 0 {
-		return "SELECT channel_id, COALESCE(model, '') AS model FROM logs WHERE 1=0", args
-	}
 	return fmt.Sprintf(
 		"SELECT DISTINCT channel_id, COALESCE(model, '') AS model FROM logs WHERE channel_id IN (%s) AND COALESCE(model, '') IN (%s)",
 		strings.Join(channelPlaceholders, ","),
@@ -634,7 +678,7 @@ func (s *SQLStore) GetClientProtocolStats(ctx context.Context, startTime, endTim
 			SUM(COALESCE(cache_creation_input_tokens, 0)) AS total_cache_creation_tokens,
 			SUM(COALESCE(cost, 0.0)) AS total_cost,
 			SUM(COALESCE(cost, 0.0) * COALESCE(cost_multiplier, 1)) AS effective_cost
-		FROM logs`
+		FROM logs` + s.logsRangeIndexHint(logsTimeRangeIndex, filter)
 
 	qb := NewQueryBuilder(baseQuery).
 		Where("time >= ?", startTime.UnixMilli()).
@@ -683,26 +727,25 @@ func (s *SQLStore) GetClientProtocolStats(ctx context.Context, startTime, endTim
 }
 
 // GetAuthTypeStats 按渠道认证类型聚合首页统计。
+// 先在 logs 上按渠道聚合再关联 channels：直接 JOIN 时 MySQL 会从 channels 出发按 channel_id 逐渠道回扫全部历史。
 func (s *SQLStore) GetAuthTypeStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.AuthTypeStats, error) {
-	baseQuery := `
+	byChannelQuery := `
 		SELECT
-			COALESCE(channels.auth_type, '') AS auth_type,
-			SUM(CASE WHEN logs.status_code >= 200 AND logs.status_code < 300 THEN 1 ELSE 0 END) AS success,
-			SUM(CASE WHEN (logs.status_code < 200 OR logs.status_code >= 300) AND logs.status_code != 499 THEN 1 ELSE 0 END) AS error,
-			SUM(COALESCE(logs.input_tokens, 0)) AS total_input_tokens,
-			SUM(COALESCE(logs.output_tokens, 0)) AS total_output_tokens,
-			SUM(COALESCE(logs.cache_read_input_tokens, 0)) AS total_cache_read_tokens,
-			SUM(COALESCE(logs.cache_creation_input_tokens, 0)) AS total_cache_creation_tokens,
-			SUM(COALESCE(logs.cost, 0.0)) AS total_cost,
-			SUM(COALESCE(logs.cost, 0.0) * COALESCE(logs.cost_multiplier, 1)) AS effective_cost
-		FROM logs
-		INNER JOIN channels ON channels.id = logs.channel_id`
+			channel_id,
+			SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS success,
+			SUM(CASE WHEN (status_code < 200 OR status_code >= 300) AND status_code != 499 THEN 1 ELSE 0 END) AS error,
+			SUM(COALESCE(input_tokens, 0)) AS input_tokens,
+			SUM(COALESCE(output_tokens, 0)) AS output_tokens,
+			SUM(COALESCE(cache_read_input_tokens, 0)) AS cache_read_tokens,
+			SUM(COALESCE(cache_creation_input_tokens, 0)) AS cache_creation_tokens,
+			SUM(COALESCE(cost, 0.0)) AS total_cost,
+			SUM(COALESCE(cost, 0.0) * COALESCE(cost_multiplier, 1)) AS effective_cost
+		FROM logs` + s.logsRangeIndexHint(logsTimeRangeIndex, filter)
 
-	qb := NewQueryBuilder(baseQuery).
-		Where("logs.time >= ?", startTime.UnixMilli()).
-		Where("logs.time <= ?", endTime.UnixMilli()).
-		Where("logs.channel_id > 0")
-	qb.Where("channels.auth_type <> ?", "")
+	qb := NewQueryBuilder(byChannelQuery).
+		Where("time >= ?", startTime.UnixMilli()).
+		Where("time <= ?", endTime.UnixMilli()).
+		Where("channel_id > 0")
 
 	isEmpty, err := s.applyChannelFilter(ctx, qb, filter)
 	if err != nil {
@@ -713,7 +756,23 @@ func (s *SQLStore) GetAuthTypeStats(ctx context.Context, startTime, endTime time
 	}
 	qb.ApplyFilter(filter)
 
-	query, args := qb.BuildWithSuffix("GROUP BY channels.auth_type ORDER BY channels.auth_type ASC")
+	byChannel, args := qb.BuildWithSuffix("GROUP BY channel_id")
+	query := `
+		SELECT
+			channels.auth_type,
+			SUM(t.success),
+			SUM(t.error),
+			SUM(t.input_tokens),
+			SUM(t.output_tokens),
+			SUM(t.cache_read_tokens),
+			SUM(t.cache_creation_tokens),
+			SUM(t.total_cost),
+			SUM(t.effective_cost)
+		FROM (` + byChannel + `) t
+		INNER JOIN channels ON channels.id = t.channel_id
+		WHERE channels.auth_type <> ''
+		GROUP BY channels.auth_type
+		ORDER BY channels.auth_type ASC`
 	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -760,7 +819,7 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 	combinedBaseQuery := `
 		SELECT COALESCE(MAX(cnt), 0) as peak_rpm, COALESCE(SUM(cnt), 0) as total_count FROM (
 			SELECT COUNT(*) as cnt
-			FROM logs`
+			FROM logs` + s.logsRangeIndexHint(logsMinuteRangeIndex, filter)
 
 	combinedQB := NewQueryBuilder(combinedBaseQuery).
 		Where("minute_bucket >= ?", startBucket).
@@ -804,7 +863,7 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 		recentStartBucket := now.Add(-60*time.Second).UnixMilli() / minuteMs
 		recentEndBucket := now.UnixMilli() / minuteMs
 
-		recentBaseQuery := `SELECT COUNT(*) FROM logs`
+		recentBaseQuery := `SELECT COUNT(*) FROM logs` + s.logsRangeIndexHint(logsMinuteRangeIndex, filter)
 		recentQB := NewQueryBuilder(recentBaseQuery).
 			Where("minute_bucket >= ?", recentStartBucket).
 			Where("minute_bucket <= ?", recentEndBucket).
@@ -840,69 +899,59 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 	return stats, nil
 }
 
-// fillStatsRPM 计算每个channel_id+model组合的RPM统计数据
+// statsRPM 是按 channel_id+model 统计的峰值与最近一分钟 RPM，以及按渠道合并的峰值。
+type statsRPM struct {
+	peak        map[statsRequestKey]float64
+	recent      map[statsRequestKey]float64
+	channelPeak map[int]float64
+}
+
+// queryStatsRPM 查询每个channel_id+model组合的RPM统计数据
 // [FIX] 2025-12: 排除499（客户端取消）避免污染RPM统计
-func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) error {
+func (s *SQLStore) queryStatsRPM(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) (statsRPM, error) {
 	startBucket := startTime.UnixMilli() / minuteMs
 	endBucket := endTime.UnixMilli() / minuteMs
 
-	// 计算时间跨度（秒）用于平均RPM
-	durationSeconds := endTime.Sub(startTime).Seconds()
-	if durationSeconds < 1 {
-		durationSeconds = 1
+	rpm := statsRPM{
+		peak:        make(map[statsRequestKey]float64),
+		recent:      make(map[statsRequestKey]float64),
+		channelPeak: make(map[int]float64),
 	}
-
-	type statsKey struct {
-		channelID int
-		model     string
-	}
-	peakRPMMap := make(map[statsKey]float64)
 
 	// 1) 峰值RPM（分钟桶内最大请求数）
-	peakBaseQuery := `
-		SELECT channel_id, COALESCE(model, '') AS model, MAX(cnt) AS peak_rpm
-		FROM (
-			SELECT channel_id, COALESCE(model, '') AS model, COUNT(*) AS cnt
-			FROM logs`
-
-	peakQB := NewQueryBuilder(peakBaseQuery).
-		Where("minute_bucket >= ?", startBucket).
-		Where("minute_bucket <= ?", endBucket).
-		Where("channel_id > 0").
-		Where("status_code != 499")
-
-	isEmpty, err := s.applyChannelFilter(ctx, peakQB, filter)
-	if err != nil {
-		return fmt.Errorf("apply channel filter for peak: %w", err)
-	}
-
-	// 仅当渠道过滤非空时才执行查询
-	if !isEmpty {
-		peakQB.ApplyFilter(filter)
-		peakQuery, peakArgs := peakQB.BuildWithSuffix("GROUP BY channel_id, model, minute_bucket) t GROUP BY channel_id, model")
-
-		peakRows, err := s.QueryContext(ctx, peakQuery, peakArgs...)
-		if err != nil {
-			return fmt.Errorf("query peak RPM: %w", err)
-		}
-		defer func() { _ = peakRows.Close() }()
-
-		for peakRows.Next() {
+	err := s.queryStatsPeakRPM(ctx, startBucket, endBucket, filter,
+		"channel_id, COALESCE(model, '') AS model", "channel_id, model",
+		func(rows *sql.Rows) error {
 			var channelID int
 			var model string
 			var peakRPM float64
-			if err := peakRows.Scan(&channelID, &model, &peakRPM); err != nil {
-				return fmt.Errorf("scan peak RPM: %w", err)
+			if err := rows.Scan(&channelID, &model, &peakRPM); err != nil {
+				return err
 			}
-			peakRPMMap[statsKey{channelID, model}] = peakRPM
-		}
-		if err := peakRows.Err(); err != nil {
-			return fmt.Errorf("iterate peak RPM rows: %w", err)
-		}
+			rpm.peak[statsRequestKey{channelID, model}] = peakRPM
+			return nil
+		})
+	if err != nil {
+		return statsRPM{}, err
+	}
+
+	// 渠道峰值必须按渠道合并分钟桶后再取最大值，不能由各模型峰值相加
+	err = s.queryStatsPeakRPM(ctx, startBucket, endBucket, filter,
+		"channel_id", "channel_id",
+		func(rows *sql.Rows) error {
+			var channelID int
+			var peakRPM float64
+			if err := rows.Scan(&channelID, &peakRPM); err != nil {
+				return err
+			}
+			rpm.channelPeak[channelID] = peakRPM
+			return nil
+		})
+	if err != nil {
+		return statsRPM{}, err
 	}
 
 	// 2) 最近一分钟RPM（仅本日有效）
-	recentRPMMap := make(map[statsKey]float64)
 	if isToday {
 		now := time.Now()
 		recentStartBucket := now.Add(-60*time.Second).UnixMilli() / minuteMs
@@ -910,7 +959,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 
 		recentBaseQuery := `
 			SELECT channel_id, COALESCE(model, '') AS model, COUNT(*) AS cnt
-			FROM logs`
+			FROM logs` + s.logsRangeIndexHint(logsMinuteRangeIndex, filter)
 		recentQB := NewQueryBuilder(recentBaseQuery).
 			Where("minute_bucket >= ?", recentStartBucket).
 			Where("minute_bucket <= ?", recentEndBucket).
@@ -919,7 +968,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 
 		isEmpty, err := s.applyChannelFilter(ctx, recentQB, filter)
 		if err != nil {
-			return fmt.Errorf("apply channel filter for recent: %w", err)
+			return statsRPM{}, fmt.Errorf("apply channel filter for recent: %w", err)
 		}
 
 		// 仅当渠道过滤非空时才执行查询
@@ -928,7 +977,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 			recentQuery, recentArgs := recentQB.BuildWithSuffix("GROUP BY channel_id, model")
 			recentRows, err := s.QueryContext(ctx, recentQuery, recentArgs...)
 			if err != nil {
-				return fmt.Errorf("query recent RPM: %w", err)
+				return statsRPM{}, fmt.Errorf("query recent RPM: %w", err)
 			}
 			defer func() { _ = recentRows.Close() }()
 
@@ -937,26 +986,88 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 				var model string
 				var cnt float64
 				if err := recentRows.Scan(&channelID, &model, &cnt); err != nil {
-					return fmt.Errorf("scan recent RPM: %w", err)
+					return statsRPM{}, fmt.Errorf("scan recent RPM: %w", err)
 				}
-				recentRPMMap[statsKey{channelID, model}] = cnt
+				rpm.recent[statsRequestKey{channelID, model}] = cnt
 			}
 			if err := recentRows.Err(); err != nil {
-				return fmt.Errorf("iterate recent RPM rows: %w", err)
+				return statsRPM{}, fmt.Errorf("iterate recent RPM rows: %w", err)
 			}
 		}
 	}
 
-	// 3) 填充到stats中
+	return rpm, nil
+}
+
+// queryStatsPeakRPM 按 groupCols 统计分钟桶内的最大请求数；selectCols 是 groupCols 的取值表达式，
+// scan 依次读取 groupCols 与峰值。
+func (s *SQLStore) queryStatsPeakRPM(ctx context.Context, startBucket, endBucket int64, filter *model.LogFilter, selectCols, groupCols string, scan func(*sql.Rows) error) error {
+	baseQuery := `
+		SELECT ` + groupCols + `, MAX(cnt) AS peak_rpm
+		FROM (
+			SELECT ` + selectCols + `, COUNT(*) AS cnt
+			FROM logs` + s.logsRangeIndexHint(logsMinuteRangeIndex, filter)
+
+	qb := NewQueryBuilder(baseQuery).
+		Where("minute_bucket >= ?", startBucket).
+		Where("minute_bucket <= ?", endBucket).
+		Where("channel_id > 0").
+		Where("status_code != 499")
+
+	isEmpty, err := s.applyChannelFilter(ctx, qb, filter)
+	if err != nil {
+		return fmt.Errorf("apply channel filter for peak: %w", err)
+	}
+	// 仅当渠道过滤非空时才执行查询
+	if isEmpty {
+		return nil
+	}
+
+	qb.ApplyFilter(filter)
+	query, args := qb.BuildWithSuffix("GROUP BY " + groupCols + ", minute_bucket) t GROUP BY " + groupCols)
+
+	rows, err := s.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("query peak RPM: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			return fmt.Errorf("scan peak RPM: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate peak RPM rows: %w", err)
+	}
+	return nil
+}
+
+// fill 把 RPM 统计填充到 stats 中。
+func (rpm statsRPM) fill(stats []model.StatsEntry, startTime, endTime time.Time, isToday bool) {
+	// 计算时间跨度（秒）用于平均RPM
+	durationSeconds := endTime.Sub(startTime).Seconds()
+	if durationSeconds < 1 {
+		durationSeconds = 1
+	}
+
+	// 渠道最近一分钟请求数可按模型相加；峰值至少不低于它（与单条目口径一致）
+	channelRecent := make(map[int]float64)
+	if isToday {
+		for key, recentRPM := range rpm.recent {
+			channelRecent[key.channelID] += recentRPM
+		}
+	}
+
 	for i := range stats {
 		entry := &stats[i]
 		if entry.ChannelID == nil {
 			continue
 		}
 
-		key := statsKey{*entry.ChannelID, entry.Model}
+		key := statsRequestKey{*entry.ChannelID, entry.Model}
 
-		if peakRPM, ok := peakRPMMap[key]; ok && peakRPM > 0 {
+		if peakRPM, ok := rpm.peak[key]; ok && peakRPM > 0 {
 			entry.PeakRPM = &peakRPM
 		}
 
@@ -966,16 +1077,19 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 		}
 
 		if isToday {
-			if recentRPM, ok := recentRPMMap[key]; ok && recentRPM > 0 {
+			if recentRPM, ok := rpm.recent[key]; ok && recentRPM > 0 {
 				entry.RecentRPM = &recentRPM
 				if entry.PeakRPM == nil || *entry.PeakRPM < recentRPM {
 					entry.PeakRPM = &recentRPM
 				}
 			}
 		}
-	}
 
-	return nil
+		channelPeak := max(rpm.channelPeak[*entry.ChannelID], channelRecent[*entry.ChannelID])
+		if channelPeak > 0 {
+			entry.ChannelPeakRPM = &channelPeak
+		}
+	}
 }
 
 // GetChannelSuccessRates 获取健康度排序使用的各渠道成功率和样本量。
@@ -1016,7 +1130,7 @@ func (s *SQLStore) GetChannelSuccessRates(ctx context.Context, since time.Time) 
 			SUM(CASE WHEN ` + eligible + ` THEN 1 ELSE 0 END) AS total,
 			AVG(CASE WHEN status_code >= 200 AND status_code < 300 AND first_byte_time > 0 THEN first_byte_time ELSE NULL END) AS avg_first_byte,
 			SUM(CASE WHEN status_code >= 200 AND status_code < 300 AND first_byte_time > 0 THEN 1 ELSE 0 END) AS first_byte_samples
-		FROM logs
+		FROM logs` + s.logsRangeIndexHint(logsMinuteRangeIndex, nil) + `
 		WHERE minute_bucket >= ? AND minute_bucket <= ? AND channel_id > 0 AND log_source = ?
 		GROUP BY channel_id`
 
@@ -1057,7 +1171,7 @@ func (s *SQLStore) GetTodayChannelCosts(ctx context.Context, todayStart time.Tim
 
 	query := `
 		SELECT channel_id, COALESCE(SUM(COALESCE(cost, 0.0) * COALESCE(cost_multiplier, 1)), 0) as total_cost
-		FROM logs
+		FROM logs` + s.logsRangeIndexHint(logsTimeRangeIndex, nil) + `
 		WHERE time >= ? AND channel_id > 0 AND log_source = ?
 		GROUP BY channel_id`
 

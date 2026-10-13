@@ -129,7 +129,7 @@ func cleanupPostgresTables(t *testing.T, db *sql.DB) {
 
 	tables := []string{
 		"debug_logs", "logs", "web_sessions", "admin_sessions", "system_settings",
-		"auth_tokens", "channel_models", "channel_model_cooldowns", "channel_protocol_transforms", "api_keys", "channel_url_states",
+		"auth_tokens", "channel_models", "channel_model_cooldowns", "channel_protocol_transforms", "api_keys", "channel_url_states", "oauth_quota_cost_ledger",
 		"channels", "schema_migrations", "key_rr",
 	}
 	for _, table := range tables {
@@ -159,6 +159,16 @@ func TestPostgres(t *testing.T) {
 		testSequentialKeyPrioritiesMigration(t, env.db, DialectPostgres)
 	})
 
+	t.Run("ReasoningDecisionMigrationAndRoundTrip", func(t *testing.T) {
+		cleanupPostgresTables(t, env.db)
+		store, err := CreatePostgresStoreForTest(env.dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = store.Close() }()
+		verifyReasoningDecisionMigrationAndRoundTrip(t, env.db, store, DialectPostgres)
+	})
+
 	t.Run("FullMigration", func(t *testing.T) {
 		cleanupPostgresTables(t, env.db)
 
@@ -178,7 +188,7 @@ func TestPostgres(t *testing.T) {
 		}
 	})
 
-	t.Run("OAuthQuotaRounding", func(t *testing.T) {
+	t.Run("OAuthQuotaLedger", func(t *testing.T) {
 		cleanupPostgresTables(t, env.db)
 
 		store, err := CreatePostgresStoreForTest(env.dsn)
@@ -187,7 +197,7 @@ func TestPostgres(t *testing.T) {
 		}
 		defer func() { _ = store.Close() }()
 
-		assertOAuthQuotaRoundingMatchesGo(t, store)
+		assertOAuthQuotaLedgerDialect(t, store)
 	})
 
 	t.Run("StructuredChannelURLs", func(t *testing.T) {
@@ -284,7 +294,7 @@ func TestPostgres(t *testing.T) {
 			t.Logf("列 %s.%s 存在", table, col)
 		}
 
-		for _, col := range []string{"auth_token_id", "client_protocol", "client_ip", "minute_bucket", "cache_read_input_tokens", "actual_model", "response_model", "log_source", "upstream_websocket"} {
+		for _, col := range []string{"auth_token_id", "client_protocol", "client_ip", "minute_bucket", "cache_read_input_tokens", "actual_model", "response_model", "reasoning_decision", "log_source", "upstream_websocket"} {
 			checkCol("logs", col)
 		}
 		for _, col := range []string{
@@ -294,7 +304,7 @@ func TestPostgres(t *testing.T) {
 		} {
 			checkCol("auth_tokens", col)
 		}
-		for _, col := range []string{"allowed_models", "model_scope_empty", "priority"} {
+		for _, col := range []string{"allowed_models", "model_scope_empty", "model_scope_auto", "priority"} {
 			checkCol("api_keys", col)
 		}
 		for _, col := range []string{"daily_cost_limit", "scheduled_check_model", "cost_multiplier"} {
@@ -666,12 +676,25 @@ func TestPostgres(t *testing.T) {
 			assertStats(t, stats)
 		})
 
+		// 最近成功/请求查询失败只记 WARN，必须断言字段确实被填充，才能证明 PG 方言 SQL 可执行。
+		assertLatest := func(t *testing.T, stats []model.StatsEntry) {
+			t.Helper()
+			want := now.Add(-10 * time.Second).UnixMilli()
+			if got := stats[0].LastSuccessAt; got == nil || *got != want {
+				t.Fatalf("last success at=%v want=%d", got, want)
+			}
+			if got := stats[0].LastRequestAt; got == nil || *got != want {
+				t.Fatalf("last request at=%v want=%d", got, want)
+			}
+		}
+
 		t.Run("GetStats", func(t *testing.T) {
 			stats, err := store.GetStats(ctx, start, end, filter, false)
 			if err != nil {
 				t.Fatalf("GetStats: %v", err)
 			}
 			assertStats(t, stats)
+			assertLatest(t, stats)
 
 			modelFilter := *filter
 			modelFilter.Model = "gpt-4o"
@@ -680,6 +703,7 @@ func TestPostgres(t *testing.T) {
 				t.Fatalf("GetStats model filter: %v", err)
 			}
 			assertStats(t, stats)
+			assertLatest(t, stats)
 		})
 
 		t.Run("AggregateRangeWithFilter", func(t *testing.T) {
@@ -1048,7 +1072,7 @@ func TestPostgres(t *testing.T) {
 			const tokenValue = "pg-query-auth-token"
 			token := &model.AuthToken{
 				Token: tokenValue, Description: "query compatibility", IsActive: true, CreatedAt: time.Now(),
-				AllowedModels: []string{"gpt-4o"}, MaxConcurrency: 2,
+				AllowedModels: []string{"gpt-4o"}, MaxConcurrency: 2, RPMLimit: 12,
 			}
 			if err := store.CreateAuthToken(ctx, token); err != nil {
 				t.Fatalf("CreateAuthToken: %v", err)
@@ -1071,6 +1095,10 @@ func TestPostgres(t *testing.T) {
 				t.Fatalf("ListActiveAuthTokens: tokens=%v err=%v", tokens, err)
 			}
 
+			if got.RPMLimit != 12 {
+				t.Fatalf("rpm_limit=%d, want 12", got.RPMLimit)
+			}
+			got.RPMLimit = 24
 			got.Description = "query compatibility updated"
 			got.AllowedChannelIDs = []int64{11, 22}
 			got.ChannelRestrictionMode = model.ChannelRestrictionModeDeny
@@ -1083,6 +1111,9 @@ func TestPostgres(t *testing.T) {
 			}
 			if err := sqlStore.UpsertAuthTokenAllFields(ctx, got); err != nil {
 				t.Fatalf("UpsertAuthTokenAllFields: %v", err)
+			}
+			if mirrored, err := store.GetAuthToken(ctx, token.ID); err != nil || mirrored.RPMLimit != 24 {
+				t.Fatalf("updated/upserted token=%+v err=%v", mirrored, err)
 			}
 			if err := store.UpdateTokenLastUsed(ctx, tokenValue, time.Now()); err != nil {
 				t.Fatalf("UpdateTokenLastUsed: %v", err)

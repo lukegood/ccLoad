@@ -102,6 +102,7 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		schema.DefineChannelModelsTable,
 		schema.DefineChannelModelCooldownsTable,
 		schema.DefineChannelURLStatesTable,
+		schema.DefineOAuthQuotaCostLedgerTable,
 		schema.DefineAuthTokensTable,
 		schema.DefineSystemSettingsTable,
 		schema.DefineWebSessionsTable,
@@ -145,6 +146,11 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		// 创建表
 		if _, err := db.ExecContext(ctx, buildDDL(tb, dialect)); err != nil {
 			return fmt.Errorf("create %s table: %w", tb.Name(), err)
+		}
+		if tb.Name() == "oauth_quota_cost_ledger" {
+			if err := ensureOAuthQuotaLedgerBinaryKeys(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate OAuth quota ledger key collation: %w", err)
+			}
 		}
 		if tb.Name() == "debug_logs" {
 			if err := ensureDebugLogsProtocolMetadata(ctx, db, dialect); err != nil {
@@ -212,6 +218,12 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureChannelsRetryOtherKeysOnFailure(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels retry_other_keys_on_failure: %w", err)
 			}
+			if err := ensureChannelsSameChannelRetries(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels same_channel_retries: %w", err)
+			}
+			if err := ensureChannelsOAuthQuotaPassthrough(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels oauth_quota_passthrough: %w", err)
+			}
 			if err := ensureChannelsWebsockets(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels websockets: %w", err)
 			}
@@ -258,6 +270,9 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureAPIKeysModelScopeEmpty(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys model_scope_empty: %w", err)
 			}
+			if err := ensureAPIKeysModelScopeAuto(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys model_scope_auto: %w", err)
+			}
 			if err := ensureAPIKeysCostMultiplier(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys cost_multiplier: %w", err)
 			}
@@ -301,6 +316,9 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			}
 			if err := ensureAuthTokensMaxConcurrency(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate auth_tokens max_concurrency: %w", err)
+			}
+			if err := ensureAuthTokensRPMLimit(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate auth_tokens rpm_limit: %w", err)
 			}
 			if err := backfillAuthTokensCostLimitMaxConcurrency(ctx, db, dialect); err != nil {
 				return fmt.Errorf("backfill auth_tokens max_concurrency: %w", err)
@@ -362,6 +380,10 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 
 	if err := backfillLogsClientProtocol(ctx, db, dialect); err != nil {
 		return fmt.Errorf("backfill logs client_protocol: %w", err)
+	}
+	// 账本基线依赖 channels 与账本表均已迁移完成。
+	if err := backfillOAuthQuotaCostLedger(ctx, db, dialect); err != nil {
+		return fmt.Errorf("backfill OAuth quota cost ledger: %w", err)
 	}
 
 	// 初始化默认配置
@@ -516,8 +538,6 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 	settings := []struct {
 		key, value, valueType, desc, defaultVal string
 	}{
-		{config.TypeSafeEnabledSettingKey, "false", "bool", "TypeSafe 错误分析兜底（需配置密钥，保存后重启生效）", "false"},
-		{config.TypeSafeAPIKeySettingKey, "", "string", "TypeSafe API Key（留空保留；重置可清除并关闭 TypeSafe）", ""},
 		{config.APITokenLoginEnabledSettingKey, "false", "bool", "允许 API Token 登录网页（保存后重启生效，不影响 API 调用）", "false"},
 		{config.APITokenShowChannelsSettingKey, "false", "bool", "API Token 登录时显示渠道名和实际模型名（默认禁用，保存后重启生效；不开放渠道配置）", "false"},
 		{config.CodexBaseURLSettingKey, "", "string", "Codex OAuth 完整 Responses URL(留空使用渠道URL；填写后覆盖渠道URL)", ""},
@@ -539,6 +559,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{config.CodexMap429To503SettingKey, "false", "bool", "所有上游候选均失败时，将返回给官方 Codex 客户端的最终 429 映射为 503，使其按 5xx 重试", "false"},
 		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
 		{"model_multimodal_fallback", "{}", "json", "多模态请求(含图片/文件等非文本内容)自动改用回退模型，JSON对象格式 {\"文本模型\":\"回退模型\"}", "{}"},
+		{"reasoning_auto", `{ "enabled": false, "decision_channel_id": 0, "decision_model": "", "business_models": [], "timeout_ms": 2000 }`, "json", "动态思考等级配置（保存后重启生效）", `{ "enabled": false, "decision_channel_id": 0, "decision_model": "", "business_models": [], "timeout_ms": 2000 }`},
 		{"model_custom_pricing", "{}", "json", "模型自定义价格覆盖（价格单位为美元/百万Token）", "{}"},
 		{"antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON, "json", "Antigravity systemInstruction 和 CodeBuddy system/developer 消息文本中使用零宽字符替换的敏感词 JSON 字符串数组", config.DefaultAntigravitySensitiveWordsJSON},
 		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
@@ -587,20 +608,30 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"responses_ws_max_connections_per_token", "0", "int", responsesWSMaxConnectionsPerTokenDescription, "0"},
 	}
 
-	var query string
+	// 单条多行 INSERT：逐条写入是迁移里语句数最多的一段，每次启动/建库都要付一遍往返。
+	var insertHead, rowSQL, insertTail string
 	switch dialect {
 	case DialectMySQL:
-		query = "INSERT IGNORE INTO system_settings (`key`, value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, UNIX_TIMESTAMP())"
+		insertHead = "INSERT IGNORE INTO system_settings (`key`, value, value_type, description, default_value, updated_at) VALUES "
+		rowSQL = "(?, ?, ?, ?, ?, UNIX_TIMESTAMP())"
 	case DialectPostgres:
-		query = `INSERT INTO system_settings ("key", value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, EXTRACT(EPOCH FROM NOW())::BIGINT) ON CONFLICT ("key") DO NOTHING`
+		insertHead = `INSERT INTO system_settings ("key", value, value_type, description, default_value, updated_at) VALUES `
+		rowSQL = "(?, ?, ?, ?, ?, EXTRACT(EPOCH FROM NOW())::BIGINT)"
+		insertTail = ` ON CONFLICT ("key") DO NOTHING`
 	default:
-		query = "INSERT OR IGNORE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, unixepoch())"
+		insertHead = "INSERT OR IGNORE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES "
+		rowSQL = "(?, ?, ?, ?, ?, unixepoch())"
 	}
 
-	for _, s := range settings {
-		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, query), s.key, s.value, s.valueType, s.desc, s.defaultVal); err != nil {
-			return fmt.Errorf("insert default setting %s: %w", s.key, err)
-		}
+	rows := make([]string, len(settings))
+	args := make([]any, 0, len(settings)*5)
+	for i, s := range settings {
+		rows[i] = rowSQL
+		args = append(args, s.key, s.value, s.valueType, s.desc, s.defaultVal)
+	}
+	query := insertHead + strings.Join(rows, ", ") + insertTail
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, query), args...); err != nil {
+		return fmt.Errorf("insert default settings: %w", err)
 	}
 
 	// 默认词表在 CLIProxyAPI 示例的 ["API","proxy"] 基础上加入 Claude/Anthropic。

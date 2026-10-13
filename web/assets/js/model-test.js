@@ -2,6 +2,7 @@ const TEST_MODE_CHANNEL = 'channel';
 const TEST_MODE_MODEL = 'model';
 const TEST_MODE_CHAT = 'chat';
 const TEST_MODE_IMAGE = 'image';
+const TEST_MODE_PREVIEW = 'preview';
 
 // localStorage keys
 const STORAGE_KEY_TEST_MODE = 'ccload_model_test_mode';
@@ -42,6 +43,10 @@ let chatChannelKeyLoadRequestId = 0;
 let chatChannelKeyCombobox = null;
 let chatModel = '';
 let isChatSending = false;
+let chatAbortController = null;
+// 用户上翻阅读时停止跟随流式输出，回到底部后恢复
+let chatAutoFollow = true;
+const CHAT_AUTO_FOLLOW_THRESHOLD_PX = 48;
 let chatChannelCombobox = null;
 let chatModelCombobox = null;
 let chatProtocolCombobox = null;
@@ -577,7 +582,6 @@ function chatStatPart(labelKey, fallback, valueHtml) {
 
 const MODEL_TEST_PRIORITY_MIN = -99999;
 const MODEL_TEST_PRIORITY_MAX = 9999999;
-let modelTestPrioritySaveTimers = new Map();
 
 function normalizeModelTestPriorityValue(value, fallback) {
   const fallbackValue = Number.isFinite(Number(fallback)) ? Number(fallback) : 0;
@@ -595,6 +599,21 @@ function formatModelTestHealthScore(value) {
 
 function isChannelDynamicPriorityVisible(ch) {
   return ch && ch.effective_priority !== undefined && ch.effective_priority !== null;
+}
+
+// 健康度动态排序开启时（存在 effective_priority）按动态优先级排序，否则按静态优先级。
+function getModelTestChannelSortPriority(ch) {
+  const value = Number(isChannelDynamicPriorityVisible(ch) ? ch.effective_priority : ch?.priority);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function compareModelTestChannels(a, b) {
+  return getModelTestChannelSortPriority(b) - getModelTestChannelSortPriority(a) ||
+    String(a.name || '').localeCompare(String(b.name || ''));
+}
+
+function findModelTestChannel(channelId) {
+  return channelsList.find(ch => Number(ch.id) === Number(channelId));
 }
 
 // 按模型测试行在静态优先级下方叠加显示渠道动态优先级(P_eff = priority - 失败惩罚 - TTFB 惩罚)，
@@ -706,6 +725,7 @@ async function saveModelTestInlinePriority(input) {
     input.classList.remove('is-dirty');
     updateLocalModelTestChannelPriority(channelId, nextPriority);
     syncModelTestRowDynamicPriority(input);
+    reorderModelTestRowsByChannelPriority();
   } catch (error) {
     console.error('Update channel priority failed:', error);
     input.dataset.originalPriority = String(originalPriority);
@@ -716,29 +736,18 @@ async function saveModelTestInlinePriority(input) {
   }
 }
 
-function queueModelTestPrioritySave(input, delay = 1000) {
-  if (!input) return;
-  const channelId = Number(input.dataset.channelId);
-  if (!Number.isFinite(channelId) || channelId <= 0) return;
-  input.classList.add('is-dirty');
-  const existingTimer = modelTestPrioritySaveTimers.get(channelId);
-  if (existingTimer) clearTimeout(existingTimer);
-  const timer = setTimeout(() => {
-    modelTestPrioritySaveTimers.delete(channelId);
-    saveModelTestInlinePriority(input);
-  }, delay);
-  modelTestPrioritySaveTimers.set(channelId, timer);
-}
-
-function flushModelTestPrioritySave(input) {
-  if (!input) return;
-  const channelId = Number(input.dataset.channelId);
-  const existingTimer = modelTestPrioritySaveTimers.get(channelId);
-  if (existingTimer) {
-    clearTimeout(existingTimer);
-    modelTestPrioritySaveTimers.delete(channelId);
-  }
-  return saveModelTestInlinePriority(input);
+// 优先级变更后按新的（动态）优先级重排已有行，保留测试结果与勾选状态；用户的表头排序仍优先生效。
+function reorderModelTestRowsByChannelPriority() {
+  if (testMode !== TEST_MODE_MODEL || !tbody) return;
+  const dataRows = Array.from(tbody.querySelectorAll('tr')).filter(row => !row.querySelector('td[colspan]'));
+  if (dataRows.length === 0) return;
+  dataRows
+    .map(row => ({ row, channel: findModelTestChannel(row.dataset.channelId), order: Number(row.dataset.baseOrder || 0) }))
+    .sort((a, b) => (a.channel && b.channel ? compareModelTestChannels(a.channel, b.channel) : 0) || a.order - b.order)
+    .forEach(({ row }, index) => {
+      row.dataset.baseOrder = String(index);
+    });
+  applyCurrentSort();
 }
 
 function findChannelModelEntry(channel, modelName) {
@@ -1159,7 +1168,7 @@ function initModelTestActions() {
       'open-add-models-modal': () => openAddModelsModal(),
       'delete-selected-models': () => deleteSelectedModels(),
       'run-model-tests': () => runModelTests(),
-      'send-chat-message': () => sendChatMessage(),
+      'send-chat-message': () => (isChatSending ? stopChatMessage() : sendChatMessage()),
       'select-chat-image': () => document.getElementById('chatImageInput')?.click(),
       'toggle-chat-builtin-search': () => toggleChatBuiltinSearch(),
       'open-chat-advanced-options': () => openChatAdvancedOptionsModal(),
@@ -1167,6 +1176,7 @@ function initModelTestActions() {
       'save-chat-advanced-options': () => saveChatAdvancedOptionsFromModal(),
       'clear-chat': () => clearChat(),
       'retry-chat-message': (actionTarget) => retryChatMessage(actionTarget),
+      'retry-failed-chat-message': (actionTarget) => retryFailedChatMessage(actionTarget),
       'edit-chat-message': (actionTarget) => editChatMessage(actionTarget),
       'toggle-chat-export-menu': () => toggleChatExportMenu(),
       'export-chat-md': () => { closeChatExportMenu(); exportChatAsMarkdown(); },
@@ -1275,6 +1285,10 @@ function getRowSortValue(row, key) {
     case 'name':
       return row.children[1]?.textContent?.trim() || '';
     case 'priority': {
+      const channel = findModelTestChannel(row.dataset.channelId);
+      if (testMode === TEST_MODE_MODEL && isChannelDynamicPriorityVisible(channel)) {
+        return getModelTestChannelSortPriority(channel);
+      }
       const priorityInput = row.querySelector('.ch-priority-input');
       return parseNumericCellValue(priorityInput ? priorityInput.value : row.querySelector('.channel-priority')?.textContent);
     }
@@ -1484,13 +1498,25 @@ function syncClientProtocolCombobox() {
     });
   }
 
-  const label = protocolLabel(selectedProtocol);
+  // 渠道模式选中决策渠道时固定原生 /v1/systemone，协议不可选
+  const decision = testMode === TEST_MODE_CHANNEL && isSystemOneChannel(selectedChannel);
+  const label = decision ? i18nText('modelTest.clientProtocolSystemOne', 'System One') : protocolLabel(selectedProtocol);
   if (clientProtocolCombobox) {
-    clientProtocolCombobox.setValue(selectedProtocol, label);
+    clientProtocolCombobox.setValue(decision ? 'system_one' : selectedProtocol, label);
     clientProtocolCombobox.refresh();
   } else if (clientProtocolSelect) {
     clientProtocolSelect.value = label;
   }
+  if (clientProtocolSelect) clientProtocolSelect.disabled = decision;
+}
+
+function isSystemOneChannel(channel) {
+  return channel?.auth_type === 'system_one';
+}
+
+// 决策渠道测试不带 client_protocol（带了后端返回 400）；JSON 序列化会省略 undefined
+function testClientProtocolFor(channel) {
+  return isSystemOneChannel(channel) ? undefined : selectedProtocol;
 }
 
 function syncChatClientProtocolCombobox() {
@@ -1565,7 +1591,7 @@ function isModelSupported(channel, modelName) {
 function getChannelsSupportingModel(modelName) {
   return channelsList
     .filter(ch => isModelSupported(ch, modelName))
-    .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name));
+    .sort(compareModelTestChannels);
 }
 
 function isExactModel(modelName) {
@@ -1579,8 +1605,8 @@ function getChannelModelPairsMatching(keyword) {
   const trimmed = String(keyword || '').trim().toLowerCase();
   if (!trimmed) return [];
   const pairs = [];
-  channelsList
-    .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
+  [...channelsList]
+    .sort(compareModelTestChannels)
     .forEach(ch => {
       (ch.models || []).forEach(entry => {
         const name = getModelName(entry);
@@ -1718,7 +1744,9 @@ function renderChannelModeRows() {
 
   const fragment = document.createDocumentFragment();
   const channelEnabled = isModelTestChannelEnabled(selectedChannel);
-  models.forEach(entry => {
+  // 默认顺序（baseOrder）按模型名称，表头排序取消后也回到名称顺序。
+  const sortedModels = [...models].sort((a, b) => compareSortValues(getModelName(a), getModelName(b)));
+  sortedModels.forEach(entry => {
     const modelName = getModelName(entry);
     if (!modelName) return;
     const modelEnabled = entry?.disabled !== true;
@@ -1741,6 +1769,7 @@ function renderChannelModeRows() {
 }
 
 function populateModelSelector() {
+  window.ModelTestRoutePreview.refreshModels();
   const models = getAllModels();
   const typedModel = getModelInputValue();
 
@@ -1809,6 +1838,7 @@ function renderModelModeRows() {
       channelId: String(ch.id),
       channelName,
       channelBaseName: baseName,
+      oauthPlanBadge: buildOAuthPlanBadge(ch),
       channelEnabled: String(channelEnabled),
       channelPriority: String(priorityValue),
       dynamicPriorityHtml: buildModelTestDynamicPriorityHtml(ch, priorityValue),
@@ -1848,7 +1878,8 @@ const MODEL_TEST_MODE_TABS = [
   { id: 'modeTabChat', mode: TEST_MODE_CHAT },
   { id: 'modeTabImage', mode: TEST_MODE_IMAGE },
   { id: 'modeTabChannel', mode: TEST_MODE_CHANNEL },
-  { id: 'modeTabModel', mode: TEST_MODE_MODEL }
+  { id: 'modeTabModel', mode: TEST_MODE_MODEL },
+  { id: 'modeTabPreview', mode: TEST_MODE_PREVIEW }
 ];
 
 function syncModeTabState() {
@@ -1897,7 +1928,8 @@ function updateModeUI() {
   const isModelMode = testMode === TEST_MODE_MODEL;
   const isChatMode = testMode === TEST_MODE_CHAT;
   const isImageMode = testMode === TEST_MODE_IMAGE;
-  const isStandaloneMode = isChatMode || isImageMode;
+  const isPreviewMode = testMode === TEST_MODE_PREVIEW;
+  const isStandaloneMode = isChatMode || isImageMode || isPreviewMode;
   const fetchModelsBtn = getFetchModelsBtn();
   const addModelsBtn = getAddModelsBtn();
   const deleteModelsBtn = getDeleteModelsBtn();
@@ -1912,6 +1944,7 @@ function updateModeUI() {
   chatToolbar?.classList.toggle('hidden', !isChatMode);
   chatPanel?.classList.toggle('hidden', !isChatMode);
   imagePanel?.classList.toggle('hidden', !isImageMode);
+  document.getElementById('routePreviewPanel')?.classList.toggle('hidden', !isPreviewMode);
   modelTestCard?.classList.toggle('model-test-card--chat-mode', isChatMode);
 
   if (isStandaloneMode) return;
@@ -1956,7 +1989,7 @@ function getSelectedTargets() {
           row,
           model: row.dataset.model || selectedModelName,
           channelId: channel.id,
-          clientProtocol: selectedProtocol
+          clientProtocol: testClientProtocolFor(channel)
         };
       }
 
@@ -1965,7 +1998,7 @@ function getSelectedTargets() {
         row,
         model: row.dataset.model,
         channelId: selectedChannel.id,
-        clientProtocol: selectedProtocol,
+        clientProtocol: testClientProtocolFor(selectedChannel),
         keyIndex: selectedKeyIndex
       };
     })
@@ -2531,7 +2564,7 @@ async function executeDeletePlan(deletePlan, progress = null) {
       body: JSON.stringify({ operations })
     });
   } catch (error) {
-    const message = error?.message || i18nText('common.deleteFailed', '删除失败');
+    const message = error?.message || i18nText('modelTest.deleteFailed', '删除失败');
     operations.forEach(operation => failed.push({ channelId: operation.channel_id, error: message }));
     appendLog(message);
     notifyProgress(i18nText(
@@ -2543,7 +2576,7 @@ async function executeDeletePlan(deletePlan, progress = null) {
   }
 
   if (!resp.success) {
-    const message = resp.error || i18nText('common.deleteFailed', '删除失败');
+    const message = resp.error || i18nText('modelTest.deleteFailed', '删除失败');
     operations.forEach(operation => failed.push({ channelId: operation.channel_id, error: message }));
     appendLog(message);
     notifyProgress(i18nText(
@@ -2580,7 +2613,7 @@ async function executeDeletePlan(deletePlan, progress = null) {
   notFoundIDs.forEach(channelId => appendLog(i18nText(
     'modelTest.deleteProgressChannelFailed',
     `渠道 #${channelId} 删除失败`,
-    { channel_id: channelId, error: i18nText('channels.test.channelNotFound', '渠道不存在') }
+    { channel_name: '', channel_id: channelId, error: i18nText('channels.test.channelNotFound', '渠道不存在') }
   )));
   notifyProgress(i18nText(
     'modelTest.deleteProgressRunning',
@@ -3034,11 +3067,6 @@ function getFirstEnabledModelTestKey(keys) {
   return (Array.isArray(keys) ? keys : []).find(key => key?.disabled !== true) || null;
 }
 
-function getPreferredModelTestKey(keys) {
-  const list = Array.isArray(keys) ? keys : [];
-  return getFirstEnabledModelTestKey(list) || list[0] || null;
-}
-
 async function fetchModelTestChannelKeys(channelId) {
   if (!channelId) return [];
   const keys = (await fetchDataWithAuth(`/admin/channels/${channelId}/keys`)) || [];
@@ -3365,7 +3393,8 @@ function bindEvents() {
   tbody.addEventListener('input', (event) => {
     const input = event.target.closest('.ch-priority-input');
     if (!input) return;
-    queueModelTestPrioritySave(input);
+    // 只标记脏状态：保存期间禁用输入框会夺走焦点并吞掉后续按键
+    input.classList.add('is-dirty');
   });
 
   tbody.addEventListener('keydown', (event) => {
@@ -3373,7 +3402,7 @@ function bindEvents() {
     if (!input) return;
     if (event.key === 'Enter') {
       event.preventDefault();
-      flushModelTestPrioritySave(input);
+      saveModelTestInlinePriority(input);
     } else if (event.key === 'Escape') {
       const originalPriority = normalizeModelTestPriorityValue(input.dataset.originalPriority, 0);
       input.value = String(originalPriority);
@@ -3384,7 +3413,7 @@ function bindEvents() {
   tbody.addEventListener('focusout', (event) => {
     const input = event.target.closest('.ch-priority-input');
     if (!input) return;
-    flushModelTestPrioritySave(input);
+    saveModelTestInlinePriority(input);
   });
 
   tbody.addEventListener('change', (event) => {
@@ -3396,7 +3425,7 @@ function bindEvents() {
 }
 
 function setTestMode(mode) {
-  if (mode !== TEST_MODE_CHANNEL && mode !== TEST_MODE_MODEL && mode !== TEST_MODE_CHAT && mode !== TEST_MODE_IMAGE) return;
+  if (mode !== TEST_MODE_CHANNEL && mode !== TEST_MODE_MODEL && mode !== TEST_MODE_CHAT && mode !== TEST_MODE_IMAGE && mode !== TEST_MODE_PREVIEW) return;
   if (testMode === mode) return;
 
   const previousMode = testMode;
@@ -3408,6 +3437,11 @@ function setTestMode(mode) {
   saveTestModeToStorage(mode);
   clearProgress();
 
+  if (testMode === TEST_MODE_PREVIEW) {
+    updateModeUI();
+    window.ModelTestRoutePreview.open();
+    return;
+  }
   if (testMode === TEST_MODE_CHAT) {
     updateModeUI();
     initChatPanel();
@@ -3456,7 +3490,7 @@ function saveTestModeToStorage(mode) {
 function loadTestModeFromStorage() {
   try {
     const mode = localStorage.getItem(STORAGE_KEY_TEST_MODE);
-    if (mode === TEST_MODE_CHANNEL || mode === TEST_MODE_MODEL || mode === TEST_MODE_CHAT || mode === TEST_MODE_IMAGE) {
+    if (mode === TEST_MODE_CHANNEL || mode === TEST_MODE_MODEL || mode === TEST_MODE_CHAT || mode === TEST_MODE_IMAGE || mode === TEST_MODE_PREVIEW) {
       return mode;
     }
   } catch (_) { /* ignore */ }
@@ -3968,6 +4002,14 @@ function initChatPanel() {
     chatInput.addEventListener('paste', handleChatPaste);
   }
 
+  const chatMessagesEl = document.getElementById('chatMessages');
+  if (chatMessagesEl && !chatMessagesEl._chatScrollBound) {
+    chatMessagesEl._chatScrollBound = true;
+    chatMessagesEl.addEventListener('scroll', () => {
+      chatAutoFollow = isChatScrolledNearBottom(chatMessagesEl);
+    }, { passive: true });
+  }
+
   // Restore persisted chat messages
   const savedChat = loadChatMessagesFromStorage();
   chatSessionState.restore(savedChat?.session_id);
@@ -3979,7 +4021,7 @@ function initChatPanel() {
   }
 }
 
-/** 收集所有渠道的模型并集（去重 + 字母排序），供 chat 模式模型下拉使用 */
+/** 收集所有渠道的具体模型并集（去重 + 字母排序），供模型下拉使用 */
 function getAllChatModelOptions() {
   const set = new Set();
   channelsList.forEach(ch => {
@@ -4068,7 +4110,7 @@ function renderChatImagePreviews() {
     removeBtn.className = 'chat-image-preview-remove';
     removeBtn.setAttribute('data-action', 'remove-chat-image');
     removeBtn.setAttribute('data-image-id', image.id);
-    removeBtn.setAttribute('aria-label', '删除图片');
+    removeBtn.setAttribute('aria-label', i18nText('modelTest.chat.removeImage', '删除图片'));
     removeBtn.textContent = '×';
 
     item.appendChild(img);
@@ -4209,9 +4251,70 @@ function renderChatMessages() {
       // thinking 仅 UI 持久化字段，恢复时必须重绘，否则刷新/重开页面会丢思考块
       renderChatThinking(bubble, msg.thinking, false);
       renderChatBubbleStats(bubble, chatMessageSummaries[index]);
+      if (msg.stopped) markChatBubbleStopped(bubble);
     }
   });
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollChatToBottom(true);
+}
+
+function isChatScrolledNearBottom(el) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= CHAT_AUTO_FOLLOW_THRESHOLD_PX;
+}
+
+/** 滚动到底部；force=false 时仅在用户仍跟随底部时滚动 */
+function scrollChatToBottom(force = false) {
+  const messagesEl = document.getElementById('chatMessages');
+  if (!messagesEl) return;
+  if (force) chatAutoFollow = true;
+  if (chatAutoFollow) messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+function setChatSendButtonState(sending) {
+  const sendBtn = document.getElementById('chatSendBtn');
+  if (!sendBtn) return;
+  const key = sending ? 'modelTest.chat.stop' : 'modelTest.chat.send';
+  sendBtn.setAttribute('data-i18n', key);
+  sendBtn.textContent = sending ? i18nText(key, '停止') : i18nText(key, '发送');
+  sendBtn.classList.toggle('chat-send-btn--stop', sending);
+}
+
+function stopChatMessage() {
+  chatAbortController?.abort();
+}
+
+function markChatBubbleStopped(bubble) {
+  if (!bubble || bubble.querySelector('.chat-message-stopped')) return;
+  bubble.classList.add('chat-message--stopped');
+  const footerEl = bubble.querySelector('.chat-message-footer');
+  if (!footerEl) return;
+  const tag = document.createElement('span');
+  tag.className = 'chat-message-stopped';
+  tag.setAttribute('data-i18n', 'modelTest.chat.stopped');
+  tag.textContent = i18nText('modelTest.chat.stopped', '已停止');
+  footerEl.insertBefore(tag, footerEl.querySelector('.chat-message-stats'));
+}
+
+/** 失败气泡追加重试按钮：重试时移除失败的这一轮并按原内容重新发送 */
+function attachChatRetry(assistantBubble, userBubble, userContent) {
+  const footerEl = assistantBubble?.querySelector('.chat-message-footer');
+  if (!footerEl || footerEl.querySelector('[data-action="retry-failed-chat-message"]')) return;
+  assistantBubble._retryContent = userContent;
+  assistantBubble._retryUserBubble = userBubble;
+  footerEl.insertBefore(
+    createChatActionButton('retry-failed-chat-message', i18nText('common.retry', '重试'), '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><path d="M21 3v6h-6"></path></svg>'),
+    footerEl.firstChild
+  );
+}
+
+async function retryFailedChatMessage(actionTarget) {
+  if (isChatSending) return;
+  const bubble = actionTarget?.closest?.('.chat-message');
+  if (!bubble || bubble._retryContent === undefined) return;
+  const content = cloneChatMessageContent(bubble._retryContent);
+  bubble._retryUserBubble?.remove();
+  bubble.remove();
+  setChatComposerContent(content);
+  await sendChatMessage();
 }
 
 function getUserChatMessageFromAction(actionTarget) {
@@ -4281,18 +4384,19 @@ async function sendChatMessage() {
   const userContent = buildChatUserContent(content, chatPendingImages);
   const userMessageIndex = pushChatMessage({ role: 'user', content: userContent });
   saveChatMessagesToStorage();
-  appendChatBubble('user', userContent, userMessageIndex);
+  const userBubble = appendChatBubble('user', userContent, userMessageIndex);
   inputEl.value = '';
   chatPendingImages = [];
   renderChatImagePreviews();
   autoResizeChatInput();
 
   isChatSending = true;
-  const sendBtn = document.getElementById('chatSendBtn');
-  if (sendBtn) {
-    sendBtn.disabled = true;
-    sendBtn.textContent = i18nText('modelTest.chat.sending', '发送中...');
-  }
+  const abortController = new AbortController();
+  chatAbortController = abortController;
+  // 清空对话会轮换 session；旧请求收尾时不得把结果写回新会话
+  const requestSessionId = chatSessionState.current();
+  const isStaleSession = () => chatSessionState.current() !== requestSessionId;
+  setChatSendButtonState(true);
 
   const assistantBubble = appendChatBubble('assistant', '');
   const contentEl = assistantBubble?.querySelector('.chat-message-content');
@@ -4313,7 +4417,7 @@ async function sendChatMessage() {
       model: chatModel,
       client_protocol: selectedProtocol,
       ...(Number.isInteger(chatSelectedKeyIndex) ? { key_index: chatSelectedKeyIndex } : {}),
-      session_id: chatSessionState.current(),
+      session_id: requestSessionId,
       stream: chatStreamEnabled,
       thinking_effort: chatThinkingEffort,
       builtin_search: chatBuiltinSearch
@@ -4330,6 +4434,7 @@ async function sendChatMessage() {
         ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
       },
       body: JSON.stringify(requestPayload),
+      signal: abortController.signal,
     });
 
     if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
@@ -4363,14 +4468,12 @@ async function sendChatMessage() {
             } else if (typeof evt.thinking_delta === 'string') {
               accThinking += evt.thinking_delta;
               renderChatThinking(assistantBubble, accThinking, true);
-              const messagesEl = document.getElementById('chatMessages');
-              if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+              scrollChatToBottom();
             } else if (typeof evt.delta === 'string') {
               accText += evt.delta;
               renderChatMarkdown(contentEl, accText, { cursor: true });
               if (assistantBubble) assistantBubble._rawText = accText;
-              const messagesEl = document.getElementById('chatMessages');
-              if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+              scrollChatToBottom();
             } else if (evt.summary) {
               if (assistantBubble) {
                 assistantSummary = cloneChatSummary(evt.summary);
@@ -4383,38 +4486,61 @@ async function sendChatMessage() {
       }
     }
 
-    if (!hasError) {
-      renderChatThinking(assistantBubble, accThinking, false);
-      renderChatMarkdown(contentEl, accText || '');
-      if (assistantBubble) assistantBubble._rawText = accText || '';
-      if (accText) {
-        const assistantMessage = { role: 'assistant', content: accText };
-        const thinkingText = String(accThinking || '').trim();
-        if (thinkingText) assistantMessage.thinking = thinkingText;
-        const assistantMessageIndex = pushChatMessage(assistantMessage, assistantSummary);
-        if (assistantBubble) assistantBubble.dataset.chatIndex = String(assistantMessageIndex);
-        saveChatMessagesToStorage();
-      } else {
-        popChatMessage();
-      }
+    if (hasError) {
+      failChatTurn();
+    } else {
+      finishChatAssistantMessage(false);
     }
   } catch (e) {
-    popChatMessage();
-    saveChatMessagesToStorage();
-    if (contentEl) {
-      contentEl.textContent = e.message || i18nText('modelTest.chat.error', '发送失败');
-      assistantBubble?.classList.add('chat-message--error');
+    if (hasError) {
+      failChatTurn();
+    } else if (abortController.signal.aborted) {
+      // 用户主动停止：保留已收到的部分输出并标记为已停止
+      finishChatAssistantMessage(true);
+    } else {
+      failChatTurn(e?.message || i18nText('modelTest.chat.error', '发送失败'));
     }
-    if (assistantBubble) assistantBubble._rawText = String(e?.message || i18nText('modelTest.chat.error', '发送失败'));
   } finally {
     contentEl?.querySelector('.chat-cursor')?.remove();
+    if (chatAbortController === abortController) chatAbortController = null;
     isChatSending = false;
-    if (sendBtn) {
-      sendBtn.disabled = false;
-      sendBtn.textContent = i18nText('modelTest.chat.send', '发送');
+    setChatSendButtonState(false);
+    scrollChatToBottom();
+  }
+
+  // 失败的这一轮不进入历史，气泡上提供重试
+  function failChatTurn(message) {
+    if (!isStaleSession()) {
+      popChatMessage();
+      saveChatMessagesToStorage();
     }
-    const messagesEl = document.getElementById('chatMessages');
-    if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (message !== undefined) {
+      if (contentEl) {
+        contentEl.textContent = message;
+        assistantBubble?.classList.add('chat-message--error');
+      }
+      if (assistantBubble) assistantBubble._rawText = String(message);
+    }
+    attachChatRetry(assistantBubble, userBubble, userContent);
+  }
+
+  function finishChatAssistantMessage(stopped) {
+    renderChatThinking(assistantBubble, accThinking, false);
+    renderChatMarkdown(contentEl, accText || '');
+    if (assistantBubble) assistantBubble._rawText = accText || '';
+    if (stopped) markChatBubbleStopped(assistantBubble);
+    if (isStaleSession()) return;
+    if (accText) {
+      const assistantMessage = { role: 'assistant', content: accText };
+      const thinkingText = String(accThinking || '').trim();
+      if (thinkingText) assistantMessage.thinking = thinkingText;
+      if (stopped) assistantMessage.stopped = true;
+      const assistantMessageIndex = pushChatMessage(assistantMessage, assistantSummary);
+      if (assistantBubble) assistantBubble.dataset.chatIndex = String(assistantMessageIndex);
+    } else {
+      popChatMessage();
+    }
+    saveChatMessagesToStorage();
   }
 }
 
@@ -4484,7 +4610,7 @@ function appendChatBubble(role, content, messageIndex = null) {
   bubble._rawText = extractChatMessageRawText(content);
 
   messagesEl.appendChild(bubble);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+  scrollChatToBottom(true);
   return bubble;
 }
 
@@ -4497,6 +4623,7 @@ function createChatActionButton(action, label, iconHTML, extraClass = '') {
   btn.title = label;
   const labelKey = {
     'retry-chat-message': 'modelTest.chat.refreshMessage',
+    'retry-failed-chat-message': 'common.retry',
     'edit-chat-message': 'modelTest.chat.editMessage',
     'copy-chat-message': 'common.copy'
   }[action];
@@ -4568,7 +4695,7 @@ function renderChatBubbleStats(bubble, summary) {
     parts.push(chatStatValue(`${summary.speed.toFixed(1)} tok/s`));
   }
   if (summary.cost_usd != null && summary.cost_usd > 0) {
-    parts.push(chatStatValue('$' + summary.cost_usd.toFixed(4), 'stats-value-warning', ''));
+    parts.push(chatStatValue(formatCost(summary.cost_usd), 'stats-value-warning', ''));
   }
 
   if (!statsEl) {
@@ -4620,15 +4747,27 @@ function renderChatThinking(bubble, thinking, streaming = false) {
   thinkingEl.open = streaming;
 }
 
-/** 清空对话历史与消息列表 DOM */
-function clearChat() {
+/** 清空对话历史与消息列表 DOM（有内容时先确认，进行中的请求一并停止） */
+async function clearChat() {
+  const messagesEl = document.getElementById('chatMessages');
+  const hasContent = chatMessages.length > 0 || chatPendingImages.length > 0 || isChatSending
+    || Boolean(messagesEl?.childElementCount);
+  if (!hasContent) return;
+  const confirmed = await window.showConfirm({
+    title: i18nText('modelTest.chat.clearConfirmTitle', '清空对话'),
+    message: i18nText('modelTest.chat.clearConfirmMessage', '确定清空当前对话？此操作不可撤销。'),
+    confirmText: i18nText('modelTest.chat.clear', '清空'),
+    danger: true
+  });
+  if (!confirmed) return;
+  stopChatMessage();
   chatMessages = [];
   chatMessageSummaries = [];
   chatPendingImages = [];
   chatSessionState.rotate();
   saveChatMessagesToStorage();
-  const messagesEl = document.getElementById('chatMessages');
   if (messagesEl) messagesEl.innerHTML = '';
+  chatAutoFollow = true;
   renderChatImagePreviews();
 }
 
@@ -4843,6 +4982,7 @@ async function bootstrap() {
   bindEvents();
   initChatExportDropdown();
   initModeTabKeyboard();
+  window.ModelTestRoutePreview.init({ t: i18nText, protocols: getClientProtocols(), protocolLabel, getModelOptions: getAllChatModelOptions });
   window.ModelTestImage?.init({
     t: i18nText,
     getModelName,
@@ -4904,6 +5044,8 @@ async function bootstrap() {
     initChatPanel();
   } else if (testMode === TEST_MODE_IMAGE) {
     window.ModelTestImage?.open();
+  } else if (testMode === TEST_MODE_PREVIEW) {
+    window.ModelTestRoutePreview.open();
   }
 }
 

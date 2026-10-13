@@ -6,14 +6,19 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	"ccLoad/internal/storage/schema"
 	sqlstore "ccLoad/internal/storage/sql"
 
+	"github.com/tidwall/sjson"
 	_ "modernc.org/sqlite"
 )
 
@@ -26,6 +31,167 @@ func openTestDB(t *testing.T) *sql.DB {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	return db
+}
+
+// TestMigrate_SQLite_BackfillsOAuthQuotaLedgerWithLegacyBaseline 走真实的重开库迁移路径。
+func TestMigrate_SQLite_BackfillsOAuthQuotaLedgerWithLegacyBaseline(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "ledger.db")
+	store, err := createSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	credentialJSON, err := (&codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: now.Add(time.Hour).Format(time.RFC3339),
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{
+			{Key: "codex|primary", WindowSeconds: 5 * 60 * 60,
+				StartedAt: now.Add(-time.Hour).Unix(), ResetAt: now.Add(4 * time.Hour).Unix()},
+			{Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
+				StartedAt: now.Add(-3 * 24 * time.Hour).Unix(), ResetAt: now.Add(4 * 24 * time.Hour).Unix()},
+			{Key: "codex-spark|secondary", Family: oauthcost.FamilySpark, WindowSeconds: 7 * 24 * 60 * 60,
+				StartedAt: now.Add(-7*24*time.Hour - time.Hour).Unix(), ResetAt: now.Add(-time.Hour).Unix()},
+		}},
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, legacy := range []int64{100_000, 5_000_000, 9_000_000} {
+		credentialJSON, err = sjson.Set(credentialJSON, fmt.Sprintf("quota_cost_usage.windows.%d.standard_cost_microusd", i), legacy)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "ledger-backfill", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt, err := store.CreateConfig(ctx, &model.Config{
+		Name: "corrupt-ledger-backfill", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, "UPDATE channels SET oauth_credential = ? WHERE id = ?", "{broken", corrupt.ID); err != nil {
+		t.Fatal(err)
+	}
+	oversized, err := store.CreateConfig(ctx, &model.Config{
+		Name: "oversized-ledger-backfill", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversizedJSON := credentialJSON
+	for path, value := range map[string]int64{
+		"quota_cost_usage.windows.0.window_seconds": 1 << 55,
+		"quota_cost_usage.windows.0.started_at":     1,
+		"quota_cost_usage.windows.0.reset_at":       2,
+	} {
+		oversizedJSON, err = sjson.Set(oversizedJSON, path, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !json.Valid([]byte(oversizedJSON)) {
+		t.Fatal("oversized fixture is not valid JSON")
+	}
+	if _, err := store.ExecContext(ctx, "UPDATE channels SET oauth_credential = ? WHERE id = ?", oversizedJSON, oversized.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct {
+		at   time.Time
+		cost float64
+	}{
+		{now.Add(-2 * 24 * time.Hour), 1.5},
+		{now.Add(-30 * time.Minute), 0.5},
+	} {
+		if err := store.AddLog(ctx, &model.LogEntry{
+			Time: model.JSONTime{Time: entry.at}, ChannelID: created.ID, Model: "gpt-5.6-sol",
+			StatusCode: 200, Cost: entry.cost, CostMultiplier: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.CleanupLogsBefore(ctx, now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = ?", oauthQuotaCostLedgerMigrationVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopen := func() *sqlstore.SQLStore {
+		t.Helper()
+		reopened, openErr := createSQLiteStore(path)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		t.Cleanup(func() { _ = reopened.Close() })
+		return reopened
+	}
+	assertCosts := func(s *sqlstore.SQLStore) {
+		t.Helper()
+		cfg, getErr := s.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		credential, parseErr := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil {
+			t.Fatal(parseErr)
+		}
+		views, viewErr := s.OAuthQuotaCostViews(ctx, map[int64]*oauthcost.Usage{
+			created.ID: oauthcost.EffectiveUsage(credential.QuotaCostUsage, credential.OAuthUsage),
+		}, now.Add(time.Second))
+		if viewErr != nil {
+			t.Fatal(viewErr)
+		}
+		view := views[created.ID]
+		for key, want := range map[string]int64{
+			"codex|primary":         500_000,
+			"codex|secondary":       5_000_000,
+			"codex-spark|secondary": 0,
+		} {
+			window := view.FindWindow(key)
+			if window == nil || window.StandardCostMicroUSD != want {
+				t.Fatalf("%s cost = %#v, want %d (view %#v)", key, window, want, view)
+			}
+		}
+	}
+
+	// 旧窗口时长若溢出 Duration，启动迁移曾在推进窗口时无限循环。
+	type openResult struct {
+		store *sqlstore.SQLStore
+		err   error
+	}
+	opened := make(chan openResult, 1)
+	go func() {
+		s, openErr := createSQLiteStore(path)
+		opened <- openResult{store: s, err: openErr}
+	}()
+	var migrated *sqlstore.SQLStore
+	select {
+	case result := <-opened:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		migrated = result.store
+		t.Cleanup(func() { _ = migrated.Close() })
+	case <-time.After(10 * time.Second):
+		t.Fatal("SQLite migration hung on an oversized legacy window")
+	}
+	assertCosts(migrated)
+	if err := migrated.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertCosts(reopen())
 }
 
 func TestMigrateDailyChannelChecks(t *testing.T) {
@@ -941,6 +1107,10 @@ func TestMigrateSQLite_LegacyCostLimitedAuthTokenGetsDefaultMaxConcurrency(t *te
 		t.Fatalf("migrate legacy auth_tokens: %v", err)
 	}
 
+	var rpmLimit int
+	if err := db.QueryRowContext(ctx, `SELECT rpm_limit FROM auth_tokens WHERE token = 'limited-legacy'`).Scan(&rpmLimit); err != nil || rpmLimit != 0 {
+		t.Fatalf("legacy rpm_limit=%d err=%v, want 0", rpmLimit, err)
+	}
 	var limitedMaxConcurrency int
 	if err := db.QueryRowContext(ctx, `
 		SELECT max_concurrency FROM auth_tokens WHERE token = 'limited-legacy'
@@ -967,7 +1137,7 @@ func TestMigrateSQLite_LegacyCostLimitedAuthTokenGetsDefaultMaxConcurrency(t *te
 	}
 	for _, col := range []string{
 		"cost_daily_used_microusd", "cost_daily_limit_microusd", "cost_daily_period_start",
-		"cost_monthly_used_microusd", "cost_monthly_limit_microusd", "cost_monthly_period_start",
+		"cost_monthly_used_microusd", "cost_monthly_limit_microusd", "cost_monthly_period_start", "rpm_limit",
 	} {
 		if !cols[col] {
 			t.Errorf("legacy migrate missing column %s", col)
@@ -1278,9 +1448,10 @@ func TestEnsureAPIKeysAllowedModels_SQLite(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `
 		CREATE TABLE api_keys (
 			id INTEGER PRIMARY KEY,
-			api_key TEXT NOT NULL
+			api_key TEXT NOT NULL,
+			detected_models TEXT
 		);
-		INSERT INTO api_keys (id, api_key) VALUES (1, 'legacy-key')
+		INSERT INTO api_keys (id, api_key, detected_models) VALUES (1, 'legacy-key', '["legacy-model"]')
 	`); err != nil {
 		t.Fatalf("create legacy api_keys: %v", err)
 	}
@@ -1291,10 +1462,13 @@ func TestEnsureAPIKeysAllowedModels_SQLite(t *testing.T) {
 	if err := ensureAPIKeysModelScopeEmpty(ctx, db, DialectSQLite); err != nil {
 		t.Fatalf("ensureAPIKeysModelScopeEmpty: %v", err)
 	}
+	if err := ensureAPIKeysModelScopeAuto(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("ensureAPIKeysModelScopeAuto: %v", err)
+	}
 
 	var allowedModels string
-	var modelScopeEmpty int
-	if err := db.QueryRowContext(ctx, `SELECT allowed_models, model_scope_empty FROM api_keys WHERE id = 1`).Scan(&allowedModels, &modelScopeEmpty); err != nil {
+	var modelScopeEmpty, modelScopeAuto int
+	if err := db.QueryRowContext(ctx, `SELECT allowed_models, model_scope_empty, model_scope_auto FROM api_keys WHERE id = 1`).Scan(&allowedModels, &modelScopeEmpty, &modelScopeAuto); err != nil {
 		t.Fatalf("query migrated allowed_models: %v", err)
 	}
 	if allowedModels != "" {
@@ -1302,6 +1476,9 @@ func TestEnsureAPIKeysAllowedModels_SQLite(t *testing.T) {
 	}
 	if modelScopeEmpty != 0 {
 		t.Fatalf("legacy model_scope_empty=%d, want unrestricted", modelScopeEmpty)
+	}
+	if modelScopeAuto != 0 {
+		t.Fatalf("legacy model_scope_auto=%d, want unknown source preserved", modelScopeAuto)
 	}
 }
 
@@ -2009,7 +2186,7 @@ func TestEnsureLogsNewColumns_SQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sqliteExistingColumns: %v", err)
 	}
-	for _, col := range []string{"minute_bucket", "auth_token_id", "client_ip", "actual_model", "response_model", "log_source"} {
+	for _, col := range []string{"minute_bucket", "auth_token_id", "client_ip", "actual_model", "response_model", "reasoning_decision", "log_source"} {
 		if !cols[col] {
 			t.Errorf("column %s not found in logs", col)
 		}
@@ -2332,5 +2509,80 @@ func TestInitDefaultSettings_RefreshesTokenVisibilityDescription(t *testing.T) {
 	readSetting()
 	if value != "true" || defaultValue != "false" || !strings.Contains(description, "实际模型名") {
 		t.Fatalf("saved value changed or description not refreshed: %q %q %q", value, defaultValue, description)
+	}
+}
+
+func TestMigrateSQLiteOAuthQuotaPassthroughDefault(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "quota.db")
+	store, err := createSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := store.CreateConfig(ctx, &model.Config{Name: "legacy", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecContext(ctx, "ALTER TABLE channels DROP COLUMN oauth_quota_passthrough"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = createSQLiteStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	got, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OAuthQuotaPassthrough {
+		t.Fatal("legacy channel must migrate with false default")
+	}
+}
+
+func TestReasoningDecisionMigrationAndRoundTripSQLite(t *testing.T) {
+	db := openTestDB(t)
+	if err := migrate(context.Background(), db, DialectSQLite); err != nil {
+		t.Fatal(err)
+	}
+	verifyReasoningDecisionMigrationAndRoundTrip(t, db, sqlstore.NewSQLStore(db, "sqlite"), DialectSQLite)
+}
+
+func verifyReasoningDecisionMigrationAndRoundTrip(t *testing.T, db *sql.DB, store Store, dialect Dialect) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now()
+	legacy := &model.LogEntry{Time: model.JSONTime{Time: now}, Model: "legacy", StatusCode: 200, Message: "legacy"}
+	if err := store.AddLog(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE logs DROP COLUMN reasoning_decision"); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(ctx, db, dialect); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate(ctx, db, dialect); err != nil {
+		t.Fatal(err)
+	}
+	logs, err := store.ListLogs(ctx, now.Add(-time.Minute), 10, 0, nil)
+	if err != nil || len(logs) != 1 || logs[0].ReasoningDecision != nil {
+		t.Fatalf("legacy log after migration: %+v, error = %v", logs, err)
+	}
+	metadata := &model.ReasoningDecision{Status: "applied", SuggestedEffort: "high", ClientEffort: "xhigh", CostUnknown: true}
+	decision := &model.LogEntry{Time: model.JSONTime{Time: now}, Model: "jev-latest", ClientProtocol: "system_one",
+		StatusCode: 200, Message: "decision", ReasoningDecision: metadata, InputTokens: 25, Cost: 0.5}
+	if err := store.BatchAddLogs(ctx, []*model.LogEntry{decision}); err != nil {
+		t.Fatal(err)
+	}
+	logs, err = store.ListLogs(ctx, now.Add(-time.Minute), 10, 0, &model.LogFilter{ClientProtocol: "system_one"})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("decision logs: %+v, error = %v", logs, err)
+	}
+	if got := logs[0]; got.ReasoningDecision == nil || *got.ReasoningDecision != *metadata || got.InputTokens != 25 || got.Cost != 0.5 {
+		t.Fatalf("decision metadata = %+v", got)
 	}
 }

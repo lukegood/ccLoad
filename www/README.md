@@ -4,138 +4,83 @@ ccLoad 项目的官方介绍网站。执行 `make www-setup` 复制共享资源�
 
 ## 功能特性
 
-- ✅ **独立部署**：执行 `make www-setup` 后可直接复制到 Nginx/Apache/CDN
-- ✅ **局部双语**：首页、导航、页面标题和摘要支持中英文切换；详细文档正文目前为英文
-- ✅ **主题切换**：支持 light/dark/system 三种模式
-- ✅ **响应式设计**：完美适配移动端、平板、桌面
-- ✅ **零框架依赖**：纯原生 JavaScript，轻量高效（< 20KB）
-- ✅ **真实内容页**：安装、配置、API 使用、反馈支持均已补全
-- ✅ **独立视觉资源**：包含项目主图和管理后台截图，可脱离仓库部署
+- ✅ **构建期预渲染**：`build.mjs` 把每页渲染成英文 `/` 与中文 `/zh/` 两份完整 HTML，爬虫无需执行 JS 即可读到正文
+- ✅ **SEO 完整**：title/description、canonical、hreflang 互指、Open Graph/Twitter、JSON-LD（首页含 FAQPage）、`sitemap.xml`、`robots.txt`
+- ✅ **语言偏好**：英文页对 zh 浏览器且无保存偏好的访客跳转到 `/zh/`；手动切换写入 `localStorage.ccload_locale`
+- ✅ **主题切换**：light/dark/system 三种模式
+- ✅ **自动缓存失效**：构建时按文件内容给本地资源 URL 附 `?v=<hash>`，内容不变 URL 不变，源 HTML 不手写版本号
+- ✅ **零依赖**：构建脚本只用 Node 内置模块，运行时脚本只处理导航、复制、Tab、渐入与文档目录高亮
 
 ## 快速开始
 
-### 开发环境（ccLoad 项目内）
-
 ```bash
-# 1. 设置网站（复制共享资源）
-make www-setup
-
-# 2. 本地预览
-make www-run
-
-# 访问 http://localhost:8888/
+make www-run        # www-setup + www-build，然后在 www/dist 上启动预览，访问 http://localhost:8888/
+make www-build      # 仅构建到 www/dist/
+make www-release    # 构建并 rsync www/dist/ 到线上
 ```
 
-### 部署到生产环境
-
-```bash
-# 1. 设置网站
-make www-setup
-
-# 2. 复制到你的 Web 服务器
-cp -r www /path/to/webroot/
-
-# 完成！现在可以通过 Web 服务器访问
-```
-
-详细部署指南请查看 [DEPLOY.md](DEPLOY.md)。
+`www/dist/` 是唯一的发布产物，源 HTML、语言包和 `promo/` 不会上线。详细部署见 [DEPLOY.md](DEPLOY.md)。
 
 ## 开发指南
 
-### 添加新页面
+### 文案来源
 
-1. 在 `www/` 目录创建新的 HTML 文件
-2. 在 `www/assets/js/nav.js` 的 `NAV_ITEMS` 中添加导航项
-3. 在语言包中添加对应的翻译
+- **英文**：直接写在源 HTML 里（`index.html` 等），即英文页的最终文本
+- **中文**：首页、导航、页脚、页面 title 写在 `assets/locales/zh-CN.js`；子页正文写在 `assets/locales/<page>.zh-CN.js`
+- **导航/页脚英文**：由构建脚本生成，文案在 `assets/locales/en.js`
 
-### 添加翻译
-
-在 `www/assets/locales/zh-CN.js` 和 `en.js` 中添加翻译条目：
-
-```javascript
-// 中文
-'www.page.title': '页面标题',
-
-// 英文
-'www.page.title': 'Page Title',
-```
-
-### 使用 i18n
-
-在 HTML 中使用 `data-i18n` 属性：
+### 标注方式
 
 ```html
-<h1 data-i18n="www.page.title">页面标题</h1>
+<h2 data-i18n="www.home.why.title">Why ccLoad</h2>              <!-- 纯文本，构建时转义 -->
+<p data-i18n-html="www.install.docker.desc">Set <code>X</code></p> <!-- 允许行内 HTML -->
+<img data-i18n-alt="www.home.preview.alt" alt="...">              <!-- 属性：alt/aria-label/title/content/src/poster/srclang/label -->
 ```
 
-### 样式开发
+中文构建是严格模式：任何 `data-i18n*` 键在中文语言包里缺失，`make www-build` 直接失败。改了英文源文要同步改对应中文键。所有 `data-i18n*` 属性在产物中被剥离。
 
-在 `www/assets/css/www.css` 中添加样式，使用 `www-` 前缀避免冲突：
+### 添加新页面
 
-```css
-.www-my-component {
-  /* 样式规则 */
-}
-```
+1. 在 `www/` 创建 HTML，`<title>` 用 `data-i18n="www.<page>.meta.title"`，并写 `<meta name="description">`
+2. 在 `build.mjs` 的 `PAGES` 与 `NAV_ITEMS` 中加入该页，`en.js` 与 `zh-CN.js` 加导航文案
+3. 添加中文键，运行 `make verify-web`（`build.test.mjs` 校验死链、hreflang、sitemap、JSON-LD）
+
+### 样式
+
+在 `assets/css/www.css` 中添加，使用 `www-` 前缀。`www.css` 开头自带设计令牌（颜色、字体、间距、圆角），不依赖管理后台的 `styles.css`；`make www-setup` 只从 `web/` 复制 `theme-init.js` 和图标。
+
+图标不用 emoji：源 HTML 写 `<span class="www-feature-icon" data-icon="key"></span>`（也可用 `www-doc-icon`），构建时由 `build.mjs` 的 `ICONS` 内联为线性 SVG；图标名未知时构建直接失败。
+
+子页面布局由构建生成：`<header class="www-page-hero">` 自动加面包屑；带 `id` 的 `<section>`（取其 `h2`）不少于 3 个时，生成左侧本页导航，`<section data-toc-icon="名称">` 为条目配 `ICONS` 图标。多行代码块自动加行号栏。
 
 ## 技术栈
 
-- **前端**：纯原生 JavaScript ES6+
+- **构建**：`build.mjs`（Node ESM，零依赖）预渲染双语静态页
+- **前端**：原生 JavaScript，`nav.js` / `www.js` 只负责交互
 - **样式**：CSS3 + CSS 变量
-- **国际化**：自研 i18n 系统
-- **构建**：无构建步骤；`make www-setup` 仅复制共享静态资源
-- **后端**：无；由任意静态 Web 服务器直接托管
+- **后端**：无；任意静态 Web 服务器托管 `dist/`
 
-## 已完成功能
+## 页面
 
-### ✅ 首页（index.html）
-- Hero 区域（对齐正式版 README 标语）
-- 核心特性卡片（OAuth、思考后缀、Key 模型白名单、渠道时段）
-- 第一方账号渠道：Codex / Anthropic / Antigravity / xAI / CodeBuddy / Z.ai / Cursor / Zed
-- 管理后台预览截图
-- 4 种部署方式卡片（Go 1.26+，官方 latest 二进制）
-- 快速开始 Tab 切换
-- 代码复制功能
+| 页面 | 内容 |
+| --- | --- |
+| `index.html` | 定位与介绍视频、差异点、同类对比、适用人群、能力、账号渠道、后台预览、快速开始、FAQ |
+| `install.html` | Docker / Hugging Face / Homebrew / 源码与二进制部署，部署后验证 |
+| `config.html` | 环境变量、存储模式、渠道与令牌配置、运行时设置、上线检查 |
+| `usage.html` | 各协议调用示例、端点速查、Responses WebSocket、管理 API |
+| `feedback.html` | 问题分流、贡献入口、反馈模板 |
 
-### ✅ 安装指南（install.html）
-- Docker Compose 部署（GHCR latest / beta / 精确版本）
-- Hugging Face Spaces 部署
-- 源码编译与二进制运行（含 Cursor SDK Bridge）
-- 部署后验证命令
+## 图片与视频
 
-### ✅ 配置手册（config.html）
-- 启动环境变量表（含 PORT、CURSOR_SDK_BRIDGE_BIN、TRUSTED_PROXIES）
-- SQLite / MySQL / PostgreSQL / Hybrid 存储模式对比
-- 渠道配置、OAuth auth_type、Key 模型白名单、单模型启停、可用时段、每日定时检测
-- 思考后缀、全局 OAuth 上游地址、冷却兜底
-- 全局流式总超时、首字节/非流式协议覆盖、上游连接复用时限和 WebSocket 会话限制（1024 会话 / 256 MiB）
-- 批量模型名小写与来源前缀清理
-- API Token 模型、渠道白名单/黑名单、费用和并发限制
-- 自定义模型价格：基础/高上下文输入、输出和缓存价，覆盖恢复及适用边界；渠道模型价格按渠道单独覆盖
-- 管理后台热配置说明
-- 安全上线检查
+截图是入库的 WebP 变体，页面用 `srcset` 按宽度选择。仓库根目录 `images/` 的原图更新后，在仓库根目录重新生成：
 
-### ✅ API 使用（usage.html）
-- Anthropic / OpenAI / Gemini / Codex / Images / Token 统计示例
-- 思考后缀、第一方账号渠道、Images API
-- HTTP 与 Responses WebSocket 端点速查表、会话隔离、连接轮换和故障切换边界
-- 多协议内置搜索映射说明
-- Antigravity Responses 原生搜索、域名过滤与引用返回
-- 管理后台的客户端协议统计、7 天服务健康度、缓存统计与模型测试 Key 备注/倍率
-- 渠道管理 API 与 CSV 导入导出
+```bash
+for n in dashboard logs; do for w in 1280 2048; do
+  cwebp -quiet -q 85 -m 6 -resize $w 0 images/ccload-$n.webp -o www/assets/images/ccload-$n-$w.webp
+done; done
+```
 
-### ✅ 反馈渠道（feedback.html）
-- Bug、功能建议、讨论、安全问题分流
-- 贡献代码入口
-- 高质量反馈模板
-
-### ✅ 基础组件
-- 导航栏（支持移动端汉堡菜单）
-- 语言切换器
-- 主题切换器
-- 代码块（带复制按钮）
-- Tab 切换
-- 页脚
+宽高比变了要同步 HTML 中 `<img>` 的 `width`/`height`。介绍视频 `.mp4` 不入库，生成方法见 [DEPLOY.md](DEPLOY.md#-介绍视频)；`promo/audio.sh` 同时按旁白时间轴写出同名 `.vtt` 字幕，字幕入库。
 
 ## 文档
 

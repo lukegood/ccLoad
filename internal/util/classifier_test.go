@@ -26,6 +26,38 @@ func assertClassifyError(t *testing.T, err error, wantStatus int, wantLevel Erro
 
 }
 
+func TestClassifyXAIFreeUsageScope(t *testing.T) {
+	t.Parallel()
+	for _, status := range []int{429, 403, StatusSSEError} {
+		for _, tc := range []struct {
+			name  string
+			body  string
+			model string
+		}{
+			{"account", `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for now."}`, ""},
+			{"named model", `{"code":"subscription:free-usage-exhausted","error":"You've used all the included free usage for model grok-4.6 for now."}`, "grok-4.6"},
+			{"structured model", `{"error":{"code":"subscription:free-usage-exhausted","message":"Included free usage exhausted","model":"grok-4.7","reset_seconds":3600}}`, "grok-4.7"},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", status, tc.name), func(t *testing.T) {
+				before := time.Now()
+				got := ClassifyHTTPResponseWithMeta(status, nil, []byte(tc.body))
+				if tc.model == "" {
+					if got.ModelScoped || !got.CredentialScoped || got.Level != ErrorLevelKey || !got.HasKeyCooldownUntil {
+						t.Fatalf("account quota classification=%+v", got)
+					}
+				} else {
+					if !got.ModelScoped || got.CredentialScoped || got.Model != tc.model || !got.HasModelCooldownUntil {
+						t.Fatalf("model quota classification=%+v", got)
+					}
+					if tc.name == "structured model" && (got.ModelCooldownUntil.Before(before.Add(time.Hour-time.Second)) || got.ModelCooldownUntil.After(before.Add(time.Hour+time.Second))) {
+						t.Fatalf("exact reset lost: %v", got.ModelCooldownUntil)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestClassifyHTTPResponse(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1132,6 +1164,16 @@ func TestClassifySSEError(t *testing.T) {
 	}
 }
 
+// Codex WS 错误事件经 597 分类时，模型不可用只冷却当前模型；OAuth 渠道无独立 Key，
+// 若按普通 Key 级处理会冷却整个渠道。
+func TestClassifySSEErrorModelUnavailableIsModelScoped(t *testing.T) {
+	body := []byte(`{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+	classification := ClassifyHTTPResponseWithMeta(StatusSSEError, nil, body)
+	if classification.Level != ErrorLevelKey || !classification.ModelScoped {
+		t.Fatalf("classification=%+v, want Key level and model scoped", classification)
+	}
+}
+
 func TestClassifyHTTPResponse400IsModelScoped(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1788,6 +1830,112 @@ func TestClassifyAnthropicOverageOnlyRejectionStaysModelScoped(t *testing.T) {
 
 	if got.CredentialScoped || !got.ModelScoped {
 		t.Fatalf("classification=%+v, want model-scoped overage rejection", got)
+	}
+}
+
+func TestClassifyAnthropicRateLimitIgnoresBillingBoundaryResets(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	unix := func(d time.Duration) string { return strconv.FormatInt(now.Add(d).Unix(), 10) }
+	monthEnd := unix(23 * 24 * time.Hour)
+
+	tests := []struct {
+		name           string
+		headers        map[string][]string
+		wantCredential bool
+		wantUntil      time.Duration // 0 表示不应设置固定截止时间
+	}{
+		{
+			name: "overage claim reset equals overage billing boundary",
+			headers: map[string][]string{
+				"anthropic-ratelimit-unified-status":               {"rejected"},
+				"anthropic-ratelimit-unified-5h-status":            {"allowed"},
+				"anthropic-ratelimit-unified-7d-status":            {"allowed"},
+				"anthropic-ratelimit-unified-representative-claim": {"overage"},
+				"anthropic-ratelimit-unified-overage-reset":        {unix(2 * 24 * time.Hour)},
+				"anthropic-ratelimit-unified-reset":                {unix(2 * 24 * time.Hour)},
+			},
+		},
+		{
+			name: "overage claim keeps distinct unified reset",
+			headers: map[string][]string{
+				"anthropic-ratelimit-unified-status":               {"rejected"},
+				"anthropic-ratelimit-unified-5h-status":            {"allowed"},
+				"anthropic-ratelimit-unified-7d-status":            {"allowed"},
+				"anthropic-ratelimit-unified-representative-claim": {"overage"},
+				"anthropic-ratelimit-unified-overage-reset":        {monthEnd},
+				"anthropic-ratelimit-unified-reset":                {unix(3 * time.Hour)},
+			},
+			wantUntil: 3 * time.Hour,
+		},
+		{
+			name:    "unified reset beyond longest window",
+			headers: map[string][]string{"anthropic-ratelimit-unified-reset": {monthEnd}},
+		},
+		{
+			name: "rejected shared window ignores billing boundary unified reset",
+			headers: map[string][]string{
+				"anthropic-ratelimit-unified-status":    {"rejected"},
+				"anthropic-ratelimit-unified-5h-status": {"rejected"},
+				"anthropic-ratelimit-unified-5h-reset":  {unix(2 * time.Hour)},
+				"anthropic-ratelimit-unified-reset":     {monthEnd},
+			},
+			wantCredential: true,
+			wantUntil:      2 * time.Hour,
+		},
+		{
+			name: "unevaluated shared windows with overage claim stay model scoped",
+			headers: map[string][]string{
+				"anthropic-ratelimit-unified-status":               {"rejected"},
+				"anthropic-ratelimit-unified-representative-claim": {"overage"},
+				"anthropic-ratelimit-unified-5h-utilization":       {"0.40"},
+				"anthropic-ratelimit-unified-reset":                {unix(time.Hour)},
+			},
+			wantUntil: time.Hour,
+		},
+		{
+			name: "unevaluated shared windows with exhausted utilization",
+			headers: map[string][]string{
+				"anthropic-ratelimit-unified-status":               {"rejected"},
+				"anthropic-ratelimit-unified-representative-claim": {"overage"},
+				"anthropic-ratelimit-unified-7d-utilization":       {"1.0"},
+				"anthropic-ratelimit-unified-reset":                {unix(time.Hour)},
+			},
+			wantCredential: true,
+			wantUntil:      time.Hour,
+		},
+		{
+			name: "unevaluated shared windows without overage claim",
+			headers: map[string][]string{
+				"anthropic-ratelimit-unified-status":         {"rejected"},
+				"anthropic-ratelimit-unified-overage-status": {"rejected"},
+				"anthropic-ratelimit-unified-reset":          {unix(time.Hour)},
+			},
+			wantCredential: true,
+			wantUntil:      time.Hour,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyHTTPResponseWithMetaAt(http.StatusTooManyRequests, tt.headers, nil, now)
+
+			if got.CredentialScoped != tt.wantCredential || got.ModelScoped == tt.wantCredential {
+				t.Fatalf("classification=%+v, want credential scoped=%v", got, tt.wantCredential)
+			}
+			hasUntil, until := got.HasModelCooldownUntil, got.ModelCooldownUntil
+			if tt.wantCredential {
+				hasUntil, until = got.HasKeyCooldownUntil, got.KeyCooldownUntil
+			}
+			if tt.wantUntil == 0 {
+				if hasUntil {
+					t.Fatalf("cooldown until=%s, want exponential backoff without fixed deadline", until)
+				}
+				return
+			}
+			if want := now.Add(tt.wantUntil); !hasUntil || !until.Equal(want) {
+				t.Fatalf("cooldown until=%s (set=%v), want %s", until, hasUntil, want)
+			}
+		})
 	}
 }
 

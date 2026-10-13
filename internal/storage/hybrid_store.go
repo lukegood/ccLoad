@@ -36,8 +36,8 @@ type HybridStore struct {
 	primarySync *primaryWriteBehind
 
 	// OAuth credential writes are serialized so the SQLite projection cannot apply them out of order.
-	// Reads take the read lock: they must not observe a half-applied credential swap, but they also
-	// must not queue behind a write that is reconciling costs against the log table.
+	// Credential reads take the read lock to avoid observing an in-flight swap.
+	// Periodic quota costs are read directly from the authoritative SQLite ledger.
 	oauthCredentialMu sync.RWMutex
 
 	sqliteReadFailCount atomic.Uint64
@@ -140,6 +140,10 @@ func cloneLogEntryForSync(e *model.LogEntry) *model.LogEntry {
 		return nil
 	}
 	clone := *e
+	if e.ReasoningDecision != nil {
+		decision := *e.ReasoningDecision
+		clone.ReasoningDecision = &decision
+	}
 	// 同步到主库时丢弃 DebugData：调试原始请求/响应体仅保留在 SQLite，
 	// 避免膨胀主库；但 logs 表主数据仍需正常同步
 	clone.DebugData = nil
@@ -222,14 +226,19 @@ func (h *HybridStore) CompareAndSwapOAuthUsage(
 	ctx context.Context,
 	channelID int64,
 	expectedAuthType, expectedCredential, nextCredential string,
-) (bool, *oauthcost.Usage, error) {
+) (bool, error) {
 	h.oauthCredentialMu.Lock()
 	defer h.oauthCredentialMu.Unlock()
-	updated, usage, err := h.sqlite.CompareAndSwapOAuthUsage(ctx, channelID, expectedAuthType, expectedCredential, nextCredential)
+	updated, err := h.sqlite.CompareAndSwapOAuthUsage(ctx, channelID, expectedAuthType, expectedCredential, nextCredential)
 	if err == nil && updated {
 		h.markChannelDirty(channelID, false)
 	}
-	return updated, usage, err
+	return updated, err
+}
+
+// OAuthQuotaCostViews 读 SQLite 权威库；主库账本异步落后。
+func (h *HybridStore) OAuthQuotaCostViews(ctx context.Context, usages map[int64]*oauthcost.Usage, at time.Time) (map[int64]*oauthcost.CostView, error) {
+	return h.sqlite.OAuthQuotaCostViews(ctx, usages, at)
 }
 
 func (h *HybridStore) CompareAndSwapChannelManagement(
@@ -384,6 +393,12 @@ func (h *HybridStore) GetEnabledChannelsByModel(ctx context.Context, modelName s
 	h.oauthCredentialMu.RLock()
 	defer h.oauthCredentialMu.RUnlock()
 	return h.sqlite.GetEnabledChannelsByModel(ctx, modelName)
+}
+
+func (h *HybridStore) GetEnabledSystemOneChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error) {
+	h.oauthCredentialMu.RLock()
+	defer h.oauthCredentialMu.RUnlock()
+	return h.sqlite.GetEnabledSystemOneChannelsByModel(ctx, modelName)
 }
 
 func (h *HybridStore) BatchUpdatePriority(ctx context.Context, updates []struct {
@@ -666,16 +681,13 @@ func (h *HybridStore) AddLog(ctx context.Context, e *model.LogEntry) error {
 	if e.Time.IsZero() {
 		e.Time = model.JSONTime{Time: time.Now()}
 	}
-	h.oauthCredentialMu.Lock()
-	updatedChannelIDs, err := h.sqlite.AddLogWithOAuthQuotaCost(ctx, e)
+	effects, err := h.addLogsLocked([]*model.LogEntry{e}, func() (sqlstore.OAuthQuotaLogEffects, error) {
+		return h.sqlite.AddLogWithOAuthQuotaCost(ctx, e)
+	})
 	if err != nil {
-		h.oauthCredentialMu.Unlock()
 		return err
 	}
-	for _, channelID := range updatedChannelIDs {
-		h.markChannelDirty(channelID, false)
-	}
-	h.oauthCredentialMu.Unlock()
+	h.enqueueOAuthQuotaLedgerSlices(effects.LedgerSlices)
 	entry := cloneLogEntryForSync(e)
 	h.primarySync.enqueueBestEffort("logs/latest", "logs", func(syncCtx context.Context) error {
 		return h.primary.AddLogReplica(syncCtx, entry)
@@ -690,21 +702,35 @@ func (h *HybridStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) 
 			entry.Time = model.JSONTime{Time: now}
 		}
 	}
-	h.oauthCredentialMu.Lock()
-	updatedChannelIDs, err := h.sqlite.BatchAddLogsWithOAuthQuotaCost(ctx, logs)
+	effects, err := h.addLogsLocked(logs, func() (sqlstore.OAuthQuotaLogEffects, error) {
+		return h.sqlite.BatchAddLogsWithOAuthQuotaCost(ctx, logs)
+	})
 	if err != nil {
-		h.oauthCredentialMu.Unlock()
 		return err
 	}
-	for _, channelID := range updatedChannelIDs {
-		h.markChannelDirty(channelID, false)
-	}
-	h.oauthCredentialMu.Unlock()
+	h.enqueueOAuthQuotaLedgerSlices(effects.LedgerSlices)
 	entries := cloneLogEntriesForSync(logs)
 	h.primarySync.enqueueBestEffort("logs/latest", "logs", func(syncCtx context.Context) error {
 		return h.primary.BatchAddLogsReplica(syncCtx, entries)
 	})
 	return nil
+}
+
+// addLogsLocked 只在日志会改写凭据（Codex 已购额度）时与凭据 CAS 串行；
+// 周期额度只写账本，不触碰凭据，无需等待被动采样。
+func (h *HybridStore) addLogsLocked(logs []*model.LogEntry, write func() (sqlstore.OAuthQuotaLogEffects, error)) (sqlstore.OAuthQuotaLogEffects, error) {
+	if sqlstore.LogsChargeOAuthCredits(logs) {
+		h.oauthCredentialMu.Lock()
+		defer h.oauthCredentialMu.Unlock()
+	}
+	effects, err := write()
+	if err != nil {
+		return effects, err
+	}
+	for _, channelID := range effects.CredentialChannelIDs {
+		h.markChannelDirty(channelID, false)
+	}
+	return effects, nil
 }
 
 func (h *HybridStore) analyticsStore() *sqlstore.SQLStore {
@@ -762,6 +788,16 @@ func (h *HybridStore) CleanupLogsBefore(ctx context.Context, cutoff time.Time) e
 	}
 	h.primarySync.enqueueBestEffort("logs/cleanup", "log cleanup", func(syncCtx context.Context) error {
 		return h.primary.CleanupLogsBefore(syncCtx, cutoff)
+	})
+	return nil
+}
+
+func (h *HybridStore) CleanupOAuthQuotaLedgerBefore(ctx context.Context, cutoff time.Time) error {
+	if err := h.sqlite.CleanupOAuthQuotaLedgerBefore(ctx, cutoff); err != nil {
+		return err
+	}
+	h.primarySync.enqueueBestEffort("oauth-quota-ledger/cleanup", "OAuth quota ledger cleanup", func(syncCtx context.Context) error {
+		return h.primary.CleanupOAuthQuotaLedgerBefore(syncCtx, cutoff)
 	})
 	return nil
 }

@@ -21,6 +21,8 @@ const customPricingTieredModels = new Set();
 const globalCooldownRulesSettingKey = 'global_cooldown_detection_rules';
 const modelMultimodalFallbackSettingKey = 'model_multimodal_fallback';
 const modelCustomPricingSettingKey = 'model_custom_pricing';
+// 与后端 settingsRequireRestart 保持一致：仅这两项单独保存时热生效，其余设置保存后进程重启。
+const hotReloadSettingKeys = new Set([modelMultimodalFallbackSettingKey, modelCustomPricingSettingKey]);
 const maxMultimodalFallbackMappings = 64;
 const maxCustomPricingBytes = 1024 * 1024;
 const maxCustomPricingModels = 512;
@@ -40,9 +42,8 @@ function projectCustomPricingDefaults(pricing) {
   return projected;
 }
 
-const containerImageManagedDisabledReason = 'container_image_managed';
 const advancedSettingKeys = new Set([
-  'typesafe_enabled', 'typesafe_api_key', 'api_token_login_enabled', 'api_token_show_channels',
+  'api_token_login_enabled', 'api_token_show_channels',
   'auto_update_interval_hours', 'auto_update_channel',
   'auto_refresh_interval_seconds',
   'codex_map_429_to_503',
@@ -125,6 +126,8 @@ const numericSettingConstraints = new Map([
 
 function settingValueForDisplay(key, value) {
   const normalizedValue = String(value ?? '');
+  // 持久化 JSON 的格式与编辑器序列化不同，统一成编辑器形式避免误判为已修改。
+  if (key === 'reasoning_auto' && !validateReasoningAuto(normalizedValue)) return formatReasoningAuto(parseReasoningAuto(normalizedValue));
   if (!byteSettingKeys.has(key)) return normalizedValue;
 
   const bytes = Number(normalizedValue);
@@ -200,6 +203,8 @@ function validateSettingInput(setting, value) {
     return validateOptionalOAuthURLInput(normalizedValue);
   }
 
+  if (setting.key === 'reasoning_auto') return validateReasoningAuto(normalizedValue);
+
   if (setting.key === modelCustomPricingSettingKey) {
     return validateCustomPricingInput(normalizedValue);
   }
@@ -270,6 +275,267 @@ function validateCustomPricingInput(value) {
     if (!checkObjectFields(object, allowedFields) || !checkPrices(object)) return t('settings.validation.customPricingFields');
   }
   return '';
+}
+
+const reasoningAutoDefaults = { enabled: false, decision_channel_id: 0, decision_model: '', business_models: [], timeout_ms: 2000 };
+let reasoningAutoChannels = [];
+// 持久化值无效时编辑器锁定：控件只能显示默认值，任何编辑都会覆盖真实配置，只允许通过重置恢复。
+let reasoningAutoLocked = false;
+
+// 与后端 model.RoutingModelName 一致：只有尾部括号内是已知等级、特殊值或非负整数预算才算思考后缀，
+// 其余带括号的模型名（如上游真的叫 foo(bar)）是合法的精确名。
+function hasThinkingSuffix(name) {
+  const match = /^(.*)\(([^(]*)\)$/.exec(name);
+  if (!match || !match[1].trim()) return false;
+  return /^(none|auto|-1|minimal|low|medium|high|xhigh|max|\+?\d+)$/i.test(match[2].trim());
+}
+
+function parseReasoningAuto(value) {
+  return validateReasoningAuto(value) ? { ...reasoningAutoDefaults } : { ...reasoningAutoDefaults, ...JSON.parse(value) };
+}
+
+function formatReasoningAuto(config) {
+  const { enabled, decision_channel_id, decision_model, business_models, timeout_ms } = config;
+  return JSON.stringify({ enabled, decision_channel_id, decision_model, business_models, timeout_ms });
+}
+
+function validateReasoningAuto(value) {
+  let config;
+  try { config = JSON.parse(value); } catch (_) { return t('settings.reasoningAuto.invalid'); }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return t('settings.reasoningAuto.invalid');
+  config = { ...reasoningAutoDefaults, ...config };
+  if (typeof config.enabled !== 'boolean'
+    || !Number.isSafeInteger(config.decision_channel_id) || config.decision_channel_id < 0
+    || typeof config.decision_model !== 'string'
+    || !Array.isArray(config.business_models)
+    || config.business_models.some(model => typeof model !== 'string' || !model.trim() || /[*?]/.test(model) || hasThinkingSuffix(model.trim()))
+    || new Set(config.business_models.map(model => model.trim())).size !== config.business_models.length
+    || !Number.isSafeInteger(config.timeout_ms) || config.timeout_ms < 100 || config.timeout_ms > 10000
+    || (config.enabled && (!config.decision_channel_id || !config.decision_model.trim() || !config.business_models.length))) {
+    return t('settings.reasoningAuto.invalid');
+  }
+  return '';
+}
+
+let reasoningAutoDraft = null;
+let reasoningAutoModels = [];
+let reasoningAutoPreviousFocus = null;
+let reasoningShowSelectedOnly = false;
+
+function renderReasoningAutoEditor(value) {
+  reasoningAutoDraft = parseReasoningAuto(value);
+  reasoningAutoLocked = Boolean(validateReasoningAuto(value));
+  reasoningShowSelectedOnly = false;
+  const config = reasoningAutoDraft;
+  const disabled = reasoningAutoLocked ? ' disabled' : '';
+  const label = key => `<span data-i18n="settings.reasoningAuto.${key}">${escapeHtml(t('settings.reasoningAuto.' + key))}</span>`;
+  document.getElementById('reasoningAutoContent').innerHTML = `<div id="reasoningAutoEditor">
+    ${reasoningAutoLocked ? `<p class="custom-rules-error" role="alert">${label('locked')} <code>${escapeHtml(value)}</code></p>` : ''}
+    <label class="channel-editor-switch reasoning-auto-switch">
+      <input type="checkbox" data-reasoning-field="enabled" ${config.enabled ? 'checked' : ''}${disabled}>
+      <span class="channel-editor-switch__track" aria-hidden="true"></span>
+      ${label('enabled')}
+    </label>
+    <div class="reasoning-auto-fields">
+      <div><label class="form-label" for="reasoningDecisionChannel">${label('channel')}</label>
+        <select class="form-input" id="reasoningDecisionChannel" data-reasoning-field="decision_channel_id"${disabled}></select>
+      </div>
+      <div><label class="form-label" for="reasoningDecisionModel">${label('model')}</label>
+        <select class="form-input" id="reasoningDecisionModel" data-reasoning-field="decision_model"${disabled}></select>
+      </div>
+      <div><label class="form-label" for="reasoningTimeout">${label('timeout')}</label>
+        <input class="form-input" id="reasoningTimeout" type="number" min="0.1" max="10" step="0.1" data-reasoning-field="timeout_ms" value="${config.timeout_ms / 1000}"${disabled}>
+      </div>
+    </div>
+    <div class="settings-dialog-toolbar">
+      <h3 id="reasoningBusinessModelsTitle" class="settings-dialog-section-title">${label('businessModels')}
+        <button type="button" id="reasoningModelsCount" class="settings-dialog-count" data-action="toggle-reasoning-selected" aria-pressed="false" data-i18n-title="settings.reasoningAuto.showSelectedOnly" title="${escapeHtml(t('settings.reasoningAuto.showSelectedOnly'))}"></button>
+      </h3>
+      <input type="search" id="reasoningModelSearch" class="form-input settings-dialog-search" data-i18n-placeholder="settings.reasoningAuto.search" placeholder="${escapeHtml(t('settings.reasoningAuto.search'))}" data-i18n-aria-label="settings.reasoningAuto.search" aria-label="${escapeHtml(t('settings.reasoningAuto.search'))}">
+    </div>
+    <div class="table-container reasoning-model-table-container">
+      <table class="modern-table reasoning-model-table" aria-labelledby="reasoningBusinessModelsTitle">
+        <thead><tr><th><input type="checkbox" id="reasoningModelsSelectAll" data-i18n-aria-label="common.selectAll" aria-label="${escapeHtml(t('common.selectAll'))}"></th><th data-i18n="common.model">${escapeHtml(t('common.model'))}</th></tr></thead>
+        <tbody id="reasoningBusinessModels"></tbody>
+      </table>
+      <p id="reasoningModelsEmpty" class="settings-dialog-empty" data-i18n="settings.reasoningAuto.empty" hidden>${escapeHtml(t('settings.reasoningAuto.empty'))}</p>
+    </div>
+    <p class="settings-dialog-note">${label('note')}</p>
+  </div>`;
+  refreshReasoningChannelOptions();
+  renderReasoningBusinessModels();
+}
+
+// 界面以秒输入，持久化契约仍为整数毫秒；取整消除 0.3 * 1000 这类浮点误差。
+function reasoningTimeoutMs(seconds) {
+  return Math.round(Number(seconds) * 1000);
+}
+
+function renderReasoningBusinessModels() {
+  const container = document.getElementById('reasoningBusinessModels');
+  if (!container || !reasoningAutoDraft) return;
+  const selected = new Set(reasoningAutoDraft.business_models);
+  const filter = (document.getElementById('reasoningModelSearch')?.value || '').trim().toLowerCase();
+  const models = [...new Set([...reasoningAutoModels, ...selected])].sort((a, b) => a.localeCompare(b))
+    .filter(model => (!reasoningShowSelectedOnly || selected.has(model)) && model.toLowerCase().includes(filter));
+  container.innerHTML = models.map(model => `<tr><td><input type="checkbox" data-reasoning-model value="${escapeHtml(model)}" aria-label="${escapeHtml(model)}" ${selected.has(model) ? 'checked' : ''}${reasoningAutoLocked ? ' disabled' : ''}></td><td>${escapeHtml(model)}</td></tr>`).join('');
+  document.getElementById('reasoningModelsEmpty').hidden = models.length > 0;
+  document.getElementById('reasoningModelsCount')?.setAttribute('aria-pressed', String(reasoningShowSelectedOnly));
+  updateReasoningModelsSelectAll();
+}
+
+function updateReasoningModelsSelectAll() {
+  const checkbox = document.getElementById('reasoningModelsSelectAll');
+  const rows = Array.from(document.getElementById('reasoningBusinessModels').querySelectorAll('[data-reasoning-model]'));
+  const count = rows.filter(row => row.checked).length;
+  checkbox.checked = rows.length > 0 && count === rows.length;
+  checkbox.indeterminate = count > 0 && count < rows.length;
+  checkbox.disabled = reasoningAutoLocked || rows.length === 0;
+  const counter = document.getElementById('reasoningModelsCount');
+  if (counter) counter.textContent = t('settings.reasoningAuto.selectedCount', { count: reasoningAutoDraft.business_models.length });
+}
+
+function refreshReasoningModelOptions(selected) {
+  const channel = reasoningAutoChannels.find(item => item.id === Number(document.getElementById('reasoningDecisionChannel')?.value));
+  const select = document.getElementById('reasoningDecisionModel');
+  if (!select) return;
+  const models = [...new Set((channel?.models || []).filter(item => !item.disabled).map(item => typeof item === 'string' ? item : item.model).filter(Boolean))];
+  if (selected && !models.includes(selected)) models.unshift(selected);
+  select.innerHTML = `<option value="">—</option>` + models.map(model => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('');
+  select.value = selected || '';
+}
+
+function refreshReasoningChannelOptions() {
+  const select = document.getElementById('reasoningDecisionChannel');
+  if (!select || !reasoningAutoDraft) return;
+  const selected = String(reasoningAutoDraft.decision_channel_id);
+  // 只有决策渠道（System One）够快，能在每个业务请求前完成判断。
+  const channels = reasoningAutoChannels.filter(channel => channel.auth_type === 'system_one' && (channel.enabled || String(channel.id) === selected));
+  select.innerHTML = '<option value="0">—</option>' + channels.map(channel => `<option value="${channel.id}">${escapeHtml(channel.name)}</option>`).join('');
+  if (selected !== '0' && !channels.some(channel => String(channel.id) === selected)) {
+    select.insertAdjacentHTML('beforeend', `<option value="${escapeHtml(selected)}">${escapeHtml(selected)}</option>`);
+  }
+  select.value = selected;
+  refreshReasoningModelOptions(reasoningAutoDraft.decision_model);
+}
+
+function showReasoningAutoError(message) {
+  const error = document.getElementById('reasoningAutoError');
+  error.textContent = message || '';
+  error.hidden = !message;
+}
+
+async function loadReasoningAutoOptions() {
+  const draft = reasoningAutoDraft;
+  try {
+    const [channels, options] = await Promise.all([
+      fetchDataWithAuth('/admin/channels'),
+      fetchDataWithAuth('/admin/channels/filter-options?status=enabled')
+    ]);
+    if (reasoningAutoDraft !== draft) return;
+    reasoningAutoChannels = Array.isArray(channels) ? channels : [];
+    reasoningAutoModels = [...new Set([...reasoningAutoModels, ...(options?.models || [])])].filter(model => typeof model === 'string' && model.trim() && !/[*?]/.test(model) && !hasThinkingSuffix(model));
+    refreshReasoningChannelOptions();
+    renderReasoningBusinessModels();
+  } catch (error) {
+    if (reasoningAutoDraft === draft) showReasoningAutoError(t('settings.reasoningAuto.loadFailed') + ': ' + error.message);
+  }
+}
+
+function openReasoningAutoModal(trigger) {
+  const modal = document.getElementById('reasoningAutoModal');
+  const input = document.getElementById('reasoning_auto');
+  if (!modal || !input || !settingDefinitions.has('reasoning_auto')) return;
+  reasoningAutoPreviousFocus = trigger || document.activeElement;
+  reasoningAutoModels = [...parseReasoningAuto(input.value).business_models];
+  renderReasoningAutoEditor(input.value);
+  showReasoningAutoError(null);
+  document.querySelector('.app-container')?.setAttribute('inert', '');
+  modal.classList.add('show');
+  modal.setAttribute('aria-hidden', 'false');
+  modal.querySelector('.close-btn')?.focus();
+  loadReasoningAutoOptions();
+}
+
+function closeReasoningAutoModal() {
+  const modal = document.getElementById('reasoningAutoModal');
+  modal.classList.remove('show');
+  modal.setAttribute('aria-hidden', 'true');
+  document.querySelector('.app-container')?.removeAttribute('inert');
+  if (reasoningAutoPreviousFocus?.isConnected) reasoningAutoPreviousFocus.focus();
+  reasoningAutoPreviousFocus = null;
+  reasoningAutoDraft = null;
+}
+
+function applyReasoningAuto() {
+  if (!reasoningAutoDraft || reasoningAutoLocked) return;
+  const value = formatReasoningAuto(reasoningAutoDraft);
+  const error = validateReasoningAuto(value);
+  if (error) {
+    showReasoningAutoError(error);
+    return;
+  }
+  document.getElementById('reasoning_auto').value = value;
+  setSettingInvalid('reasoning_auto', false);
+  updateDirtyStatus();
+  closeReasoningAutoModal();
+}
+
+function bindReasoningAutoModal() {
+  const modal = document.getElementById('reasoningAutoModal');
+  if (!modal || modal.dataset.bound) return;
+  modal.dataset.bound = '1';
+  modal.addEventListener('click', event => {
+    const action = event.target.closest('[data-action]')?.dataset.action;
+    if (event.target === modal || action === 'close-reasoning-auto') closeReasoningAutoModal();
+    else if (action === 'apply-reasoning-auto') applyReasoningAuto();
+    else if (action === 'toggle-reasoning-selected') {
+      // 只看已选：取消勾选的行保留到下次重绘，误点可直接勾回
+      reasoningShowSelectedOnly = !reasoningShowSelectedOnly;
+      renderReasoningBusinessModels();
+    }
+    else if (action === 'reset-reasoning-auto') {
+      renderReasoningAutoEditor(settingDefinitions.get('reasoning_auto')?.default_value || formatReasoningAuto(reasoningAutoDefaults));
+      showReasoningAutoError(null);
+      loadReasoningAutoOptions();
+    }
+  });
+  modal.addEventListener('input', event => {
+    if (event.target.id === 'reasoningModelSearch') renderReasoningBusinessModels();
+    else if (!reasoningAutoLocked && reasoningAutoDraft && event.target.id === 'reasoningTimeout') {
+      reasoningAutoDraft.timeout_ms = reasoningTimeoutMs(event.target.value);
+    }
+  });
+  modal.addEventListener('change', event => {
+    if (!reasoningAutoDraft || reasoningAutoLocked) return;
+    const input = event.target;
+    const field = input.dataset.reasoningField;
+    if (input.id === 'reasoningModelsSelectAll') {
+      const models = new Set(reasoningAutoDraft.business_models);
+      document.getElementById('reasoningBusinessModels').querySelectorAll('[data-reasoning-model]').forEach(row => {
+        row.checked = input.checked;
+        if (input.checked) models.add(row.value);
+        else models.delete(row.value);
+      });
+      reasoningAutoDraft.business_models = [...models];
+      updateReasoningModelsSelectAll();
+    } else if (input.hasAttribute('data-reasoning-model')) {
+      const models = new Set(reasoningAutoDraft.business_models);
+      if (input.checked) models.add(input.value);
+      else models.delete(input.value);
+      reasoningAutoDraft.business_models = [...models];
+      updateReasoningModelsSelectAll();
+    } else if (field === 'enabled') reasoningAutoDraft.enabled = input.checked;
+    else if (field === 'decision_channel_id') {
+      reasoningAutoDraft.decision_channel_id = Number(input.value);
+      reasoningAutoDraft.decision_model = '';
+      refreshReasoningModelOptions('');
+    } else if (field === 'decision_model') reasoningAutoDraft.decision_model = input.value;
+    else if (field === 'timeout_ms') reasoningAutoDraft.timeout_ms = reasoningTimeoutMs(input.value);
+  });
+  modal.addEventListener('keydown', event => {
+    if (event.key === 'Tab') trapModalFocus(modal, event);
+  });
 }
 
 const runtimeMetricDomains = [
@@ -401,6 +667,12 @@ function bindSettingsPageActions() {
     runtimeMetricsBtn.dataset.bound = '1';
   }
 
+  const reasoningAutoBtn = document.getElementById('reasoning-auto-btn');
+  if (reasoningAutoBtn && !reasoningAutoBtn.dataset.bound) {
+    reasoningAutoBtn.addEventListener('click', event => openReasoningAutoModal(event.currentTarget));
+    reasoningAutoBtn.dataset.bound = '1';
+  }
+
   const multimodalFallbackBtn = document.getElementById('model-multimodal-fallback-btn');
   if (multimodalFallbackBtn && !multimodalFallbackBtn.dataset.bound) {
     multimodalFallbackBtn.addEventListener('click', (event) => openMultimodalFallbackModal(event.currentTarget));
@@ -430,16 +702,32 @@ function bindSettingsPageActions() {
     modal.addEventListener('click', (event) => {
       if (event.target === modal) closeRuntimeMetricsModal();
     });
-    modal.addEventListener('keydown', (event) => {
-      if (event.key === 'Escape') closeRuntimeMetricsModal();
-    });
     modal.dataset.bound = '1';
   }
 
+  // Esc 挂在 document：点击弹窗空白处或聚焦元素被重渲染后焦点落到 body，弹窗自身收不到 keydown。
+  // 弹窗内下拉框处理 Esc 时会 preventDefault，此时只收起下拉、不关弹窗。
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || event.defaultPrevented) return;
+    const close = settingsModalClosers.find(([id]) => document.getElementById(id)?.classList.contains('show'))?.[1];
+    if (!close) return;
+    event.preventDefault();
+    close();
+  });
+
+  bindReasoningAutoModal();
   bindGlobalCooldownRulesModal();
   bindMultimodalFallbackModal();
   bindCustomPricingModal();
 }
+
+const settingsModalClosers = [
+  ['runtimeMetricsModal', closeRuntimeMetricsModal],
+  ['reasoningAutoModal', closeReasoningAutoModal],
+  ['customRulesModal', closeGlobalCooldownRulesModal],
+  ['multimodalFallbackModal', closeMultimodalFallbackModal],
+  ['customPricingModal', closeCustomPricingModal]
+];
 
 function bindGlobalCooldownRulesModal() {
   const modal = document.getElementById('customRulesModal');
@@ -475,11 +763,6 @@ function bindGlobalCooldownRulesModal() {
     }
   });
   modal.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeGlobalCooldownRulesModal();
-      return;
-    }
     if (event.key === 'Tab') trapModalFocus(modal, event);
   });
   modal.dataset.bound = '1';
@@ -764,14 +1047,14 @@ async function applyMultimodalFallback() {
   showMultimodalFallbackError(null);
 
   try {
-    const result = await fetchDataWithAuth('/admin/settings/batch', {
+    await fetchDataWithAuth('/admin/settings/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ [modelMultimodalFallbackSettingKey]: value })
     });
     syncSettingState(modelMultimodalFallbackSettingKey, value);
     closeMultimodalFallbackModal();
-    showSuccess(result?.message || t('settings.msg.savedCount', { count: 1 }));
+    showSuccess(t('settings.msg.savedHot', { count: 1 }));
   } catch (err) {
     console.error('保存多模态回退映射异常:', err);
     showMultimodalFallbackError(t('settings.msg.saveFailed') + ': ' + err.message);
@@ -810,11 +1093,6 @@ function bindMultimodalFallbackModal() {
     }
   });
   modal.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeMultimodalFallbackModal();
-      return;
-    }
     if (event.key === 'Tab') trapModalFocus(modal, event);
   });
   modal.dataset.bound = '1';
@@ -868,6 +1146,12 @@ function customPricingNumberControl(field, value) {
     aria-label="${label}" title="${label}">`;
 }
 
+// 桌面端由表头标注列；移动端卡片布局没有表头，靠 data-mobile-label 显示字段名。
+function customPricingNumberCell(field, value) {
+  const label = escapeHtml(t(customPricingFieldLabelKeys[field] || field));
+  return `<td data-mobile-label="${label}">${customPricingNumberControl(field, value)}</td>`;
+}
+
 function renderCustomPricingModel(entry, modelIndex) {
   const pricing = entry.pricing || {};
   const highContextDescription = escapeHtml(t('settings.customPricing.highContextDescription'));
@@ -876,29 +1160,30 @@ function renderCustomPricingModel(entry, modelIndex) {
   // 关键：输入框必须落在真正的 <td> 里，列宽由表格列算法统一决定。
   // 用 grid/flex 容器会算出与列宽无关的宽度，两行输入框永远对不齐。
   const highContextCells = customPricingHighContextFields
-    .map((field) => `<td>${customPricingNumberControl(field, pricing[field])}</td>`)
+    .map((field) => customPricingNumberCell(field, pricing[field]))
     .join('');
+  // 高上下文价多数模型用不到：无值时折叠，有值时展开，避免每个模型都占两行空输入。
+  const highExpanded = customPricingHighContextFields.some((field) => typeof pricing[field] === 'number');
 
   return `
-    <tr class="custom-pricing-model-row" data-model-index="${modelIndex}">
-      <td>
+    <tr class="custom-pricing-model-row mobile-card-row" data-model-index="${modelIndex}">
+      <td class="mobile-card-no-label">
         <div class="custom-pricing-model-cell">
           <input type="text" class="form-input custom-pricing-model-id-input" data-cp-field="model_id" value="${escapeHtml(entry.model || '')}" spellcheck="false" required aria-label="${escapeHtml(t('settings.customPricing.modelId'))}" title="${escapeHtml(t('settings.customPricing.modelId'))}">
           <span class="custom-pricing-model-status" data-cp-status role="status" hidden></span>
+          <button type="button" class="custom-pricing-high-toggle" data-action="toggle-custom-pricing-high" aria-expanded="${highExpanded}" title="${highContextDescription}">${escapeHtml(t('settings.customPricing.highContextPricing'))}</button>
         </div>
       </td>
-      <td>${customPricingNumberControl('input_price', pricing.input_price)}</td>
-      <td>${customPricingNumberControl('output_price', pricing.output_price)}</td>
-      <td>${customPricingNumberControl('cache_read_price', pricing.cache_read_price)}</td>
-      <td>${customPricingNumberControl('cache_write_price', pricing.cache_write_price)}</td>
-      <td><button type="button" class="btn-icon" data-action="remove-custom-pricing-model" data-model-index="${modelIndex}" aria-label="${escapeHtml(t('settings.customPricing.removeModel'))}">&times;</button></td>
+      ${customPricingNumberCell('input_price', pricing.input_price)}
+      ${customPricingNumberCell('output_price', pricing.output_price)}
+      ${customPricingNumberCell('cache_read_price', pricing.cache_read_price)}
+      ${customPricingNumberCell('cache_write_price', pricing.cache_write_price)}
+      <td class="mobile-card-no-label"><button type="button" class="btn-icon" data-action="remove-custom-pricing-model" data-model-index="${modelIndex}" aria-label="${escapeHtml(t('settings.customPricing.removeModel'))}">&times;</button></td>
     </tr>
-    <tr class="custom-pricing-high-row" data-model-index="${modelIndex}">
-      <td>
-        <span class="custom-pricing-high-label" title="${highContextDescription}">${escapeHtml(t('settings.customPricing.highContextPricing'))}</span>
-      </td>
+    <tr class="custom-pricing-high-row mobile-card-row" data-model-index="${modelIndex}"${highExpanded ? '' : ' data-collapsed'}>
+      <td class="mobile-empty-cell"></td>
       ${highContextCells}
-      <td></td>
+      <td class="mobile-empty-cell"></td>
     </tr>`;
 }
 
@@ -921,6 +1206,15 @@ function customPricingHighRow(modelRow) {
     if (row.classList.contains('custom-pricing-high-row')) return row;
   }
   return null;
+}
+
+function toggleCustomPricingHighRow(button) {
+  const high = customPricingHighRow(button.closest('.custom-pricing-model-row'));
+  if (!high) return;
+  const expanded = button.getAttribute('aria-expanded') !== 'true';
+  button.setAttribute('aria-expanded', String(expanded));
+  high.toggleAttribute('data-collapsed', !expanded);
+  if (expanded) high.querySelector('input')?.focus();
 }
 
 function collectCustomPricingEntries() {
@@ -1153,14 +1447,14 @@ async function applyCustomPricing() {
   }
   showCustomPricingError(null);
   try {
-    const result = await fetchDataWithAuth('/admin/settings/batch', {
+    await fetchDataWithAuth('/admin/settings/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ [modelCustomPricingSettingKey]: value })
     });
     syncSettingState(modelCustomPricingSettingKey, value);
     closeCustomPricingModal();
-    showSuccess(result?.message || t('settings.msg.savedCount', { count: 1 }));
+    showSuccess(t('settings.msg.savedHot', { count: 1 }));
   } catch (err) {
     console.error('保存自定义模型价格异常:', err);
     showCustomPricingError(t('settings.msg.saveFailed') + ': ' + err.message);
@@ -1187,6 +1481,7 @@ function bindCustomPricingModal() {
       case 'apply-custom-pricing': applyCustomPricing(); break;
       case 'add-custom-pricing-model': addCustomPricingModel(); break;
       case 'remove-custom-pricing-model': removeCustomPricingModel(button); break;
+      case 'toggle-custom-pricing-high': toggleCustomPricingHighRow(button); break;
     }
   });
   modal.addEventListener('input', (event) => {
@@ -1199,11 +1494,6 @@ function bindCustomPricingModal() {
     if (event.key === 'Enter' && event.target.matches('[data-cp-field="model_id"]')) {
       event.preventDefault();
       loadCustomPricingDefaults(event.target);
-      return;
-    }
-    if (event.key === 'Escape') {
-      event.preventDefault();
-      closeCustomPricingModal();
       return;
     }
     if (event.key === 'Tab') trapModalFocus(modal, event);
@@ -1336,10 +1626,9 @@ function formatRuntimeMetric(metric, stats) {
 
 function renderRuntimeMetricCard(metric, stats) {
   return `
-    <div class="runtime-metric-card">
+    <div class="runtime-metric-card" title="${escapeHtml(metric.key)}">
       <span class="runtime-metric-label">${escapeHtml(t(metric.labelKey))}</span>
       <strong class="runtime-metric-value">${escapeHtml(formatRuntimeMetric(metric, stats))}</strong>
-      <code class="runtime-metric-key">${escapeHtml(metric.key)}</code>
     </div>`;
 }
 
@@ -1509,7 +1798,7 @@ function getSettingGroupInfo(key) {
 
   const defs = [
     { id: 'advanced', nameKey: 'settings.group.advanced', order: 70, match: () => advancedSettingKeys.has(k) },
-    { id: 'channel', nameKey: 'settings.group.channel', order: 10, match: () => k.startsWith('channel_') || k === 'max_key_retries' },
+    { id: 'channel', nameKey: 'settings.group.channel', order: 10, match: () => k.startsWith('channel_') || k === 'max_key_retries' || k === 'reasoning_auto' },
 
     { id: 'upstream-connection', nameKey: 'settings.group.upstreamConnection', order: 19, match: () => k === 'upstream_connection_reuse_limit_seconds' || oauthBaseURLSettingKeys.has(k) },
     { id: 'websocket', nameKey: 'settings.group.websocket', order: 25, match: () => k.startsWith('responses_ws_') },
@@ -1565,8 +1854,6 @@ function getSettingOrder(key) {
     auto_update_channel: 701,
     api_token_login_enabled: 702,
     api_token_show_channels: 703,
-    typesafe_enabled: 705,
-    typesafe_api_key: 706,
     model_custom_pricing: 710
   };
   const normalizedKey = String(key || '').toLowerCase();
@@ -1574,7 +1861,19 @@ function getSettingOrder(key) {
 }
 
 function isModalSettingKey(key) {
-  return key === modelMultimodalFallbackSettingKey || key === modelCustomPricingSettingKey;
+  return key === 'reasoning_auto' || hotReloadSettingKeys.has(key);
+}
+
+function settingEffectMode(key) {
+  return hotReloadSettingKeys.has(key) ? 'hot' : 'restart';
+}
+
+// 设置项的可读名称：优先语言包描述，其次后端描述，最后才回退到 key。
+function settingLabel(key) {
+  const descKey = `settings.desc.${key}`;
+  const translated = t(descKey);
+  if (translated !== descKey) return translated;
+  return settingDefinitions.get(key)?.description || key;
 }
 
 function groupSettings(settings) {
@@ -1648,9 +1947,8 @@ function refreshSettingsTranslations() {
     const row = document.querySelector(`.setting-data-row[data-key="${setting.key}"]`);
     if (!row) continue;
     const description = row.querySelector('.setting-col-description');
-    const key = `settings.desc.${setting.key}`;
-    const translated = t(key);
-    description.textContent = translated !== key ? translated : setting.description;
+    const descriptionText = description.querySelector('.setting-description-text');
+    if (descriptionText) descriptionText.textContent = settingLabel(setting.key);
     description.dataset.mobileLabel = t('settings.configItem');
     row.querySelector('.setting-col-value').dataset.mobileLabel = t('settings.currentValue');
     row.querySelector('.setting-col-actions').dataset.mobileLabel = t('common.actions');
@@ -1658,17 +1956,34 @@ function refreshSettingsTranslations() {
   updateGlobalCooldownRulesSummary(document.getElementById(globalCooldownRulesSettingKey)?.value || '');
   updateMultimodalFallbackSummary(document.getElementById(modelMultimodalFallbackSettingKey)?.value || '');
   updateCustomPricingSummary(document.getElementById(modelCustomPricingSettingKey)?.value || '');
+  updateDirtyStatus();
 }
 
 async function loadSettings() {
+  const tbody = document.getElementById('settings-tbody');
   try {
     const data = await fetchDataWithAuth('/admin/settings');
     if (!Array.isArray(data)) throw new Error(t('settings.msg.invalidResponse'));
     renderSettings(data);
   } catch (err) {
     console.error('Failed to load settings:', err);
-    showError(t('settings.msg.loadFailed') + ': ' + err.message);
+    if (tbody) renderSettingsLoadError(tbody, err);
+    else showError(t('settings.msg.loadFailed') + ': ' + err.message);
   }
+}
+
+// 加载失败时在表格内给出原因与重试入口，重试通过事件委托重新调用 loadSettings。
+function renderSettingsLoadError(tbody, err) {
+  initSettingsEventDelegation();
+  tbody.innerHTML = `
+    <tr class="settings-load-error-row">
+      <td colspan="3">
+        <div class="settings-load-error" role="alert">
+          <span>${escapeHtml(t('settings.msg.loadFailed') + ': ' + (err?.message || ''))}</span>
+          <button type="button" class="btn btn-secondary" data-action="retry-load-settings">${escapeHtml(t('common.retry'))}</button>
+        </div>
+      </td>
+    </tr>`;
 }
 
 function renderSettings(settings) {
@@ -1686,13 +2001,8 @@ function renderSettings(settings) {
     if (!isModalSettingKey(s.key)) continue;
     const target = document.getElementById(s.key);
     if (target) target.value = displayValue;
-    const buttonID = s.key === modelMultimodalFallbackSettingKey
-      ? 'model-multimodal-fallback-btn'
-      : 'model-custom-pricing-btn';
-    const button = document.getElementById(buttonID);
-    if (button) button.disabled = s.editable === false;
     if (s.key === modelMultimodalFallbackSettingKey) updateMultimodalFallbackSummary(displayValue);
-    else updateCustomPricingSummary(displayValue);
+    else if (s.key === modelCustomPricingSettingKey) updateCustomPricingSummary(displayValue);
   }
 
   const groups = groupSettings(settings)
@@ -1703,22 +2013,16 @@ function renderSettings(settings) {
   for (const g of groups) {
     const groupRow = TemplateEngine.render('tpl-setting-group-row', {
       groupId: g.id,
-      groupName: g.name,
-      groupNoticeHtml: ''
+      groupName: g.name
     });
     if (groupRow) tbody.appendChild(groupRow);
 
     for (const s of g.settings) {
       const displayValue = settingValueForDisplay(s.key, s.value);
-      // 优先使用语言包中的描述，若没有则回退到后端返回的描述
-      const descKey = `settings.desc.${s.key}`;
-      const translatedDesc = t(descKey);
-      const description = (translatedDesc !== descKey) ? translatedDesc : s.description;
       const row = TemplateEngine.render('tpl-setting-row', {
         key: s.key,
-        description: description,
-        inputHtml: renderInput({ ...s, value: displayValue }) + (s.key === 'auto_update_channel' ? renderSettingGroupNotice(g) : ''),
-        resetDisabledAttributes: settingDisabledAttributes(s),
+        description: settingLabel(s.key),
+        inputHtml: renderInput({ ...s, value: displayValue }),
         mobileLabelDescription: t('settings.configItem'),
         mobileLabelValue: t('settings.currentValue'),
         mobileLabelActions: t('common.actions')
@@ -1726,28 +2030,7 @@ function renderSettings(settings) {
       if (row) tbody.appendChild(row);
     }
   }
-}
-
-function renderSettingGroupNotice(group) {
-  const containerManaged = group.settings.some((setting) => (
-    setting.editable === false && setting.disabled_reason === containerImageManagedDisabledReason
-  ));
-  if (!containerManaged) return '';
-
-  return `
-    <div class="settings-group-notice" role="note">
-      <p data-i18n="settings.update.containerManaged">${escapeHtml(t('settings.update.containerManaged'))}</p>
-      <ul>
-        <li><span data-i18n="settings.update.stableImage">${escapeHtml(t('settings.update.stableImage'))}</span>: <code>ghcr.io/caidaoli/ccload:latest</code></li>
-        <li><span data-i18n="settings.update.betaImage">${escapeHtml(t('settings.update.betaImage'))}</span>: <code>ghcr.io/caidaoli/ccload:beta</code></li>
-      </ul>
-      <p data-i18n="settings.update.applyImage">${escapeHtml(t('settings.update.applyImage'))}</p>
-      <code class="settings-group-notice-command">docker compose pull &amp;&amp; docker compose up -d</code>
-    </div>`;
-}
-
-function settingDisabledAttributes(setting) {
-  return setting.editable === false ? 'disabled' : '';
+  updateDirtyStatus();
 }
 
 // 初始化事件委托（替代 inline onclick）
@@ -1758,14 +2041,15 @@ function initSettingsEventDelegation() {
 
   // 重置按钮点击
   tbody.addEventListener('click', (e) => {
+    const retryBtn = e.target.closest('[data-action="retry-load-settings"]');
+    if (retryBtn) {
+      retryBtn.disabled = true;
+      loadSettings();
+      return;
+    }
     const editGlobalRulesBtn = e.target.closest('[data-action="edit-global-cooldown-rules"]');
     if (editGlobalRulesBtn) {
       openGlobalCooldownRulesModal(editGlobalRulesBtn);
-      return;
-    }
-    const typeSafeTestBtn = e.target.closest('[data-action="test-typesafe"]');
-    if (typeSafeTestBtn) {
-      testTypeSafeKey(typeSafeTestBtn);
       return;
     }
     const updateCheckBtn = e.target.closest('[data-action="check-for-updates"]');
@@ -1779,11 +2063,13 @@ function initSettingsEventDelegation() {
     }
   });
 
-  // 输入变更
-  tbody.addEventListener('change', (e) => {
+  // 输入变更：input 让脏状态与错误标记随键入即时更新，change 覆盖 radio/select
+  const onEdit = (e) => {
     const input = e.target.closest('input, select');
     if (input) markChanged(input);
-  });
+  };
+  tbody.addEventListener('input', onEdit);
+  tbody.addEventListener('change', onEdit);
 }
 
 // 手动触发完整更新流程：检查、下载、校验、替换，之后由服务端等待空闲重启。
@@ -1808,36 +2094,12 @@ async function checkForUpdates(button) {
   }
 }
 
-async function testTypeSafeKey(button) {
-  if (button.disabled) return;
-  const input = document.getElementById('TypeSafe_api_key');
-  const key = input.value.trim();
-  const payload = key || input.dataset.clearSecret === 'true' ? { api_key: key } : {};
-  button.disabled = true;
-  button.setAttribute?.('aria-busy', 'true');
-  button.textContent = t('settings.typeSafeTest.testing');
-  try {
-    const result = await fetchDataWithAuth('/admin/typesafe/test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
-    });
-    if (result.valid) showSuccess(t('settings.typeSafeTest.success'));
-    else showError(t('settings.typeSafeTest.failed') + ': ' + result.message);
-  } catch (err) {
-    showError(t('settings.typeSafeTest.failed') + ': ' + err.message);
-  } finally {
-    button.disabled = false;
-    button.removeAttribute?.('aria-busy');
-    button.textContent = t('settings.typeSafeTest.test');
-  }
-}
-
 function renderInput(setting) {
   const safeKey = escapeHtml(setting.key);
   const safeValue = escapeHtml(setting.value);
   const placeholder = oauthBaseURLPlaceholders.get(setting.key);
   const placeholderAttribute = placeholder ? `placeholder="${escapeHtml(placeholder)}"` : '';
   const wideTextInput = setting.key === 'channel_test_content' || oauthBaseURLPlaceholders.has(setting.key);
-  const disabledAttributes = settingDisabledAttributes(setting);
   const numericAttributes = numericInputAttributes(setting);
 
   if (setting.key === globalCooldownRulesSettingKey) {
@@ -1845,7 +2107,7 @@ function renderInput(setting) {
     return `
       <div class="global-cooldown-rules-control">
         <input type="hidden" id="${safeKey}" value="${safeValue}">
-        <button type="button" class="btn btn-secondary" data-action="edit-global-cooldown-rules" data-i18n="settings.globalCooldownRules.edit" ${disabledAttributes}>
+        <button type="button" class="btn btn-secondary" data-action="edit-global-cooldown-rules" data-i18n="settings.globalCooldownRules.edit">
           ${escapeHtml(t('settings.globalCooldownRules.edit'))}
         </button>
         <span id="global-cooldown-rules-summary" class="global-cooldown-rules-summary">
@@ -1854,25 +2116,17 @@ function renderInput(setting) {
       </div>`;
   }
 
-  if (setting.key === 'TypeSafe_api_key') {
-    const hint = t(setting.configured ? 'settings.secretConfigured' : 'settings.secretUnconfigured');
-    return `<div class="settings-typesafe-control">
-      <input type="text" id="${safeKey}" value="" autocomplete="off" spellcheck="false" placeholder="${escapeHtml(hint)}" aria-label="TypeSafe API Key" class="settings-input settings-input--text" ${disabledAttributes}>
-      <button type="button" class="btn btn-secondary" data-action="test-typesafe" title="${escapeHtml(t('settings.typeSafeTest.hint'))}" ${disabledAttributes}>${escapeHtml(t('settings.typeSafeTest.test'))}</button>
-    </div>`;
-  }
-
   const selectOptions = selectSettingOptions.get(setting.key);
   if (selectOptions) {
     const optionsHtml = selectOptions.map(({ value, labelKey }) => (
       `<option value="${value}" data-i18n="${labelKey}" ${setting.value === value ? 'selected' : ''}>${escapeHtml(t(labelKey))}</option>`
     )).join('');
     const selectHtml = `
-      <select id="${safeKey}" class="settings-input settings-input--select" ${disabledAttributes}>
+      <select id="${safeKey}" class="settings-input settings-input--select">
         ${optionsHtml}
       </select>`;
-    // 更新渠道旁提供手动检测按钮；容器模式（editable=false）不渲染、后端同样拒绝。
-    if (setting.key === 'auto_update_channel' && setting.editable !== false) {
+    // 更新渠道旁提供手动检测按钮（容器版后端不返回该配置项）。
+    if (setting.key === 'auto_update_channel') {
       return `
         <div class="settings-update-channel-control">
           ${selectHtml}
@@ -1885,7 +2139,7 @@ function renderInput(setting) {
   }
 
   if (byteSettingKeys.has(setting.key)) {
-    return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${numericAttributes} ${disabledAttributes}>`;
+    return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${numericAttributes}>`;
   }
 
   switch (setting.value_type) {
@@ -1894,53 +2148,87 @@ function renderInput(setting) {
       return `
         <div class="settings-bool-group">
           <label class="settings-bool-option">
-            <input type="radio" name="${safeKey}" value="true" ${isTrue ? 'checked' : ''} ${disabledAttributes}> <span data-i18n="common.enable">${t('common.enable')}</span>
+            <input type="radio" name="${safeKey}" value="true" ${isTrue ? 'checked' : ''}> <span data-i18n="common.enable">${t('common.enable')}</span>
           </label>
           <label class="settings-bool-option">
-            <input type="radio" name="${safeKey}" value="false" ${!isTrue ? 'checked' : ''} ${disabledAttributes}> <span data-i18n="common.disable">${t('common.disable')}</span>
+            <input type="radio" name="${safeKey}" value="false" ${!isTrue ? 'checked' : ''}> <span data-i18n="common.disable">${t('common.disable')}</span>
           </label>
         </div>`;
     case 'int':
     case 'duration':
-      return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${numericAttributes} ${disabledAttributes}>`;
+      return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${numericAttributes}>`;
     case 'float':
-      return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${numericAttributes} ${disabledAttributes}>`;
+      return `<input type="number" id="${safeKey}" value="${safeValue}" class="settings-input settings-input--number" ${numericAttributes}>`;
     default:
-      return `<input type="text" id="${safeKey}" value="${safeValue}" ${placeholderAttribute} class="settings-input settings-input--text${wideTextInput ? ' settings-input--wide' : ''}" ${disabledAttributes}>`;
+      return `<input type="text" id="${safeKey}" value="${safeValue}" ${placeholderAttribute} class="settings-input settings-input--text${wideTextInput ? ' settings-input--wide' : ''}">`;
   }
 }
 
 function markChanged(input) {
-  input.removeAttribute?.('aria-invalid');
   const row = input.closest('tr');
   if (!row) return; // 常驻控制区（如多模态回退 hidden input）没有表格行可高亮
-  let key, currentValue;
+  const key = input.type === 'radio' ? input.name : input.id;
+  setSettingInvalid(key, false);
+  const control = getSettingControl(key);
 
-  if (input.type === 'radio') {
-    key = input.name;
-    const checkedRadio = row.querySelector(`input[name="${key}"]:checked`);
-    currentValue = checkedRadio ? checkedRadio.value : '';
-  } else {
-    key = input.id;
-    currentValue = input.value;
-  }
-
-  if (currentValue !== originalSettings[key] || (key === 'TypeSafe_api_key' && input.dataset.clearSecret === 'true')) {
+  if (control && isSettingChanged(key, control)) {
     row.style.background = 'rgba(59, 130, 246, 0.08)';
   } else {
     row.style.background = '';
   }
+  updateDirtyStatus();
+}
+
+// reasoning_auto 的值存放在 hidden input，错误标记与聚焦需落到可见的编辑器控件上。
+function reasoningAutoEditorControls() {
+  const editor = document.getElementById('reasoningAutoEditor');
+  return editor ? Array.from(editor.querySelectorAll('input, select')) : [];
 }
 
 function setSettingInvalid(key, invalid) {
   const control = getSettingControl(key);
   if (!control) return;
-  const inputs = control.radios ? Array.from(control.radios) : [control.input];
+  const editorControls = key === 'reasoning_auto' ? reasoningAutoEditorControls() : [];
+  const inputs = control.radios ? Array.from(control.radios) : [control.input, ...editorControls.filter(item => item !== control.input)];
   for (const input of inputs) {
     if (invalid) input.setAttribute?.('aria-invalid', 'true');
     else input.removeAttribute?.('aria-invalid');
+    input.classList?.toggle('is-invalid', invalid);
   }
-  if (invalid) control.input?.focus?.();
+}
+
+function focusSettingControl(key) {
+  const control = getSettingControl(key);
+  if (!control?.input) return;
+  control.row?.scrollIntoView?.({ behavior: 'smooth', block: 'center' });
+  if (key === 'reasoning_auto') openReasoningAutoModal(document.getElementById('reasoning-auto-btn'));
+  const target = key === 'reasoning_auto' ? reasoningAutoEditorControls().find(item => item.type !== 'hidden' && !item.disabled) : null;
+  (target || control.input).focus?.({ preventScroll: true });
+}
+
+function isSettingChanged(key, control) {
+  return control.value !== originalSettings[key];
+}
+
+function changedSettingKeys() {
+  return Object.keys(originalSettings).filter((key) => {
+    const control = getSettingControl(key);
+    return control ? isSettingChanged(key, control) : false;
+  });
+}
+
+function hasUnsavedSettings() {
+  return changedSettingKeys().length > 0;
+}
+
+function updateDirtyStatus() {
+  const status = document.getElementById('settings-dirty-status');
+  if (!status) return;
+  const count = changedSettingKeys().length;
+  status.textContent = count > 0
+    ? t('settings.savebar.dirty', { count })
+    : t('settings.savebar.clean');
+  status.dataset.dirty = count > 0 ? 'true' : 'false';
 }
 
 function getSettingControl(key) {
@@ -1986,11 +2274,6 @@ function setSettingControlValue(key, value) {
 }
 
 function syncSettingState(key, value) {
-  if (key === 'TypeSafe_api_key') {
-    const input = document.getElementById(key);
-    if (input) delete input.dataset.clearSecret;
-    value = '';
-  }
   const normalizedValue = settingValueForDisplay(key, value);
   const control = setSettingControlValue(key, value);
 
@@ -1998,51 +2281,74 @@ function syncSettingState(key, value) {
   if (control?.row) {
     control.row.style.background = '';
   }
+  updateDirtyStatus();
+}
+
+// 校验全部已改动设置，返回 { updates, invalid }；invalid 按页面顺序列出每个错误项。
+function collectSettingUpdates() {
+  const updates = {};
+  const invalid = [];
+
+  for (const key of changedSettingKeys()) {
+    const control = getSettingControl(key);
+    const setting = settingDefinitions.get(key);
+    const validationError = setting ? validateSettingInput(setting, control.value) : '';
+    if (validationError) {
+      invalid.push({ key, reason: validationError });
+      continue;
+    }
+    updates[key] = settingValueForStorage(key, control.value);
+  }
+
+  if (('cooldown_min_seconds' in updates || 'cooldown_max_seconds' in updates)
+    && !invalid.some(({ key }) => key === 'cooldown_min_seconds' || key === 'cooldown_max_seconds')) {
+    const minSeconds = Number(getSettingControl('cooldown_min_seconds')?.value);
+    const maxSeconds = Number(getSettingControl('cooldown_max_seconds')?.value);
+    if (minSeconds > maxSeconds) {
+      const reason = t('settings.msg.invalidCooldownBounds', {
+        min: settingLabel('cooldown_min_seconds'),
+        max: settingLabel('cooldown_max_seconds')
+      });
+      invalid.push({ key: 'cooldown_min_seconds', reason }, { key: 'cooldown_max_seconds', reason });
+    }
+  }
+  return { updates, invalid };
+}
+
+function reportInvalidSettings(invalid) {
+  for (const { key } of invalid) setSettingInvalid(key, true);
+  const details = invalid.map(({ key, reason }) => t('settings.msg.invalidValue', { name: settingLabel(key), reason }));
+  showError(details.length === 1
+    ? details[0]
+    : t('settings.msg.invalidValues', { count: details.length, details: details.join(t('settings.msg.detailSeparator')) }));
+  focusSettingControl(invalid[0].key);
 }
 
 async function saveAllSettings() {
-  // 收集所有变更
-  const updates = {};
-
-  for (const key of Object.keys(originalSettings)) {
-    const control = getSettingControl(key);
-    if (!control) continue;
-
-    const currentValue = control.value;
-    if (currentValue !== originalSettings[key] || (key === 'TypeSafe_api_key' && control.input.dataset.clearSecret === 'true')) {
-      const setting = settingDefinitions.get(key);
-      const validationError = setting ? validateSettingInput(setting, currentValue) : '';
-      if (validationError) {
-        setSettingInvalid(key, true);
-        showError(t('settings.msg.invalidValue', { key, reason: validationError }));
-        return;
-      }
-      setSettingInvalid(key, false);
-      updates[key] = settingValueForStorage(key, currentValue);
-    }
+  for (const key of Object.keys(originalSettings)) setSettingInvalid(key, false);
+  const { updates, invalid } = collectSettingUpdates();
+  if (invalid.length > 0) {
+    reportInvalidSettings(invalid);
+    return;
   }
 
-  if (Object.keys(updates).length === 0) {
+  const savedKeys = Object.keys(updates);
+  if (savedKeys.length === 0) {
     window.showNotification(t('settings.msg.noChanges'), 'info');
     return;
   }
 
-  if ('cooldown_min_seconds' in updates || 'cooldown_max_seconds' in updates) {
-    const minSeconds = Number(getSettingControl('cooldown_min_seconds')?.value);
-    const maxSeconds = Number(getSettingControl('cooldown_max_seconds')?.value);
-    if (minSeconds > maxSeconds) {
-      setSettingInvalid('cooldown_min_seconds', true);
-      setSettingInvalid('cooldown_max_seconds', true);
-      showError(t('settings.msg.invalidCooldownBounds'));
-      return;
-    }
-  }
-
-  if (!confirm(t('settings.msg.confirmSave'))) return;
+  const restartLabels = savedKeys.filter((key) => settingEffectMode(key) === 'restart').map(settingLabel);
+  const confirmed = await window.showConfirm({
+    title: t('settings.saveAll'),
+    message: t('settings.msg.confirmSave'),
+    confirmText: t('settings.saveAll')
+  });
+  if (!confirmed) return;
 
   // 使用批量更新接口（单次请求，事务保护）
   try {
-    const result = await fetchDataWithAuth('/admin/settings/batch', {
+    await fetchDataWithAuth('/admin/settings/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates)
@@ -2052,7 +2358,9 @@ async function saveAllSettings() {
       syncSettingState(key, value);
     }
 
-    showSuccess(result?.message || t('settings.msg.savedCount', { count: Object.keys(updates).length }));
+    showSuccess(restartLabels.length > 0
+      ? t('settings.msg.savedRestart', { count: savedKeys.length, names: restartLabels.join(t('settings.msg.listSeparator')) })
+      : t('settings.msg.savedHot', { count: savedKeys.length }));
   } catch (err) {
     console.error('保存异常:', err);
     showError(t('settings.msg.saveFailed') + ': ' + err.message);
@@ -2067,11 +2375,6 @@ function resetSetting(key) {
   }
 
   const control = setSettingControlValue(key, setting.default_value ?? '');
-  if (key === 'TypeSafe_api_key' && control?.input) {
-    control.input.dataset.clearSecret = 'true';
-    const enabled = setSettingControlValue('TypeSafe_enabled', 'false');
-    if (enabled?.input) markChanged(enabled.input);
-  }
   if (control?.input) markChanged(control.input);
 }
 
@@ -2081,6 +2384,7 @@ window.initPageBootstrap({
   topbarKey: 'settings',
   run: () => {
     bindSettingsPageActions();
+    window.guardUnsavedChanges?.(hasUnsavedSettings);
     loadSettings();
   }
 });

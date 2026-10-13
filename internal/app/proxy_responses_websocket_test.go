@@ -180,6 +180,7 @@ func waitForResponsesWebsocketAttachments(
 }
 
 func TestResponsesExecutionSessionPreferredChannelLifecycle(t *testing.T) {
+	t.Parallel()
 	store := newResponsesExecutionSessionStore(nil, 1024, 0)
 	defer store.close()
 
@@ -266,6 +267,7 @@ func readResponsesWebsocketUpgradeError(t testing.TB, response *http.Response) r
 }
 
 func TestResponsesWebsocketSessionCapacityPreservesStableReconnect(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	requests := make(chan []byte, 2)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +341,7 @@ func TestResponsesWebsocketSessionCapacityPreservesStableReconnect(t *testing.T)
 }
 
 func TestResponsesWebsocketTranscriptBudgetRejectsNewWorkWithoutEvictingStableSession(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -502,6 +505,7 @@ func TestResponsesWebsocketBridgeWriterRejectsInvalidJSON(t *testing.T) {
 // events must still fail once the collected transcript snapshot exceeds the
 // request-side transcript limit, instead of accumulating without bound.
 func TestResponsesWebsocketBridgeWriterCapsCollectedOutputBytes(t *testing.T) {
+	t.Parallel()
 	writer := newResponsesWebsocketBridgeWriter(newBridgeWriterTestConn(t), 0)
 
 	text := strings.Repeat("x", 512*1024)
@@ -525,6 +529,7 @@ func TestResponsesWebsocketBridgeWriterCapsCollectedOutputBytes(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketReaderDetachesClosedConnectionImmediately(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -571,6 +576,7 @@ func TestNativeCodexWebsocketReaderDetachesClosedConnectionImmediately(t *testin
 }
 
 func TestCodexWebsocketTargetChangesWithTransportConfiguration(t *testing.T) {
+	t.Parallel()
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {
 		t.Fatalf("build target request: %v", err)
@@ -597,6 +603,7 @@ func TestCodexWebsocketTargetChangesWithTransportConfiguration(t *testing.T) {
 }
 
 func TestResponsesWebsocketUpgradeAndRejectUnsupportedEvent(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("unsupported downstream event must not reach upstream")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -636,6 +643,7 @@ func TestResponsesWebsocketUpgradeAndRejectUnsupportedEvent(t *testing.T) {
 // upgrades and completes a turn exactly like the canonical /v1/responses
 // path. This mirrors CLIProxyAPI's codexDirect route group.
 func TestResponsesWebsocketAcceptsCodexDirectRouteAlias(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-alias\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
@@ -659,6 +667,7 @@ func TestResponsesWebsocketAcceptsCodexDirectRouteAlias(t *testing.T) {
 // path (/v1/codex/responses, baseUrl + "/codex/responses") upgrades and
 // completes a turn exactly like the canonical /v1/responses path.
 func TestResponsesWebsocketAcceptsV1CodexPath(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-v1codex\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
@@ -684,6 +693,7 @@ func TestResponsesWebsocketAcceptsV1CodexPath(t *testing.T) {
 // /backend-api/codex/responses. The upstream must see the canonical
 // /v1/responses path, not the alias.
 func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			t.Errorf("upstream method = %q, want POST", r.Method)
@@ -717,6 +727,7 @@ func TestCodexResponsePathsHTTPSSEFallback(t *testing.T) {
 }
 
 func TestResponsesGetWithoutWebsocketUpgradeDoesNotReachUpstream(t *testing.T) {
+	t.Parallel()
 	for _, path := range responsesWebsocketUpgradePaths {
 		t.Run(path, func(t *testing.T) {
 			var upstreamCalls atomic.Int32
@@ -744,6 +755,7 @@ func TestResponsesGetWithoutWebsocketUpgradeDoesNotReachUpstream(t *testing.T) {
 }
 
 func TestResponsesWebsocketRequiresAPIAuthentication(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -770,6 +782,7 @@ func TestResponsesWebsocketRequiresAPIAuthentication(t *testing.T) {
 }
 
 func TestResponsesWebsocketRejectsUnknownPreviousResponseOnNewSession(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -811,6 +824,7 @@ func TestResponsesWebsocketRejectsUnknownPreviousResponseOnNewSession(t *testing
 }
 
 func TestResponsesWebsocketRejectsStalePreviousResponse(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -861,6 +875,7 @@ func TestResponsesWebsocketRejectsStalePreviousResponse(t *testing.T) {
 }
 
 func TestResponsesWebsocketRejectsBinaryAndOversizedFrames(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("invalid websocket frame must not reach upstream")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -905,6 +920,7 @@ func TestResponsesWebsocketRejectsBinaryAndOversizedFrames(t *testing.T) {
 }
 
 func TestResponsesWebsocketIdleConnectionsDoNotConsumeTokenConcurrency(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -929,6 +945,7 @@ func TestResponsesWebsocketIdleConnectionsDoNotConsumeTokenConcurrency(t *testin
 }
 
 func TestResponsesWebsocketConnectionLimitRejectsIdleUpgrades(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -980,6 +997,7 @@ func TestResponsesWebsocketConnectionLimitRejectsIdleUpgrades(t *testing.T) {
 }
 
 func TestResponsesWebsocketGlobalConnectionLimitRejectsIdleUpgrades(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -1024,6 +1042,7 @@ func TestResponsesWebsocketGlobalConnectionLimitRejectsIdleUpgrades(t *testing.T
 }
 
 func TestResponsesWebsocketRevokedTokenClosesBeforeNextTurn(t *testing.T) {
+	t.Parallel()
 	upstreamCalls := atomic.Int32{}
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -1059,6 +1078,7 @@ func TestResponsesWebsocketRevokedTokenClosesBeforeNextTurn(t *testing.T) {
 }
 
 func TestResponsesWebsocketExpiredTokenClosesWhileIdle(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -1084,6 +1104,7 @@ func TestResponsesWebsocketExpiredTokenClosesWhileIdle(t *testing.T) {
 }
 
 func TestResponsesWebsocketClosesWhenServerShutsDown(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -1113,6 +1134,7 @@ func TestResponsesWebsocketClosesWhenServerShutsDown(t *testing.T) {
 }
 
 func TestResponsesWebsocketServerPingKeepsLongTurnAlive(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(180 * time.Millisecond)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1139,6 +1161,7 @@ func TestResponsesWebsocketServerPingKeepsLongTurnAlive(t *testing.T) {
 }
 
 func TestResponsesWebsocketClientDisconnectCancelsUpstreamTurn(t *testing.T) {
+	t.Parallel()
 	started := make(chan struct{})
 	canceled := make(chan struct{})
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1254,7 +1277,201 @@ func TestResponsesWebsocketNativeClientDisconnectStopsFailover(t *testing.T) {
 	}
 }
 
+func TestResponsesWebsocketInterruptForwardsToNativeUpstream(t *testing.T) {
+	t.Parallel()
+	interrupts := make(chan map[string]any, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade native upstream: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		var request map[string]any
+		if err := conn.ReadJSON(&request); err != nil {
+			t.Errorf("read first native request: %v", err)
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{"type": "response.created", "response": map[string]any{"id": "resp-native-1"}})
+		_ = conn.WriteJSON(map[string]any{"type": "response.output_text.delta", "delta": "partial"})
+		var interrupt map[string]any
+		if err := conn.ReadJSON(&interrupt); err != nil {
+			t.Errorf("read native interrupt: %v", err)
+			return
+		}
+		interrupts <- interrupt
+		_ = conn.WriteJSON(map[string]any{"type": "response.incomplete", "response": map[string]any{
+			"id": "resp-native-1", "status": "incomplete",
+			"incomplete_details": map[string]any{"reason": "interrupted"}, "output": []any{},
+		}})
+		if err := conn.ReadJSON(&request); err != nil {
+			t.Errorf("read second native request: %v", err)
+			return
+		}
+		_ = conn.WriteJSON(map[string]any{"type": "response.completed", "response": map[string]any{
+			"id": "resp-native-2", "output": []any{},
+			"usage": map[string]any{"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+		}})
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "native-codex", upstreamProtocol: "codex", websockets: true,
+		models: "gpt-test", apiKey: "sk-upstream", priority: 100,
+	}}, map[int]string{0: upstream.URL})
+	downstream := dialResponsesWebsocket(t, env.engine)
+	if err := downstream.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set downstream read deadline: %v", err)
+	}
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "long task"}},
+	}); err != nil {
+		t.Fatalf("write first turn: %v", err)
+	}
+	readWebsocketUntilType(t, downstream, "response.output_text.delta")
+	if err := downstream.WriteJSON(map[string]any{"type": "response.interrupt", "response_id": "resp-native-1"}); err != nil {
+		t.Fatalf("write interrupt: %v", err)
+	}
+	incomplete := readWebsocketUntilType(t, downstream, "response.incomplete")
+	response, _ := incomplete["response"].(map[string]any)
+	details, _ := response["incomplete_details"].(map[string]any)
+	if response["id"] != "resp-native-1" || details["reason"] != "interrupted" {
+		t.Fatalf("interrupt acknowledgement=%#v", incomplete)
+	}
+	select {
+	case interrupt := <-interrupts:
+		if interrupt["type"] != "response.interrupt" || interrupt["response_id"] != "resp-native-1" {
+			t.Fatalf("native upstream interrupt=%#v", interrupt)
+		}
+	default:
+		t.Fatal("interrupt was not forwarded to native upstream")
+	}
+
+	if err := downstream.WriteJSON(map[string]any{
+		"type": "response.create", "previous_response_id": "resp-native-1",
+		"input": []any{map[string]any{"role": "user", "content": "next"}},
+	}); err != nil {
+		t.Fatalf("write second turn: %v", err)
+	}
+	readWebsocketUntilType(t, downstream, "response.completed")
+}
+
+func TestResponsesWebsocketInterruptCancelsHTTPTurnLocally(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	canceled := make(chan struct{})
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) == 1 {
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n")
+			_, _ = io.WriteString(w, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
+			w.(http.Flusher).Flush()
+			select {
+			case <-r.Context().Done():
+				close(canceled)
+			case <-time.After(2 * time.Second):
+			}
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-2\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "codex-http", upstreamProtocol: "codex",
+		models: "gpt-test", apiKey: "sk-upstream", priority: 100,
+	}}, map[int]string{0: upstream.URL})
+	conn := dialResponsesWebsocket(t, env.engine)
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set websocket read deadline: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "long task"}},
+	}); err != nil {
+		t.Fatalf("write first turn: %v", err)
+	}
+	readWebsocketUntilType(t, conn, "response.output_text.delta")
+	if err := conn.WriteJSON(map[string]any{"type": "response.interrupt", "response_id": "resp-1"}); err != nil {
+		t.Fatalf("write interrupt: %v", err)
+	}
+	incomplete := readWebsocketUntilType(t, conn, "response.incomplete")
+	response, _ := incomplete["response"].(map[string]any)
+	details, _ := response["incomplete_details"].(map[string]any)
+	if response["id"] != "resp-1" || response["status"] != "incomplete" || details["reason"] != "interrupted" {
+		t.Fatalf("local interrupt event=%#v", incomplete)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("upstream HTTP request was not canceled by interrupt")
+	}
+	if entry := waitForProxyLog(t, env, "gpt-test"); entry.StatusCode != StatusClientClosedRequest {
+		t.Fatalf("interrupted turn status=%d, want %d (message=%q)", entry.StatusCode, StatusClientClosedRequest, entry.Message)
+	}
+
+	// 同一连接继续下一轮：渠道未冷却，previous_response_id 指向被中断的响应。
+	if err := conn.WriteJSON(map[string]any{
+		"type": "response.create", "previous_response_id": "resp-1",
+		"input": []any{map[string]any{"role": "user", "content": "next"}},
+	}); err != nil {
+		t.Fatalf("write second turn: %v", err)
+	}
+	readWebsocketUntilType(t, conn, "response.completed")
+	if calls.Load() != 2 {
+		t.Fatalf("upstream calls=%d, want 2", calls.Load())
+	}
+}
+
+func TestResponsesWebsocketInterruptWithoutActiveTurn(t *testing.T) {
+	t.Parallel()
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "codex-http", upstreamProtocol: "codex",
+		models: "gpt-test", apiKey: "sk-upstream", priority: 100,
+	}}, map[int]string{0: upstream.URL})
+	conn := dialResponsesWebsocket(t, env.engine)
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set websocket read deadline: %v", err)
+	}
+
+	if err := conn.WriteJSON(map[string]any{"type": "response.interrupt"}); err != nil {
+		t.Fatalf("write interrupt: %v", err)
+	}
+	var event struct {
+		Type   string `json:"type"`
+		Status int    `json:"status"`
+		Error  struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := conn.ReadJSON(&event); err != nil {
+		t.Fatalf("read websocket error event: %v", err)
+	}
+	if event.Type != "error" || event.Status != http.StatusBadRequest || event.Error.Type != "invalid_request_error" {
+		t.Fatalf("missing response_id event=%+v", event)
+	}
+
+	// 轮次已结束后到达的合法中断静默忽略，不能把错误归到客户端下一轮。
+	if err := conn.WriteJSON(map[string]any{"type": "response.interrupt", "response_id": "resp-0"}); err != nil {
+		t.Fatalf("write late interrupt: %v", err)
+	}
+	if err := conn.WriteJSON(map[string]any{
+		"type": "response.create", "model": "gpt-test",
+		"input": []any{map[string]any{"role": "user", "content": "hi"}},
+	}); err != nil {
+		t.Fatalf("write turn: %v", err)
+	}
+	readWebsocketUntilType(t, conn, "response.completed")
+}
+
 func TestResponsesWebsocketBridgesHTTPSSEResponse(t *testing.T) {
+	t.Parallel()
 	requestSeen := make(chan map[string]any, 1)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -1327,6 +1544,7 @@ func TestResponsesWebsocketBridgesHTTPSSEResponse(t *testing.T) {
 }
 
 func TestResponsesWebsocketMultimodalFallbackUsesFullTranscript(t *testing.T) {
+	t.Parallel()
 	upstreamModels := make(chan string, 3)
 	var turn int
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1412,6 +1630,7 @@ func TestResponsesWebsocketMultimodalFallbackUsesFullTranscript(t *testing.T) {
 }
 
 func TestResponsesWebsocketXAIOAuthAlwaysBridgesHTTPSSEResponse(t *testing.T) {
+	t.Parallel()
 	var websocketCalls atomic.Int32
 	var httpCalls atomic.Int32
 	requestSeen := make(chan map[string]any, 2)
@@ -1509,6 +1728,7 @@ func TestResponsesWebsocketXAIOAuthAlwaysBridgesHTTPSSEResponse(t *testing.T) {
 }
 
 func TestResponsesWebsocketExpandsIncrementalTurnForHTTPUpstream(t *testing.T) {
+	t.Parallel()
 	requests := make(chan map[string]any, 2)
 	var turn int
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1592,6 +1812,7 @@ func TestResponsesWebsocketExpandsIncrementalTurnForHTTPUpstream(t *testing.T) {
 }
 
 func TestResponsesWebsocketBoundsAccumulatedTranscript(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -1644,6 +1865,7 @@ func TestResponsesWebsocketBoundsAccumulatedTranscript(t *testing.T) {
 }
 
 func TestResponsesWebsocketCompactionReplacesStaleTranscript(t *testing.T) {
+	t.Parallel()
 	requests := make(chan map[string]any, 2)
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1697,6 +1919,7 @@ func TestResponsesWebsocketCompactionReplacesStaleTranscript(t *testing.T) {
 }
 
 func TestResponsesCompactEndpointStaysOnHTTP(t *testing.T) {
+	t.Parallel()
 	requestSeen := make(chan []byte, 1)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
@@ -1732,6 +1955,7 @@ func TestResponsesCompactEndpointStaysOnHTTP(t *testing.T) {
 }
 
 func TestBuildCodexWebsocketRequestBodySanitizesInputItemIDs(t *testing.T) {
+	t.Parallel()
 	longReasoningID := "rs_" + strings.Repeat("r", 64)
 	longCallID := strings.Repeat("call-item-", 8)
 	body := []byte(`{"model":"gpt-test","input":[` +
@@ -1765,6 +1989,7 @@ func TestBuildCodexWebsocketRequestBodySanitizesInputItemIDs(t *testing.T) {
 }
 
 func TestResponsesReplayDropsOnlyNonPortableReasoning(t *testing.T) {
+	t.Parallel()
 	body := []byte(`{"model":"gpt-test","input":[` +
 		`{"type":"reasoning","id":"rs_drop","summary":[]},` +
 		`{"type":"reasoning","id":"rs_keep","encrypted_content":"opaque","summary":[]},` +
@@ -1790,6 +2015,7 @@ func TestResponsesReplayDropsOnlyNonPortableReasoning(t *testing.T) {
 }
 
 func TestResponsesWebsocketCarriesCompletedToolCallIntoNextTurn(t *testing.T) {
+	t.Parallel()
 	requests := make(chan map[string]any, 2)
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1866,6 +2092,7 @@ func TestResponsesWebsocketCarriesCompletedToolCallIntoNextTurn(t *testing.T) {
 }
 
 func TestResponsesWebsocketDropsIncompleteCollectedToolCall(t *testing.T) {
+	t.Parallel()
 	requests := make(chan []byte, 2)
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1915,6 +2142,7 @@ func TestResponsesWebsocketDropsIncompleteCollectedToolCall(t *testing.T) {
 }
 
 func TestResponsesWebsocketReconcilesCompletedToolCallBeforeReplay(t *testing.T) {
+	t.Parallel()
 	requests := make(chan []byte, 2)
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1970,6 +2198,7 @@ func TestResponsesWebsocketReconcilesCompletedToolCallBeforeReplay(t *testing.T)
 // not make the client's matching tool output an orphan. The next turn must
 // replay the delivered call and its output without executing the tool again.
 func TestResponsesWebsocketRecoversCompletedToolCallAfterInterruptedStream(t *testing.T) {
+	t.Parallel()
 	requests := make(chan []byte, 3)
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2089,6 +2318,7 @@ func TestResponsesWebsocketRecoversCompletedToolCallAfterInterruptedStream(t *te
 // client-retryable server_error and close 1011 so Codex can reconnect and
 // replay the turn instead of treating it as an invalid_request_error.
 func TestResponsesWebsocketClientRetryAfterInterruptedTextStream(t *testing.T) {
+	t.Parallel()
 	requests := make(chan []byte, 3)
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2192,6 +2422,7 @@ func TestResponsesWebsocketClientRetryAfterInterruptedTextStream(t *testing.T) {
 // carry a status (usage_limit_reached + 429) stays a verbatim terminal answer;
 // TestNativeCodexWebsocketUsageLimitCoolsWithoutReplay guards that side.
 func TestResponsesWebsocketClientRetryAfterUpstreamErrorEvent(t *testing.T) {
+	t.Parallel()
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -2255,6 +2486,7 @@ func TestResponsesWebsocketClientRetryAfterUpstreamErrorEvent(t *testing.T) {
 }
 
 func TestResponsesWebsocketSwitchesChannelAfterMetadataThenBareError(t *testing.T) {
+	t.Parallel()
 	var firstCalls atomic.Int32
 	upstream1 := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -2318,6 +2550,7 @@ func TestResponsesWebsocketSwitchesChannelAfterMetadataThenBareError(t *testing.
 // — it terminates nothing — and the turn must end with 502
 // upstream_stream_interrupted plus close 1011.
 func TestResponsesWebsocketClientRetryAfterCommittedUpstreamErrorEvent(t *testing.T) {
+	t.Parallel()
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -2386,6 +2619,7 @@ func TestResponsesWebsocketClientRetryAfterCommittedUpstreamErrorEvent(t *testin
 // its existing path: it IS a Responses turn terminator, so it reaches the client
 // verbatim and the connection stays open for the next turn.
 func TestResponsesWebsocketForwardsUpstreamResponseFailed(t *testing.T) {
+	t.Parallel()
 	var turn atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -2436,6 +2670,7 @@ func TestResponsesWebsocketForwardsUpstreamResponseFailed(t *testing.T) {
 // model-level failure — cooling down and retrying an unrelated channel for
 // what is actually a malformed client request. Rejecting locally avoids that.
 func TestResponsesWebsocketRejectsOrphanToolCallOutputOnInitialRequest(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -2482,6 +2717,7 @@ func TestResponsesWebsocketRejectsOrphanToolCallOutputOnInitialRequest(t *testin
 // merged transcript still contains an orphan output that must be rejected
 // before it reaches upstream.
 func TestResponsesWebsocketRejectsOrphanToolCallOutputOnIncrementalTurn(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -2532,6 +2768,7 @@ func TestResponsesWebsocketRejectsOrphanToolCallOutputOnIncrementalTurn(t *testi
 }
 
 func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
+	t.Parallel()
 	var handshakes atomic.Int32
 	requests := make(chan map[string]any, 2)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -2689,6 +2926,7 @@ func TestNativeCodexWebsocketReusesUpstreamConnection(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T) {
+	t.Parallel()
 	const clientUserAgent = "codex-tui/0.153.4 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (codex-tui; 0.153.4)"
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	requestBody := make(chan map[string]any, 1)
@@ -2788,6 +3026,7 @@ func TestNativeCodexWebsocketUsesOAuthCredentialAndIdentityHeaders(t *testing.T)
 }
 
 func TestNativeCodexWebsocketScopesTurnStateToIssuingAccount(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	echoed := make(chan gjson.Result, 4)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2914,6 +3153,7 @@ func TestNativeCodexWebsocketScopesTurnStateToIssuingAccount(t *testing.T) {
 // HTTP 客户端只从响应头取 turn-state；HTTP 续写重拨原生 WS 时，握手头里的令牌
 // 必须经合成响应带标签回到 HTTP 响应头。
 func TestHTTPResponsesTagsNativeCodexWebsocketHandshakeTurnState(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	completeTurn := func(conn *websocket.Conn, responseID string) {
 		if _, _, err := conn.ReadMessage(); err != nil {
@@ -3008,6 +3248,7 @@ func TestHTTPResponsesTagsNativeCodexWebsocketHandshakeTurnState(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketWindowHeaderRules(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		action string
@@ -3072,6 +3313,7 @@ func TestNativeCodexWebsocketWindowHeaderRules(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketUsageLimitCoolsWithoutReplay(t *testing.T) {
+	t.Parallel()
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3148,6 +3390,7 @@ func TestNativeCodexWebsocketUsageLimitCoolsWithoutReplay(t *testing.T) {
 }
 
 func TestResponsesWebsocketReconnectResumesExplicitExecutionSession(t *testing.T) {
+	t.Parallel()
 	var handshakes atomic.Int32
 	requests := make(chan map[string]any, 2)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -3225,6 +3468,7 @@ func TestResponsesWebsocketReconnectResumesExplicitExecutionSession(t *testing.T
 }
 
 func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.T) {
+	t.Parallel()
 	organizations := make(chan string, 2)
 	var handshakes atomic.Int32
 	var responses atomic.Int32
@@ -3304,6 +3548,7 @@ func TestNativeCodexWebsocketIgnoresUnapprovedHandshakeHeaderChanges(t *testing.
 }
 
 func TestResponsesWebsocketCacheHintsDoNotShareTranscript(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		bodyHint     map[string]any
@@ -3381,6 +3626,7 @@ func TestResponsesWebsocketCacheHintsDoNotShareTranscript(t *testing.T) {
 }
 
 func TestResponsesWebsocketExecutionSessionExpires(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -3448,6 +3694,7 @@ func TestResponsesWebsocketExecutionSessionExpires(t *testing.T) {
 }
 
 func TestResponsesWebsocketClosesDetachedUpstreamButKeepsTranscript(t *testing.T) {
+	t.Parallel()
 	upstreamClosed := make(chan struct{}, 1)
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -3523,6 +3770,7 @@ func TestResponsesWebsocketClosesDetachedUpstreamButKeepsTranscript(t *testing.T
 }
 
 func TestResponsesWebsocketExecutionSessionIsolatedByAuthSubject(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
@@ -3569,6 +3817,7 @@ func TestResponsesWebsocketExecutionSessionIsolatedByAuthSubject(t *testing.T) {
 }
 
 func TestResponsesWebsocketThreadIsolationPreservesParentContinuation(t *testing.T) {
+	t.Parallel()
 	var calls atomic.Int32
 	requests := make(chan []byte, 3)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3643,6 +3892,7 @@ func TestResponsesWebsocketThreadIsolationPreservesParentContinuation(t *testing
 }
 
 func TestHTTPResponsesWithoutExistingUpstreamWebsocketUsesHTTP(t *testing.T) {
+	t.Parallel()
 	var websocketCalls atomic.Int32
 	var httpCalls atomic.Int32
 	requests := make(chan map[string]any, 2)
@@ -3695,6 +3945,7 @@ func TestHTTPResponsesWithoutExistingUpstreamWebsocketUsesHTTP(t *testing.T) {
 }
 
 func TestHTTPResponsesCacheHintsDoNotSerializeIndependentRequests(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		body       map[string]any
@@ -3797,6 +4048,7 @@ func TestHTTPResponsesCacheHintsDoNotSerializeIndependentRequests(t *testing.T) 
 }
 
 func TestCodexHTTPGatewayChainPreservesThreadConcurrency(t *testing.T) {
+	t.Parallel()
 	type executionIdentity struct {
 		sessionID string
 		threadID  string
@@ -3894,6 +4146,7 @@ func TestCodexHTTPGatewayChainPreservesThreadConcurrency(t *testing.T) {
 }
 
 func TestHTTPResponsesReportsActiveUpstreamLifecycle(t *testing.T) {
+	t.Parallel()
 	requestArrived := make(chan struct{})
 	allowResponse := make(chan struct{}, 1)
 	responseFlushed := make(chan struct{})
@@ -3988,6 +4241,7 @@ func TestHTTPResponsesReportsActiveUpstreamLifecycle(t *testing.T) {
 }
 
 func TestResponsesExecutionSessionSwitchesFromDownstreamWebsocketToHTTP(t *testing.T) {
+	t.Parallel()
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4048,6 +4302,7 @@ func TestResponsesExecutionSessionSwitchesFromDownstreamWebsocketToHTTP(t *testi
 }
 
 func TestHTTPResponsesUnknownPreviousIDStaysOnHTTP(t *testing.T) {
+	t.Parallel()
 	var websocketCalls atomic.Int32
 	var httpCalls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4084,6 +4339,7 @@ func TestHTTPResponsesUnknownPreviousIDStaysOnHTTP(t *testing.T) {
 }
 
 func TestHTTPResponsesWithoutPreviousIDReplacesSessionTranscript(t *testing.T) {
+	t.Parallel()
 	var websocketCalls atomic.Int32
 	var httpCalls atomic.Int32
 	requests := make(chan map[string]any, 2)
@@ -4133,6 +4389,7 @@ func TestHTTPResponsesWithoutPreviousIDReplacesSessionTranscript(t *testing.T) {
 }
 
 func TestResponsesWebsocketClosesNativeConnectionWhenTransportSwitchesToHTTP(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstreamClosed := make(chan struct{}, 1)
 	httpBodies := make(chan []byte, 1)
@@ -4218,6 +4475,7 @@ func TestResponsesWebsocketClosesNativeConnectionWhenTransportSwitchesToHTTP(t *
 }
 
 func TestNativeCodexWebsocketPinsChannelKeyAndURLAcrossTurns(t *testing.T) {
+	t.Parallel()
 	authorizations := make(chan string, 2)
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -4301,6 +4559,7 @@ func TestNativeCodexWebsocketPinsChannelKeyAndURLAcrossTurns(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketRetainsAffinityAfterPhysicalDisconnect(t *testing.T) {
+	t.Parallel()
 	authorizations := make(chan string, 2)
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -4393,6 +4652,7 @@ func TestNativeCodexWebsocketRetainsAffinityAfterPhysicalDisconnect(t *testing.T
 }
 
 func TestNativeCodexWebsocketProcessesPingBetweenTurns(t *testing.T) {
+	t.Parallel()
 	pongReceived := make(chan bool, 1)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4462,6 +4722,7 @@ func TestNativeCodexWebsocketProcessesPingBetweenTurns(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketSendsPingBetweenTurns(t *testing.T) {
+	t.Parallel()
 	pingReceived := make(chan struct{}, 1)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4552,6 +4813,7 @@ func TestNativeCodexWebsocketSendsPingBetweenTurns(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketBackpressuresFullReadQueue(t *testing.T) {
+	t.Parallel()
 	upstreamClosed := make(chan bool, 1)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4617,6 +4879,7 @@ func TestNativeCodexWebsocketBackpressuresFullReadQueue(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketCancelUnblocksFullReadQueue(t *testing.T) {
+	t.Parallel()
 	started := make(chan struct{})
 	upstreamStopped := make(chan struct{})
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -4703,6 +4966,7 @@ func TestNativeCodexWebsocketCancelUnblocksFullReadQueue(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketAcceptsAllSuccessfulTerminalEvents(t *testing.T) {
+	t.Parallel()
 	for _, testCase := range []struct {
 		name           string
 		terminalType   string
@@ -4778,6 +5042,7 @@ func TestNativeCodexWebsocketAcceptsAllSuccessfulTerminalEvents(t *testing.T) {
 }
 
 func TestResponsesWebsocketHandlesHTTPPrewarmLocally(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		upstreamCalls.Add(1)
@@ -4819,6 +5084,7 @@ func TestResponsesWebsocketHandlesHTTPPrewarmLocally(t *testing.T) {
 }
 
 func TestResponsesWebsocketOnlyHandlesInitialHTTPPrewarmLocally(t *testing.T) {
+	t.Parallel()
 	var upstreamCalls atomic.Int32
 	requestBodies := make(chan []byte, 1)
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4867,6 +5133,7 @@ func TestResponsesWebsocketOnlyHandlesInitialHTTPPrewarmLocally(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketPreservesFinalFailedEvent(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -4927,6 +5194,7 @@ func TestNativeCodexWebsocketPreservesFinalFailedEvent(t *testing.T) {
 }
 
 func TestResponsesWebsocketMapsFinal429To503ForCodexRetry(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -4967,6 +5235,7 @@ func TestResponsesWebsocketMapsFinal429To503ForCodexRetry(t *testing.T) {
 }
 
 func TestResponsesWebsocketDoesNotMapFinal429ForOtherResponsesClients(t *testing.T) {
+	t.Parallel()
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -5006,10 +5275,12 @@ func TestResponsesWebsocketDoesNotMapFinal429ForOtherResponsesClients(t *testing
 }
 
 func TestNativeCodexWebsocketReadFailureReconnectsWithReplay(t *testing.T) {
+	t.Parallel()
 	testNativeCodexWebsocketReadFailureReconnectsWithReplay(t, "EOF", nil)
 }
 
 func TestNativeCodexWebsocketInterruptedEventReconnectsWithReplayBeforeSemanticOutput(t *testing.T) {
+	t.Parallel()
 	testNativeCodexWebsocketReadFailureReconnectsWithReplay(
 		t,
 		responsesWebsocketInterruptedCode,
@@ -5030,6 +5301,7 @@ func TestNativeCodexWebsocketInterruptedEventReconnectsWithReplayBeforeSemanticO
 // keepalive 是保活帧而非语义输出：上游发完 keepalive 就断连时，
 // 只要还没出现真实内容就必须允许同目标重连重放。
 func TestNativeCodexWebsocketKeepaliveReconnectsWithReplayBeforeSemanticOutput(t *testing.T) {
+	t.Parallel()
 	testNativeCodexWebsocketReadFailureReconnectsWithReplay(
 		t,
 		"keepalive",
@@ -5332,6 +5604,7 @@ func TestNativeCodexWebsocketMaxAgeDrainsActiveTurnBeforeClosing(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketPriorityKeyFailbackReplaysBetweenTurns(t *testing.T) {
+	t.Parallel()
 	var phase atomic.Int32
 	var keyAHandshakes, keyBHandshakes atomic.Int32
 	keyAReplay := make(chan map[string]any, 1)
@@ -5467,6 +5740,7 @@ func TestNativeCodexWebsocketPriorityKeyFailbackReplaysBetweenTurns(t *testing.T
 }
 
 func TestNativeCodexWebsocketModelRowBindingAndSwitchReplaysTranscript(t *testing.T) {
+	t.Parallel()
 	var handshakes, responses atomic.Int32
 	requests := make(chan map[string]any, 3)
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -5557,6 +5831,7 @@ func TestNativeCodexWebsocketModelRowBindingAndSwitchReplaysTranscript(t *testin
 }
 
 func TestNativeCodexWebsocketPreviousResponseNotFoundReconnectsWithReplay(t *testing.T) {
+	t.Parallel()
 	requests := make(chan map[string]any, 3)
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -5674,6 +5949,7 @@ func TestNativeCodexWebsocketPreviousResponseNotFoundReconnectsWithReplay(t *tes
 }
 
 func TestNativeCodexWebsocketMissingStoredInputItemReconnectsWithStrippedReplay(t *testing.T) {
+	t.Parallel()
 	const missingID = "rs_item_813dd000e22bc4aa5ed48884"
 	requests := make(chan []byte, 2)
 	var handshakes atomic.Int32
@@ -5771,6 +6047,7 @@ func TestNativeCodexWebsocketMissingStoredInputItemReconnectsWithStrippedReplay(
 }
 
 func TestNativeCodexWebsocketInvalidEncryptedContentReconnectsWithStrippedReplay(t *testing.T) {
+	t.Parallel()
 	requests := make(chan []byte, 2)
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -5875,6 +6152,7 @@ func TestNativeCodexWebsocketInvalidEncryptedContentReconnectsWithStrippedReplay
 }
 
 func TestNativeCodexWebsocketFailsOverToAnotherWebsocketAfterReconnectExhausted(t *testing.T) {
+	t.Parallel()
 	var primaryHandshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5949,6 +6227,7 @@ func TestNativeCodexWebsocketFailsOverToAnotherWebsocketAfterReconnectExhausted(
 }
 
 func TestResponsesWebsocketFailsOverBeforeSemanticOutput(t *testing.T) {
+	t.Parallel()
 	var primaryCalls atomic.Int32
 	var fallbackCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -5987,6 +6266,7 @@ func TestResponsesWebsocketFailsOverBeforeSemanticOutput(t *testing.T) {
 }
 
 func TestResponsesWebsocketRetryableErrorReplaysTranscriptToNativeFallback(t *testing.T) {
+	t.Parallel()
 	var primaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		call := primaryCalls.Add(1)
@@ -6361,6 +6641,7 @@ func TestNativeCodexWebsocketEOFHandshakeFallsBackToSameChannelHTTP(t *testing.T
 }
 
 func TestNativeCodexWebsocketReconnectRejectionFallsBackToSameChannelHTTP(t *testing.T) {
+	t.Parallel()
 	var websocketHandshakes atomic.Int32
 	var httpCalls atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -6434,6 +6715,7 @@ func TestNativeCodexWebsocketReconnectRejectionFallsBackToSameChannelHTTP(t *tes
 }
 
 func TestNativeCodexWebsocketMessageTooBigDoesNotFailOver(t *testing.T) {
+	t.Parallel()
 	var primaryHandshakes atomic.Int32
 	var fallbackCalls atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -6490,6 +6772,7 @@ func TestNativeCodexWebsocketMessageTooBigDoesNotFailOver(t *testing.T) {
 }
 
 func TestNativeCodexWebsocketMessageTooBigAfterOutputClosesDownstream(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -6545,6 +6828,7 @@ func TestNativeCodexWebsocketMessageTooBigAfterOutputClosesDownstream(t *testing
 }
 
 func TestNativeCodexWebsocketUsesChannelHTTPProxy(t *testing.T) {
+	t.Parallel()
 	var proxyCalls atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6633,6 +6917,7 @@ func TestNativeCodexWebsocketUsesChannelHTTPProxy(t *testing.T) {
 }
 
 func TestResponsesWebsocketDoesNotFailOverAfterSemanticOutput(t *testing.T) {
+	t.Parallel()
 	var fallbackCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -6931,6 +7216,7 @@ func testNativeCodexWebsocketTransportFailureRequiresTwoPhysicalConnectionsBefor
 }
 
 func TestNativeCodexWebsocketCompletedTurnResetsAbnormalCloseStreak(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var primaryHandshakes atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -7119,6 +7405,7 @@ func TestResponsesWebsocketPersistsUsageCostAndRedactedDebugContent(t *testing.T
 }
 
 func TestResponsesWebsocketExposesActualUpstreamTransportWhileActive(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	requestStarted := make(chan struct{}, 1)
 	releaseResponse := make(chan struct{})
@@ -7201,6 +7488,7 @@ func TestResponsesWebsocketExposesActualUpstreamTransportWhileActive(t *testing.
 }
 
 func TestResponsesWebsocketOperatorAbortPingOnlyUpstream(t *testing.T) {
+	t.Parallel()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	requestStarted := make(chan struct{}, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -7272,6 +7560,7 @@ func TestResponsesWebsocketOperatorAbortPingOnlyUpstream(t *testing.T) {
 }
 
 func TestResponsesWebsocketOperatorAbortPingOnlyHTTPUpstream(t *testing.T) {
+	t.Parallel()
 	for _, withBackup := range []bool{false, true} {
 		t.Run(fmt.Sprintf("nativeBackup=%v", withBackup), func(t *testing.T) {
 			requestStarted := make(chan struct{}, 1)
@@ -7434,6 +7723,7 @@ func TestNativeCodexWebsocketFailedTerminalPersistsUsageWithoutCost(t *testing.T
 }
 
 func TestResponsesWebsocketAntigravityCreditsFallback(t *testing.T) {
+	t.Parallel()
 	for _, initialEmpty := range []bool{false, true} {
 		t.Run(strconv.FormatBool(initialEmpty), func(t *testing.T) {
 			var standard, paid atomic.Int32
@@ -7492,6 +7782,7 @@ func TestResponsesWebsocketAntigravityCreditsFallback(t *testing.T) {
 }
 
 func TestResponsesWebsocketBridgesToGeminiHTTPChannel(t *testing.T) {
+	t.Parallel()
 	requestSeen := make(chan struct {
 		path string
 		body []byte
@@ -7571,6 +7862,7 @@ func TestResponsesWebsocketBridgesToGeminiHTTPChannel(t *testing.T) {
 // 的 SSE error `[input[N].status]`）。发送边界必须在首帧就剥离，而不是撞 400 再靠重试
 // 自愈——自愈多一个 RTT，且在响应已提交时根本不可用。
 func TestNativeCodexWebsocketStripsInputItemStatusBeforeFirstSend(t *testing.T) {
+	t.Parallel()
 	requests := make(chan []byte, 1)
 	var handshakes atomic.Int32
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
@@ -7639,4 +7931,266 @@ func TestNativeCodexWebsocketStripsInputItemStatusBeforeFirstSend(t *testing.T) 
 	if got := handshakes.Load(); got != 1 {
 		t.Fatalf("status strip must succeed on the first send, handshakes=%d", got)
 	}
+}
+
+func TestResponsesWebsocketTokenRPMSharedAdmissionAndRecovery(t *testing.T) {
+	requests := make(chan []byte, 10)
+	var calls atomic.Int32
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		requests <- body
+		n := calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-rpm-%d\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\ndata: [DONE]\n\n", n)
+	}))
+	var failedCalls atomic.Int32
+	failed := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		failedCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"type":"server_error","message":"retry elsewhere"}}`)
+	}))
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "rpm-failover", upstreamProtocol: "codex", models: "gpt-test", priority: 100},
+		{name: "rpm-success", upstreamProtocol: "codex", models: "gpt-test", priority: 90},
+	}, map[int]string{0: failed.URL, 1: upstream.URL})
+	token := &model.AuthToken{Description: "shared RPM", RPMLimit: 2, MaxConcurrency: 1}
+	webSession := createDashboardSession(t, env, "rpm-shared", token)
+	clock := &channelRPMFakeClock{now: time.Unix(1000, 0)}
+	env.server.authService.tokenRPMLimiter = newRPMLimiter(clock.Now)
+	conn := dialResponsesWebsocketWithToken(t, env.engine, "rpm-shared")
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	writeTurn := func(kind, content string) {
+		t.Helper()
+		if err := conn.WriteJSON(map[string]any{"type": kind, "model": "gpt-test", "input": []any{map[string]any{"role": "user", "content": content}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Token concurrency rejection releases the acquired global/session slots
+	// without consuming any of the two available RPM admissions.
+	releaseToken, _, _, acquired := env.server.authService.acquireTokenConcurrencySlot(token.Token)
+	if !acquired {
+		t.Fatal("could not hold token concurrency slot")
+	}
+	writeTurn("response.create", "concurrency-rejected")
+	var concurrencyEvent struct {
+		Type  string `json:"type"`
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	errConcurrency := conn.ReadJSON(&concurrencyEvent)
+	releaseToken()
+	if errConcurrency != nil || concurrencyEvent.Type != "error" || concurrencyEvent.Error.Code != "upstream_error" {
+		t.Fatalf("concurrency event=%+v err=%v", concurrencyEvent, errConcurrency)
+	}
+	writeTurn("response.create", "first")
+	readWebsocketUntilType(t, conn, "response.completed")
+	<-requests
+	if failedCalls.Load() != 1 || calls.Load() != 1 {
+		t.Fatalf("failover calls=%d successful=%d", failedCalls.Load(), calls.Load())
+	}
+	// Control frames and the upgrade itself cannot consume a generation slot.
+	if err := conn.WriteControl(websocket.PingMessage, []byte("rpm"), time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "response.interrupt", "response_id": "resp-rpm-1"}); err != nil {
+		t.Fatal(err)
+	}
+	// A control-event reply is the public boundary showing the previous turn's
+	// completion bookkeeping and concurrency release have finished.
+	if err := conn.WriteJSON(map[string]any{"type": "rpm-test-barrier"}); err != nil {
+		t.Fatal(err)
+	}
+	var controlEvent struct {
+		Type  string `json:"type"`
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := conn.ReadJSON(&controlEvent); err != nil {
+		t.Fatal(err)
+	}
+	if controlEvent.Type != "error" || controlEvent.Error.Code != "unsupported_event" {
+		t.Fatalf("control event=%+v", controlEvent)
+	}
+	w := doProxyRequest(t, env.engine, "/v1/responses", map[string]any{"model": "gpt-test", "input": "http", "stream": true}, map[string]string{"Authorization": "Bearer rpm-shared"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("HTTP status=%d body=%s", w.Code, w.Body.String())
+	}
+	<-requests
+	w = doProxyRequest(t, env.engine, "/dashboard/v1/responses", map[string]any{"model": "gpt-test", "input": "web"}, map[string]string{"Authorization": "Bearer " + webSession})
+	assertTokenRPMHTTPError(t, w, 60)
+	writeTurn("response.append", "rejected")
+	assertTokenRPMWebsocketError(t, conn, 60)
+	setLimit := func(limit int) {
+		token.RPMLimit = limit
+		if err := env.store.UpdateAuthToken(context.Background(), token); err != nil {
+			t.Fatal(err)
+		}
+		if err := env.server.authService.ReloadAuthTokens(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setLimit(3)
+	writeTurn("response.append", "accepted")
+	readWebsocketUntilType(t, conn, "response.completed")
+	var body struct {
+		Input []struct {
+			Content string `json:"content"`
+		} `json:"input"`
+	}
+	mustUnmarshalJSON(t, <-requests, &body)
+	if len(body.Input) != 2 || body.Input[0].Content != "first" || body.Input[1].Content != "accepted" {
+		t.Fatalf("rejected turn polluted transcript: %+v", body.Input)
+	}
+	setLimit(1)
+	writeTurn("response.create", "limited")
+	assertTokenRPMWebsocketError(t, conn, 60)
+	clock.Advance(time.Minute)
+	writeTurn("response.append", "recovered")
+	readWebsocketUntilType(t, conn, "response.completed")
+	<-requests
+	setLimit(0)
+	writeTurn("response.append", "unlimited")
+	readWebsocketUntilType(t, conn, "response.completed")
+	<-requests
+	setLimit(1)
+	writeTurn("response.append", "still-limited")
+	assertTokenRPMWebsocketError(t, conn, 60)
+	// A different token has its own quota despite sharing upstream channels.
+	other := &model.AuthToken{Token: model.HashToken("rpm-other"), Description: "other", IsActive: true, RPMLimit: 1}
+	if err := env.store.CreateAuthToken(context.Background(), other); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.server.authService.ReloadAuthTokens(); err != nil {
+		t.Fatal(err)
+	}
+	w = doProxyRequest(t, env.engine, "/v1/responses", map[string]any{"model": "gpt-test", "input": "other", "stream": true}, map[string]string{"Authorization": "Bearer rpm-other"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("different token status=%d body=%s", w.Code, w.Body.String())
+	}
+	<-requests
+}
+
+func assertTokenRPMWebsocketError(t testing.TB, conn *websocket.Conn, seconds int) {
+	t.Helper()
+	var event struct {
+		Type   string `json:"type"`
+		Status int    `json:"status"`
+		Error  struct {
+			Type, Code, Message string
+			RetryAfter          int `json:"retry_after"`
+		} `json:"error"`
+	}
+	if err := conn.ReadJSON(&event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "error" || event.Status != 429 || event.Error.Type != "rate_limit_error" || event.Error.Code != "token_rpm_exceeded" || event.Error.RetryAfter != seconds || event.Error.Message == "" {
+		t.Fatalf("RPM event=%+v", event)
+	}
+}
+
+func TestResponsesWebsocketTokenRPMInterruptWhileWaitingForGlobalSlot(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-wait\",\"output\":[]}}\n\ndata: [DONE]\n\n")
+	}))
+	env := setupProxyTestEnvWithSettings(t, []testChannel{{name: "rpm-wait", upstreamProtocol: "codex", models: "gpt-test"}}, map[int]string{0: upstream.URL}, map[string]string{"max_concurrency": "1"})
+	token := &model.AuthToken{Token: model.HashToken("rpm-wait"), Description: "wait", IsActive: true, RPMLimit: 1}
+	if err := env.store.CreateAuthToken(context.Background(), token); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.server.authService.ReloadAuthTokens(); err != nil {
+		t.Fatal(err)
+	}
+	release, err := env.server.acquireConcurrencySlotForContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+	conn := dialResponsesWebsocketWithToken(t, env.engine, "rpm-wait")
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "gpt-test", "input": "waiting"}); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the turn owns its execution-session slot; the global slot is
+	// still occupied, so no upstream request can have begun.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		active := false
+		env.server.responsesExecutionSessions.mu.Lock()
+		for _, session := range env.server.responsesExecutionSessions.sessions {
+			active = active || len(session.turn) > 0
+		}
+		env.server.responsesExecutionSessions.mu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("turn did not reach global slot wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "response.interrupt", "response_id": "resp-waiting"}); err != nil {
+		t.Fatal(err)
+	}
+	event := readWebsocketUntilType(t, conn, "response.incomplete")
+	response := event["response"].(map[string]any)
+	if response["id"] != "resp-waiting" {
+		t.Fatalf("interrupt response=%+v", response)
+	}
+	release()
+	release = nil
+	if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "gpt-test", "input": "after-wait"}); err != nil {
+		t.Fatal(err)
+	}
+	readWebsocketUntilType(t, conn, "response.completed")
+}
+
+func TestResponsesWebsocketTokenRPMAdmittedLocalFailureCounts(t *testing.T) {
+	env := setupProxyTestEnv(t, nil, nil)
+	token := &model.AuthToken{Token: model.HashToken("rpm-failed-turn"), Description: "failed turn", IsActive: true, RPMLimit: 1}
+	if err := env.store.CreateAuthToken(context.Background(), token); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.server.authService.ReloadAuthTokens(); err != nil {
+		t.Fatal(err)
+	}
+	clock := &channelRPMFakeClock{now: time.Unix(1000, 0)}
+	env.server.authService.tokenRPMLimiter = newRPMLimiter(clock.Now)
+	conn := dialResponsesWebsocketWithToken(t, env.engine, "rpm-failed-turn")
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "response.create", "input": "missing model"}); err != nil {
+		t.Fatal(err)
+	}
+	var event struct {
+		Type  string `json:"type"`
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := conn.ReadJSON(&event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Type != "error" || event.Error.Code != "invalid_request" {
+		t.Fatalf("invalid turn event=%+v", event)
+	}
+	if err := conn.WriteJSON(map[string]any{"type": "response.create", "model": "gpt-test", "input": "next"}); err != nil {
+		t.Fatal(err)
+	}
+	assertTokenRPMWebsocketError(t, conn, 60)
 }

@@ -1,9 +1,9 @@
 # CLIProxyAPI translator provenance
 
 - Repository: `https://github.com/caidaoli/CLIProxyAPI`
-- Module source path: `github.com/router-for-me/CLIProxyAPI/v7`
-- Last synchronized commit: `21d26a07a39316f94c6ebc370a92222bca89aaac` (`fork/v8.97.0`)
-- Synchronized at: `2026-09-25`
+- Module source path: `github.com/router-for-me/CLIProxyAPI/v8`
+- Last synchronized commit: `f0f13cfda531da02a077748512f78a07679efd08` (`fork/v11.2.0`)
+- Synchronized at: `2026-10-12`
 
 This directory is maintained by one atomic synchronization operation. It currently
 contains the four-protocol conversion core. Allowlisted provider-specific pure
@@ -21,6 +21,178 @@ verification compares the previous immutable commit with the commit above and
 fails on every unclassified or unstamped core change. The manifest deliberately
 does not carry a second commit or date; the previous commit is anchored to the
 version of this file stored in Git `HEAD` before the synchronization edits.
+
+## Synchronization adaptations (2026-10-12)
+
+The core and the allowlisted Antigravity adapter share the target above.
+Adopted: Gemini schema cleanup that strips the unsupported `dependentRequired`,
+`dependentSchemas`, and `dependencies` keywords; Chat-to-Codex shortening of over-length `call_id`s, applied identically to the
+assistant call and its tool result; and Antigravity Chat stream deltas that omit
+`tool_calls: null`.
+
+Upstream's Claude-target Responses `tool_search` translation is imported with
+its process switch (`SetClientToolSearchEnabled`, default off) and request pin
+(`WithClientToolSearch`). ccLoad never enables the switch, so the default wire
+output equals upstream's `dev_golden.json` fixture, and the Registry still
+rejects `tool_search_call`/`tool_search_output` input for the Anthropic and
+Gemini targets. ccLoad's native non-stream path, which converts a Claude message
+JSON directly instead of replaying SSE, follows the same switch. The
+`RequestEnvelope` entry point is SDK code and stays excluded, so
+`TestToolSearchPinnedContextWinsOverSwitch` is recorded as `skip-test`; the
+unmapped-item counter feeds the excluded runtime logger and is dropped.
+
+## Synchronization adaptations (2026-10-09)
+
+The core and the allowlisted Antigravity adapter share the target above.
+Adopted: request converters that return `([]byte, error)` together with
+`common.UserTurnDrops` / `UnsupportedPartError`, so a user turn emptied by
+unsendable parts is refused instead of being sent empty; OpenAI-to-Claude
+streams that defer `message_delta`/`message_stop` from the `finish_reason`
+chunk to the trailing usage-only chunk or `[DONE]`, keeping authoritative
+cache usage; Claude-to-OpenAI base64 documents as data-URL `file` parts; and the
+Gemini-to-Claude response carrier thinking blocks and refusal `stop_reason`.
+
+ccLoad boundaries: `builtin/cliproxy_adapter.go` and the Antigravity wire return
+converter errors, which the Registry wraps as `RequestTranslationError` (no
+cooldown; protocol fallback continues and ends in HTTP 400 when no candidate can
+represent the request). The Responses-to-Codex normalizer never reports an
+unsendable part, so its error is ignored. Upstream's `...WithError` Responses-to-
+Chat wrapper is gone; ccLoad's tool-search validation is folded into the
+exported converter.
+
+Retained local wire shapes: Claude-to-Codex keeps any image URL, `file_id`, and
+non-PDF `file_data` inputs; Claude-to-Gemini and Chat-to-Gemini send remote image
+URLs as `fileData` (`image/*`) and Claude document URL/`file_id` as `fileData`;
+Responses-to-Gemini forwards `input_file.file_id` as `fileData`; Responses-to-Chat
+forwards `file_id` and `file_url`; Claude-to-OpenAI documents map URL to
+`file_url`, file source to `file_id`, and `title` to `filename`. Gemini-to-Claude
+keeps the client model override and emits `message_stop` on the finish chunk.
+Upstream user-turn tests that treated those references as unsendable use a
+reference-less part instead, Gemini field assertions follow ccLoad's camelCase
+output, and `TestConvertClaudeRequestToGemini_ImageURLAndRedactedThinkingStaySkipped`
+is recorded as `skip-test`. The local test helper `requestEnvelope` stands in for
+the excluded SDK envelope.
+
+## Synchronization adaptations (2026-10-04)
+
+The core and the allowlisted Antigravity adapter share the target above.
+Adopted: Antigravity Claude 5.5 double-layer CAQS signature validation and
+replay gating, the shared synthetic `signaturetest` envelope, the local shell
+tool for OpenAI Responses, Codex URL citation annotations in Chat output,
+Claude Responses request fixes, Gemini Responses usage/terminal handling, and
+the target model catalog.
+
+The Gemini-to-Responses converter now waits for usage or `[DONE]` after a
+`finishReason`. Gemini has no `[DONE]` on the wire; upstream's executor feeds
+one at EOF, and ccLoad's application boundary now synthesizes the same
+terminator for Gemini upstreams with Responses clients when the source stream
+is semantically complete (Zed's Gemini relay does the same on `stream_ended`).
+Gemini-to-Claude is not fed a synthetic `[DONE]`: it drops `finishReason` on
+`[DONE]` and would report `MAX_TOKENS` as `end_turn`.
+
+The ported `pause_turn` buffered test calls the non-stream converter directly.
+ccLoad's production non-stream path first runs `NormalizeAnthropicResponse`,
+which rejects `server_tool_use` / `web_search_tool_result` blocks, so
+non-stream Claude server-tool responses remain unsupported; streaming is
+unaffected.
+
+Upstream's `common/claude_native_response.go` (native Claude JSON replayed as
+SSE) is excluded. ccLoad keeps its direct native JSON converters, which emit
+one output item per Claude block and preserve structured reasoning, usage
+details and `apply_patch` identity; the ported native-response test uses a
+single text block accordingly. The Codex request converter keeps preserving the
+client `include` list, so the two upstream include-normalization tests are
+recorded as `skip-test`. Antigravity in-stream error frames, multi-line
+payloads and post-terminal client cancellation are handled at ccLoad's wire
+boundary rather than by the excluded executor.
+
+## Synchronization adaptations (2026-10-02)
+
+The four-protocol core and every allowlisted Antigravity adapter share the
+explicit target above. The pure `internal/client/codex/apply-patch` helpers are
+mapped to `applypatch/`; the shared input decoder, event builders and Responses
+bridge are mapped to `common/`. No upstream client runtime, executor, plugin,
+configuration system, or Interactions wire support is imported.
+
+Custom `apply_patch` declarations now retain their grammar while describing the
+JSON input wrapper required by function-tool upstreams. Claude no longer drops
+the tool. Responses output restores custom-tool identity, preserves patch
+whitespace and Unicode, emits decoded input deltas, and rejects invalid argument
+envelopes and conflicting identity/snapshot evidence. Antigravity reuses the
+Gemini converter and carries its matching provider contract test. Ordinary
+same-name functions retain their original identity and behavior.
+
+ccLoad's Registry/builtin and application boundaries consume tool input errors
+and finalize converter state at EOF. When the upstream already carried its
+semantic terminal (for example an OpenAI `finish_reason` without `[DONE]`),
+ccLoad synthesizes the terminator first so finalization only rejects truly
+truncated patch-enabled streams; transport errors keep their original error.
+Failure chunks
+are delivered before returning conversion errors, and a completed upstream
+cannot erase a conversion failure. Existing upstream errors take precedence
+over missing-terminator checks. HTTP, Antigravity, Cursor and Zed paths retain
+their cancellation and error behavior; parsed usage is preserved even when
+non-stream response translation fails. Native same-protocol passthrough and
+the client model catalog's disabled `apply_patch_tool_type` remain unchanged.
+
+The Codex-to-Chat converter also carries a local correction to the target:
+input.done, output_item.done and response.completed snapshots complete any
+unstreamed patch suffix. Conflicting snapshots and a missing source terminator
+are reported through the same tool-error boundary instead of returning a
+truncated successful function call. Native Claude JSON remains supported with
+the new custom-tool validation; cache accounting, terminal SSE events, client
+tool_search, and namespace restoration retain ccLoad's existing contracts.
+The Chat-to-Codex request and Codex-to-Chat response converters also accept
+OpenAI Chat's nested custom tools (`{"type":"custom","custom":{...}}`) as a
+local correction. Declarations, grammar formats and tool_choice are flattened
+to the Responses shape. Calls to those tools return as native Chat
+`type:"custom"` tool_calls with raw input.
+Flat custom declarations keep the function-envelope behavior.
+
+Other adopted changes include self-terminating shared SSE frames, Claude tool
+name collision handling and thinking replay separation, explicit Claude effort
+preservation, empty Codex function-history arguments normalized to `{}`, and the
+target model catalog. The locally added Antigravity model entry remains intact.
+Gemini diagnostic logging remains excluded; its new log-only tests, the opaque
+Responses output digest, and two allocation/literal-description tests are
+explicitly recorded in the manifest. The runtime thinking-policy test remains
+excluded with its implementation. The license and upstream attribution are unchanged.
+
+## Synchronization adaptations (2026-09-30)
+
+Core sources remain the four-protocol trees and shared helpers under
+`internal/translator/{claude,codex,gemini,openai,common}`, plus the allowlisted
+`internal/{signature,thinking,util,misc}` sources and embedded model catalog.
+They are synchronized under `internal/protocol/cliproxy`; Antigravity's source
+and destination directories are recorded in the provider section below.
+The upstream module changed from `/v7` to `/v8`; all local imports remain under
+`ccLoad/internal/protocol/cliproxy`, with no runtime module dependency.
+
+Chat Completions-to-Codex now normalizes trimmed, case-insensitive `fast` and
+`priority` service tiers to `priority`, preserves `ultrafast`, and omits other
+values. Claude requests targeting Antigravity Claude models now isolate tool
+results immediately after their model call turn, combine parallel result turns,
+and move intervening text/reminders after those results. Gemini model targets
+retain their existing merge behavior. The shared split helper and public model
+predicates are imported with their tests; `util/claude_model.go` is no longer
+excluded as a runtime helper because the provider converter directly uses its
+pure model classification. The existing HTTP provider contract tests cover the
+different Claude/Gemini ordering rules.
+
+Antigravity Responses summary visibility still belongs to ccLoad's application
+boundary. Upstream's `thinking.ExtractSummaryConfig`/`ApplySummaryConfig` changes
+are not imported into the pure provider; the synchronized summary test retains
+the local no-injection contract for explicit auto/null/none/legacy summary
+values as well as effort-only input. Existing signature, usage/cache, SSE,
+request-validation, and same-protocol passthrough contracts remain intact.
+
+The new `thinking/configuration_update.go` helpers are used only by the excluded
+runtime `thinking/apply.go` policy. No mapped converter moved field injection to
+that layer. The model catalog's new `support_configuration_update` flags are
+copied as source data but are not consumed by ccLoad's static loader; this sync
+does not enable the upstream runtime policy. Authentication, dynamic registries,
+executors, caches, logging, Interactions, and runtime-only tests remain excluded.
+The upstream license and attribution are unchanged.
 
 ## Synchronization adaptations (2026-09-25)
 
@@ -60,7 +232,7 @@ runtime-only dynamic capability veto test is explicitly excluded in the manifest
 provider isolation is checked through generic versus dedicated search requests. Grounding and citation behavior is tested through public converter
 outputs rather than private merge helpers. The new search test file follows its
 upstream source; previously backported duplicate tests were consolidated into it.
-Antigravity keeps app-selected dedicated search routing and request-driven
+Antigravity keeps app-selected search models and request-driven
 thinking visibility. Claude usage/cache accounting and stream termination fixes
 remain local contracts. Codex Responses Lite HTTP/WS header recognition stays
 excluded because it is only used by upstream runtime executors and handlers.
@@ -87,29 +259,30 @@ Antigravity is the first eligible provider adapter:
 - Local destination: `internal/protocol/cliproxy/providers/antigravity`
 - Snapshot status: synchronized at shared commit
 - Excluded: dynamic `init.go` registration, noop/allocation tests, runtime cache/logging services, executors, auth, Interactions, and the two Claude request/response suites coupled to those runtime services
-- Pure provider test files synchronized: 8; ccLoad HTTP wire contracts cover request, non-stream response, and stream response for Claude, Codex, Gemini, and OpenAI clients
+- Pure provider test files synchronized: 12; ccLoad HTTP wire contracts cover request, non-stream response, and stream response for Claude, Codex, Gemini, and OpenAI clients
 
 ## Synchronized tests
 
-The core snapshot includes 71 `_test.go` files from the same commit as the
+The core snapshot includes 102 `_test.go` files from the same commit as the
 production sources:
 
-- `claude/gemini`: 2
-- `claude/openai/chat-completions`: 3
-- `claude/openai/responses`: 8
-- `codex/claude`: 4
+- `applypatch`: 1
+- `claude/gemini`: 3
+- `claude/openai/chat-completions`: 6
+- `claude/openai/responses`: 15
+- `codex/claude`: 5
 - `codex/gemini`: 2
-- `codex/openai/chat-completions`: 2
+- `codex/openai/chat-completions`: 3
 - `codex/openai/responses`: 2
-- `common`: 10
-- `gemini/claude`: 3
-- `gemini/openai/chat-completions`: 4
-- `gemini/openai/responses`: 4
-- `openai/claude`: 3
+- `common`: 15
+- `gemini/claude`: 4
+- `gemini/openai/chat-completions`: 7
+- `gemini/openai/responses`: 8
+- `openai/claude`: 4
 - `openai/gemini`: 2
 - `openai/openai/responses`: 8
-- `signature`: 8
-- `util`: 6
+- `signature`: 10
+- `util`: 7
 
 Tests for excluded packages are not copied. Performance-only benchmarks are
 also excluded: the translator-wide benchmark requires the excluded dynamic
@@ -125,7 +298,7 @@ length check do not define converter behavior. JSON parsing, nested schema
 cleanup, and malformed/low-entropy signature rejection remain covered.
 The `thinking` package keeps only the pure
 conversion sources (`convert.go`, `suffix.go`, `text.go`, `types.go`); upstream's
-runtime thinking application (`apply.go`, `strip.go`, `summary.go`,
+runtime thinking application (`apply.go`, `configuration_update.go`, `strip.go`, `summary.go`,
 `validate.go`, `errors.go`, `provider/`) and its tests stay excluded, as does
 the upstream SDK translator Registry and its summary test. The OpenAI-to-OpenAI
 Chat Completions no-op converter and its post-`[DONE]` tests are excluded because
@@ -302,7 +475,10 @@ documented adaptations:
   `models.json` may still include a top-level kimi catalog; ccLoad's
   `modelCatalog` does not deserialize that key, so Lookup never sees those
   models. Generic API-key channels remain model-agnostic and retain Kimi
-  pricing and wire-format compatibility.
+  pricing and wire-format compatibility. The ccLoad-local
+  `LookupThinkingLevels` reads every top-level catalog (including kimi, xai,
+  meta and gemini-cli) for automatic reasoning levels only; translators keep
+  using Lookup.
 - `fork/v8.65.0` also rewrites Gemini function-call pairing validation to use
   short-circuiting `gjson.ForEach`; ccLoad carries that pure control-flow update
   while preserving its local `ccLoad/internal/protocol/cliproxy/util` import and

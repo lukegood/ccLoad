@@ -47,15 +47,6 @@ func (b *TableBuilder) Index(name, columns string) *TableBuilder {
 	return b
 }
 
-// UniqueIndex 添加唯一索引定义。
-func (b *TableBuilder) UniqueIndex(name, columns string) *TableBuilder {
-	b.indexes = append(b.indexes, IndexDef{
-		Name: name,
-		SQL:  fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s(%s)", name, b.name, columns),
-	})
-	return b
-}
-
 // BuildMySQL 生成MySQL DDL
 func (b *TableBuilder) BuildMySQL() string {
 	sql := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n\t%s\n) ;",
@@ -79,7 +70,7 @@ func (b *TableBuilder) BuildSQLite() string {
 
 // mysqlToSQLite 类型转换（MySQL → SQLite）
 func mysqlToSQLite(mysqlCol string) string {
-	col := mysqlCol
+	col := strings.ReplaceAll(mysqlCol, " CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", "")
 
 	// 特殊模式先处理（避免部分匹配）
 	col = strings.ReplaceAll(col, "INT PRIMARY KEY AUTO_INCREMENT", "INTEGER PRIMARY KEY AUTOINCREMENT")
@@ -118,6 +109,7 @@ func (b *TableBuilder) BuildPostgres() string {
 // mysqlToPostgres 类型转换（MySQL → PostgreSQL）
 func mysqlToPostgres(mysqlCol string) string {
 	col := strings.TrimSpace(mysqlCol)
+	col = strings.ReplaceAll(col, " CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", "")
 
 	// 行内 UNIQUE KEY 定义 → 表级 UNIQUE 约束
 	if strings.HasPrefix(strings.ToUpper(col), "UNIQUE KEY") {

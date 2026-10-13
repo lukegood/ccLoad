@@ -68,7 +68,7 @@ func (s *SQLStore) GetHealthTimeline(ctx context.Context, params model.HealthTim
 			SUM(COALESCE(cache_creation_input_tokens, 0)) AS cache_creation_tokens,
 			SUM(COALESCE(cost, 0.0)) AS total_cost,
 			SUM(COALESCE(cost, 0.0) * COALESCE(cost_multiplier, 1)) AS effective_cost
-		FROM logs
+		FROM logs` + s.logsRangeIndexHint(logsTimeRangeIndex, params.Filter) + `
 	`
 
 	qb := NewQueryBuilder(baseQuery).
@@ -254,6 +254,15 @@ func (s *SQLStore) queryRowTx(ctx context.Context, tx *sql.Tx, query string, arg
 // queryTx 在事务中查多行（自动 rebind）
 func (s *SQLStore) queryTx(ctx context.Context, tx *sql.Tx, query string, args ...any) (*sql.Rows, error) {
 	return tx.QueryContext(ctx, s.q(query), normalizeSQLArgs(args)...)
+}
+
+// sqlQueryer allows the same ledger query to run inside or outside a transaction.
+type sqlQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func (s *SQLStore) queryWith(ctx context.Context, queryer sqlQueryer, query string, args ...any) (*sql.Rows, error) {
+	return queryer.QueryContext(ctx, s.q(query), normalizeSQLArgs(args)...)
 }
 
 // prepareTx 在事务中预处理（自动 rebind）

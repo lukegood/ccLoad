@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"slices"
@@ -33,8 +34,7 @@ func (s *failAPIKeyAllowedModelsStore) UpdateAPIKeyModelScopes(context.Context, 
 func setupAdminTestServer(t *testing.T) (*Server, storage.Store, func()) {
 	t.Helper()
 
-	tmpDB := t.TempDir() + "/admin_crud_test.db"
-	store, err := storage.CreateSQLiteStore(tmpDB)
+	store, err := storage.CreateSQLiteStore(":memory:")
 	if err != nil {
 		t.Fatalf("创建测试数据库失败: %v", err)
 	}
@@ -306,6 +306,77 @@ func TestHandleListChannelsExactAndFuzzyFilters(t *testing.T) {
 				t.Fatalf("names=%v, want %v", gotNames, tt.wantNames)
 			}
 		})
+	}
+}
+
+func TestHandleListChannelsSortsBeforePagination(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	fixtures := []struct {
+		name     string
+		priority int
+		enabled  bool
+	}{
+		{"charlie", 30, true},
+		{"alpha", 10, false},
+		{"delta", 20, true},
+		{"bravo", 20, false},
+	}
+	for _, fixture := range fixtures {
+		if _, err := store.CreateConfig(ctx, &model.Config{
+			Name:         fixture.name,
+			URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+			Priority:     fixture.priority,
+			ModelEntries: []model.ModelEntry{{Model: "m"}},
+			Enabled:      fixture.enabled,
+		}); err != nil {
+			t.Fatalf("CreateConfig(%s) failed: %v", fixture.name, err)
+		}
+	}
+
+	listNames := func(t *testing.T, query string) []string {
+		t.Helper()
+		var names []string
+		for offset := 0; offset < len(fixtures); offset += 2 {
+			c, w := newTestContext(t, newRequest(http.MethodGet, fmt.Sprintf("/admin/channels?%s&limit=2&offset=%d", query, offset), nil))
+			server.handleListChannels(c)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			for _, item := range mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes()).Data {
+				names = append(names, item.Name)
+			}
+		}
+		return names
+	}
+
+	tests := []struct {
+		query string
+		want  []string
+	}{
+		{"", []string{"charlie", "bravo", "delta", "alpha"}},
+		{"sort=priority&order=asc", []string{"alpha", "bravo", "delta", "charlie"}},
+		{"sort=name", []string{"alpha", "bravo", "charlie", "delta"}},
+		{"sort=name&order=desc", []string{"delta", "charlie", "bravo", "alpha"}},
+		{"sort=enabled", []string{"charlie", "delta", "bravo", "alpha"}},
+		{"sort=enabled&order=asc", []string{"bravo", "alpha", "charlie", "delta"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			if got := listNames(t, tt.query); !slices.Equal(got, tt.want) {
+				t.Fatalf("names=%v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	for _, query := range []string{"sort=models", "sort=name&order=up"} {
+		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels?"+query, nil))
+		server.handleListChannels(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status=%d, want 400 body=%s", query, w.Code, w.Body.String())
+		}
 	}
 }
 
@@ -962,11 +1033,16 @@ func TestHandleGetChannelIncludesActiveModelCooldowns(t *testing.T) {
 	}
 }
 
-func TestHandleChannelModelStatsReturnsTodayStatsForRequestedChannel(t *testing.T) {
+func TestHandleChannelEditorModelStatsCoverTodayForRequestedChannel(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
 	ctx := context.Background()
+	server.urlSelector = NewURLSelector()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(ctx); err != nil {
+		t.Fatalf("加载系统设置失败: %v", err)
+	}
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "model-stats-channel",
 		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
@@ -1037,19 +1113,24 @@ func TestHandleChannelModelStatsReturnsTodayStatsForRequestedChannel(t *testing.
 		}
 	}
 
-	path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/model-stats"
+	path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/editor"
 	c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
 	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
-	server.HandleChannelModelStats(c)
+	server.HandleChannelEditor(c)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
 	}
 
-	resp := mustParseAPIResponse[[]ChannelModelStats](t, w.Body.Bytes())
-	if len(resp.Data) != 1 {
-		t.Fatalf("stats=%v, want one model", resp.Data)
+	resp := mustParseAPIResponse[struct {
+		ModelStats struct {
+			Items []ChannelModelStats `json:"items"`
+		} `json:"model_stats"`
+	}](t, w.Body.Bytes())
+	items := resp.Data.ModelStats.Items
+	if len(items) != 1 {
+		t.Fatalf("stats=%v, want one model", items)
 	}
-	got := resp.Data[0]
+	got := items[0]
 	if got.Model != "external-model" || got.Success != 2 || got.Error != 1 || got.Total != 3 {
 		t.Fatalf("stats=%+v, want model=external-model success=2 error=1 total=3", got)
 	}
@@ -2641,18 +2722,6 @@ func TestChannelRequestValidate(t *testing.T) {
 			expectNormalize: "https://api.com/v1/messages#",
 		},
 		{
-			name: "URL以#结尾不再依赖协议处理配置",
-			req: ChannelRequest{
-				Name:     "Test",
-				APIKey:   "sk-test",
-				URLs:     model.ChannelURLs{{URL: "https://api.com/v1/messages", Exact: true}},
-				Priority: 100,
-				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
-			},
-			wantError:       false,
-			expectNormalize: "https://api.com/v1/messages#",
-		},
-		{
 			name: "URL包含/api路径（允许）",
 			req: ChannelRequest{
 				Name:     "Test",
@@ -2866,5 +2935,108 @@ func TestHandleCreateChannelRejectsInvalidKeyPriority(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("priority=%v: status=%d body=%s", priority, w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestHandleUpdateChannelOAuthQuotaPassthrough(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{Name: "quota", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true, OAuthQuotaPassthrough: true, ModelEntries: []model.ModelEntry{{Model: "gpt-5"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		field string
+		want  bool
+	}{{"", true}, {`,"oauth_quota_passthrough":false`, false}, {`,"oauth_quota_passthrough":true`, true}} {
+		body := fmt.Sprintf(`{"name":"quota","api_key":"sk-quota","urls":[{"url":"https://example.com"}],"enabled":true,"models":[{"model":"gpt-5"}]%s}`, tc.field)
+		c, w := newTestContext(t, newRequest(http.MethodPut, fmt.Sprintf("/admin/channels/%d", cfg.ID), strings.NewReader(body)))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(cfg.ID, 10)}}
+		server.handleUpdateChannel(c, cfg.ID)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+		}
+		updated, err := store.GetConfig(ctx, cfg.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if updated.OAuthQuotaPassthrough != tc.want {
+			t.Fatalf("passthrough=%v want %v", updated.OAuthQuotaPassthrough, tc.want)
+		}
+		editorC, editorW := newTestContext(t, newRequest(http.MethodGet, fmt.Sprintf("/admin/channels/%d/editor", cfg.ID), nil))
+		editorC.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(cfg.ID, 10)}}
+		server.HandleChannelEditor(editorC)
+		editor := mustParseAPIResponse[channelEditorData](t, editorW.Body.Bytes())
+		if editor.Data.Channel.OAuthQuotaPassthrough != tc.want {
+			t.Fatalf("editor returned wrong quota passthrough: %s", editorW.Body.String())
+		}
+		listC, listW := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+		server.handleListChannels(listC)
+		list := mustParseAPIResponse[[]ChannelWithCooldown](t, listW.Body.Bytes())
+		if len(list.Data) != 1 || list.Data[0].OAuthQuotaPassthrough != tc.want {
+			t.Fatalf("list did not return actual value: %s", listW.Body.String())
+		}
+	}
+}
+
+func TestHandleChannelModelScopeSource(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	models := []model.ModelEntry{{Model: "a"}, {Model: "b"}}
+	payload := map[string]any{
+		"name": "scope-source", "enabled": true,
+		"urls": model.ChannelURLs{{URL: "https://example.com"}}, "models": models,
+		"api_keys": []map[string]any{{"api_key": "k", "allowed_models": []string{"a"}, "detected_models": []string{"a"}, "model_scope_auto": true}},
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels", payload))
+	server.HandleChannels(c)
+	if w.Code != http.StatusOK && w.Code != http.StatusCreated {
+		t.Fatalf("create failed: %d %s", w.Code, w.Body.String())
+	}
+	var created model.Config
+	mustUnmarshalAPIResponseData(t, w.Body.Bytes(), &created)
+	assertSource := func(want bool) {
+		t.Helper()
+		keys, err := store.GetAPIKeys(ctx, created.ID)
+		if err != nil || len(keys) == 0 {
+			t.Fatalf("read keys: %v", err)
+		}
+		if keys[0].ModelScopeAuto != want {
+			t.Fatalf("model_scope_auto=%v, want %v", keys[0].ModelScopeAuto, want)
+		}
+	}
+	assertSource(true)
+	for _, tc := range []struct {
+		name      string
+		key       map[string]any
+		appendKey bool
+		want      bool
+	}{
+		{"old client note edit", map[string]any{"api_key": "k", "note": "edited"}, false, true},
+		{"old client unchanged scope", map[string]any{"api_key": "k", "allowed_models": []string{"a"}, "detected_models": []string{"a"}}, false, true},
+		{"old client manual allowlist", map[string]any{"api_key": "k", "allowed_models": []string{"b"}}, false, false},
+		{"explicit discovery", map[string]any{"api_key": "k", "allowed_models": []string{"a"}, "detected_models": []string{"a"}, "model_scope_auto": true}, false, true},
+		{"old client rebuild", map[string]any{"api_key": "k"}, true, true},
+		{"explicit manual with same range", map[string]any{"api_key": "k", "model_scope_auto": false}, true, false},
+		{"discovery with same range", map[string]any{"api_key": "k", "model_scope_auto": true}, true, true},
+		{"old client upstream range edit", map[string]any{"api_key": "k", "detected_models": []string{"b"}}, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keys := []map[string]any{tc.key}
+			if tc.appendKey {
+				keys = append(keys, map[string]any{"api_key": "new"})
+			}
+			payload["api_keys"] = keys
+			path := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+			c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, path, payload))
+			c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+			server.HandleChannelByID(c)
+			if w.Code != http.StatusOK {
+				t.Fatalf("update failed: %d %s", w.Code, w.Body.String())
+			}
+			assertSource(tc.want)
+		})
 	}
 }

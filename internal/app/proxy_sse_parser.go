@@ -168,7 +168,7 @@ func (u *usageAccumulator) captureResponseModel(payload map[string]any, upstream
 
 	var candidates []string
 	switch strings.ToLower(strings.TrimSpace(upstreamProtocol)) {
-	case "openai", "codex":
+	case "openai", "codex", "system_one":
 		candidates = []string{nestedResponseModel(payload, "response"), responseModelValue(payload, "model")}
 	case "anthropic":
 		candidates = []string{nestedResponseModel(payload, "message"), responseModelValue(payload, "model")}
@@ -761,7 +761,8 @@ const responsesEmptyIncompleteErrorPayload = `{"type":"error","error":{"type":"s
 // isEmptyResponsesIncomplete 识别上游静默中止：response.incomplete 没有任何
 // output 且 usage.output_tokens 明确为数字 0（对齐 CLIProxyAPI
 // IsCodexTerminalEmptyIncomplete）。调用方还须保证此前没有语义输出。
-// content_filter 是确定性结果，换渠道重放只会连带冷却，保持原样返回。
+// content_filter 是确定性结果，换渠道重放只会连带冷却，保持原样返回；
+// interrupted 是上游对客户端 response.interrupt 的确认，空输出同样是正常终结。
 func isEmptyResponsesIncomplete(eventType, payloadType, data string) bool {
 	if payloadType == "" {
 		payloadType = eventType
@@ -770,7 +771,8 @@ func isEmptyResponsesIncomplete(eventType, payloadType, data string) bool {
 		return false
 	}
 	response := gjson.Get(data, "response")
-	if response.Get("incomplete_details.reason").String() == "content_filter" {
+	switch response.Get("incomplete_details.reason").String() {
+	case "content_filter", "interrupted":
 		return false
 	}
 	if output := response.Get("output"); output.IsArray() && len(output.Array()) > 0 {
@@ -1236,6 +1238,15 @@ func isJSONWhitespace(b byte) bool {
 	return b == ' ' || b == '\n' || b == '\r' || b == '\t'
 }
 
+// countTokensResult 读取 count_tokens 响应顶层的 input_tokens。它是计数结果而非生成用量，
+// 不放进 GetUsage，避免其它响应里同名顶层字段被误计。
+func (p *jsonUsageParser) countTokensResult() int {
+	if p.truncated {
+		return 0
+	}
+	return int(gjson.GetBytes(p.buffer.Bytes(), "input_tokens").Int())
+}
+
 func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cacheCreation int) {
 	if p.truncated {
 		return p.normalizedUsage(p.upstreamProtocol)
@@ -1564,8 +1575,8 @@ func (u *usageAccumulator) applyUsage(usage map[string]any, upstreamProtocol str
 			log.Printf("[WARN] OpenAI 渠道返回未知的 usage 格式，keys: %v", getUsageKeys(usage))
 		}
 
-	case "anthropic":
-		// Anthropic平台:input_tokens + output_tokens + cache字段
+	case "anthropic", "system_one":
+		// Anthropic平台:input_tokens + output_tokens + cache字段；System One 同名字段
 		u.applyAnthropicOrResponsesUsage(usage)
 
 	default:
@@ -1730,8 +1741,11 @@ func (u *usageAccumulator) applyAnthropicOrResponsesUsage(usage map[string]any) 
 	}
 	if detailedCache5m > 0 || detailedCache1h > 0 {
 		u.setCacheCreationSnapshot(detailedCache5m, detailedCache1h)
-	} else if aggregateCacheCreation > 0 {
-		// 只有 aggregate、没有权威 split 时按 5m 计价，并清掉可能残留的旧 1h bucket。
+	} else if aggregateCacheCreation > 0 &&
+		aggregateCacheCreation != u.Cache5mInputTokens+u.Cache1hInputTokens {
+		// 只有 aggregate 且与已知 split 不一致时才按 5m 计价，并清掉旧 1h bucket。
+		// Anthropic 的 message_delta 会只带 aggregate 重发同一快照（无 cache_creation），
+		// 此时必须保留 message_start 的 split，否则 1h 写入会被错记为 5m。
 		u.setCacheCreationSnapshot(aggregateCacheCreation, 0)
 	}
 

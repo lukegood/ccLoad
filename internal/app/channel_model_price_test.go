@@ -313,20 +313,17 @@ func TestReplaceModelEntriesCarriesChannelPricing(t *testing.T) {
 	}
 }
 
-func TestCSVModelPricingRoundTripAndCarry(t *testing.T) {
+func TestCSVModelPricingImportAndCarry(t *testing.T) {
 	t.Parallel()
 	price := channelPrice(1.5, 6)
-	exported, err := exportChannelModelPricing([]model.ModelEntry{{Model: "model-a", Pricing: price}, {Model: "model-b"}})
-	if err != nil || exported != `{"model-a":{"input_price":1.5,"output_price":6}}` {
-		t.Fatalf("exported model_pricing = (%s, %v)", exported, err)
-	}
+	exported := `{"model-a":{"input_price":1.5,"output_price":6}}`
 
 	columns := map[string]int{"name": 0, "api_key": 1, "urls": 2, "models": 3, "model_pricing": 4}
 	parse := func(pricing string, hasColumn bool, existing map[string][]model.ModelEntry) (*model.ChannelWithKeys, string) {
 		channel, message, _ := (&Server{}).parseChannelImportRow(
 			[]string{"priced", "sk-imported", `[{"url":"https://api.example.com"}]`, "model-a,model-b", pricing},
-			columns, 2, false, false, false, false, false, false, false, false, false, hasColumn,
-			nil, nil, nil, nil, nil, nil, nil, existing,
+			columns, 2, false, false, false, false, false, false, false, false, false, false, hasColumn,
+			nil, nil, nil, nil, nil, nil, nil, nil, existing,
 		)
 		return channel, message
 	}

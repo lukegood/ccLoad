@@ -46,6 +46,7 @@ func TestConfig_CreateAndGet(t *testing.T) {
 		Websockets:              true,
 		ProtocolTransformMode:   model.ProtocolTransformModeLocal,
 		RetryOtherKeysOnFailure: true,
+		SameChannelRetries:      2,
 		AvailableTimeStart:      "22:00",
 		AvailableTimeEnd:        "08:00",
 		RPMLimit:                60,
@@ -99,6 +100,9 @@ func TestConfig_CreateAndGet(t *testing.T) {
 	if !got.RetryOtherKeysOnFailure {
 		t.Error("expected retry_other_keys_on_failure=true")
 	}
+	if got.SameChannelRetries != 2 {
+		t.Errorf("same_channel_retries: got %d, want 2", got.SameChannelRetries)
+	}
 	if got.AvailableTimeStart != "22:00" || got.AvailableTimeEnd != "08:00" {
 		t.Errorf("available time: got %q-%q, want 22:00-08:00", got.AvailableTimeStart, got.AvailableTimeEnd)
 	}
@@ -133,7 +137,7 @@ func TestConfig_CreateAndGet(t *testing.T) {
 
 func TestConfig_OAuthCredentialRoundTripAndPrivateJSON(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "codex-credential.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"at-secret","refresh_token":"rt-secret","expired":"2030-01-01T00:00:00Z"}`
 
@@ -210,7 +214,7 @@ func TestConfig_OAuthCredentialRoundTripAndPrivateJSON(t *testing.T) {
 
 func TestConfig_DisableOAuthChannelIfCredentialMatches(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "disable-rejected-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	original := `{"type":"codex","access_token":"rejected-at","refresh_token":"rejected-rt"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -297,7 +301,7 @@ func TestConfig_DisableOAuthChannelIfCredentialMatches(t *testing.T) {
 }
 
 func TestConfig_CreateWithExistingExplicitOAuthIDCannotReplaceCredential(t *testing.T) {
-	store := newTestStore(t, "explicit-oauth-credential.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	winner := `{"type":"codex","access_token":"at-winner","refresh_token":"rt-winner","expired":"2031-01-01T00:00:00Z"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -327,7 +331,7 @@ func TestConfig_CreateWithExistingExplicitOAuthIDCannotReplaceCredential(t *test
 }
 
 func TestConfig_DeleteConfigIfOAuthSnapshotMatches(t *testing.T) {
-	store := newTestStore(t, "conditional-oauth-delete.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	original := `{"type":"codex","access_token":"old-at","refresh_token":"old-rt"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -387,7 +391,7 @@ func TestConfig_DeleteConfigIfOAuthSnapshotMatches(t *testing.T) {
 }
 
 func TestConfig_CreateWithExplicitIDRejectsOAuthAcrossExistingAPIKey(t *testing.T) {
-	store := newTestStore(t, "explicit-api-key-to-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name: "api-key-winner", AuthType: model.AuthTypeAPIKey,
@@ -417,7 +421,7 @@ func TestConfig_CreateWithExplicitIDRejectsOAuthAcrossExistingAPIKey(t *testing.
 func TestConfig_ListConfigs(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "list.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -463,7 +467,7 @@ func TestConfig_ListConfigs(t *testing.T) {
 func TestConfig_UpdateChannelEnabledOnlyTouchesEnabled(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "update-enabled.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -1022,7 +1026,7 @@ func TestConfig_DeleteConfig_AllowsRecreateWithSameIDAndKeyIndicesInMemoryStore(
 func TestConfig_GetEnabledChannelsByModel(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "model_query.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -1120,7 +1124,7 @@ func TestConfig_GetEnabledChannelsByModel(t *testing.T) {
 func TestConfig_GetEnabledChannelsByModelUsesRoutingModelName(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "routing_model_query.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	for _, entry := range []struct {
@@ -1153,7 +1157,7 @@ func TestConfig_GetEnabledChannelsByModelUsesRoutingModelName(t *testing.T) {
 func TestConfig_GetEnabledChannelsIncludesCooledEnabledChannels(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "enabled_includes_cooled.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	cooled, err := store.CreateConfig(ctx, &model.Config{
@@ -1218,7 +1222,7 @@ func TestConfig_GetEnabledChannelsIncludesCooledEnabledChannels(t *testing.T) {
 func TestConfig_BatchUpdatePriority(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "priority.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -1267,7 +1271,7 @@ func TestConfig_BatchUpdatePriority(t *testing.T) {
 func TestConfig_BatchPatchConfigs(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "batch-patch.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	create := func(name, mode, scheduledModel string, models []model.ModelEntry) *model.Config {
 		t.Helper()
@@ -1451,7 +1455,7 @@ func TestConfig_BatchPatchConfigs(t *testing.T) {
 func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "prune-key-model-scopes.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name: "prune-key-model-scopes", URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
@@ -1461,7 +1465,7 @@ func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
 		t.Fatalf("CreateConfig: %v", err)
 	}
 	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
-		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-restricted", AllowedModels: []string{"MODEL-A", "model-b"}},
+		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-restricted", AllowedModels: []string{"MODEL-A", "model-b"}, ModelScopeAuto: true},
 		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-unrestricted"},
 		{ChannelID: cfg.ID, KeyIndex: 2, APIKey: "sk-only-removed", AllowedModels: []string{"model-b"}},
 		{ChannelID: cfg.ID, KeyIndex: 3, APIKey: "sk-routing-name", AllowedModels: []string{"model-c"}},
@@ -1483,6 +1487,9 @@ func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
 		!slices.Equal(keys[3].AllowedModels, []string{"model-c"}) || keys[3].ModelScopeEmpty {
 		t.Fatalf("key model scopes after removal=%v", keys)
 	}
+	if !keys[0].ModelScopeAuto || keys[2].ModelScopeAuto {
+		t.Fatal("pruning changed automatic or manual scope source")
+	}
 
 	if err := store.UpdateAPIKeyModelScopes(ctx, cfg.ID, map[int]model.APIKeyModelScope{
 		0: {AllowedModels: []string{"dynamic-model"}},
@@ -1498,7 +1505,7 @@ func TestConfig_UpdatePrunesAPIKeyModelScopes(t *testing.T) {
 func TestConfig_BatchPatchConfigsUpdatesOAuthModelsWithoutCredentialMutation(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "batch-patch-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"winner","refresh_token":"winner-rt"}`
 	oauth, err := store.CreateConfig(ctx, &model.Config{
@@ -1548,7 +1555,7 @@ func TestConfig_BatchPatchConfigsUpdatesOAuthModelsWithoutCredentialMutation(t *
 func TestConfig_SyncOAuthConfigReplicaIsAtomicAndProviderRestricted(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "sync-oauth-replica.db")
+	store := newTestStore(t)
 	replica := store.(*sqlstore.SQLStore)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"old","refresh_token":"old-rt"}`
@@ -1597,7 +1604,7 @@ func TestConfig_SyncOAuthConfigReplicaIsAtomicAndProviderRestricted(t *testing.T
 func TestConfig_ModelRedirect(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "redirect.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -1637,7 +1644,7 @@ func TestConfig_ModelRedirect(t *testing.T) {
 
 func TestConfig_ChannelManagementCompareAndSwap(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "channel-management-cas.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -1696,7 +1703,7 @@ func TestConfig_ChannelManagementCompareAndSwap(t *testing.T) {
 
 func TestConfig_ChannelManagementCompareAndSwapRejectsOAuthChannel(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "channel-management-oauth.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"oauth-private-token","refresh_token":"oauth-refresh-token"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -1720,7 +1727,7 @@ func TestConfig_ChannelManagementCompareAndSwapRejectsOAuthChannel(t *testing.T)
 func TestConfig_ModelPricingPersistsAcrossWritePaths(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "model-pricing.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	price := func(value float64) *float64 { return &value }
 	sonnetPrice := &util.CustomModelPrice{InputPrice: price(1.5), OutputPrice: price(7.5), CacheReadPrice: price(0)}
@@ -1762,7 +1769,7 @@ func TestConfig_ModelPricingPersistsAcrossWritePaths(t *testing.T) {
 
 func TestConfig_ModelVariantsPersistAndProject(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "model-variants.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	priceValue := 3.0
 	price := &util.CustomModelPrice{InputPrice: &priceValue, OutputPrice: &priceValue}
@@ -1819,5 +1826,64 @@ func TestConfig_ModelVariantsPersistAndProject(t *testing.T) {
 	}
 	if _, err := store.GetConfig(ctx, created.ID); err == nil {
 		t.Fatal("mismatched model_variants must fail to load")
+	}
+}
+
+func TestConfigOAuthQuotaPassthroughPersistence(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{Name: "quota", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true, ModelEntries: []model.ModelEntry{{Model: "gpt-5"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthQuotaPassthrough {
+		t.Fatal("new channel must default to false")
+	}
+	for _, enabled := range []bool{true, false} {
+		cfg.OAuthQuotaPassthrough = enabled
+		cfg, err = store.UpdateConfig(ctx, cfg.ID, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		configs, err := store.ListConfigs(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		routed, err := store.GetEnabledChannelsByModel(ctx, "gpt-5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, got := range []*model.Config{cfg, cfg.Clone(), configs[0], routed[0]} {
+			if got.OAuthQuotaPassthrough != enabled {
+				t.Fatalf("quota passthrough=%v want %v", got.OAuthQuotaPassthrough, enabled)
+			}
+		}
+	}
+}
+
+func TestSystemOneConfigExcludedFromChatCandidates(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{Name: "decision-only", Enabled: true, AuthType: model.AuthTypeSystemOne,
+		URLs:         model.ChannelURLs{{URL: "https://one.example/v1"}},
+		ModelEntries: []model.ModelEntry{{Model: "jev-latest"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil || !got.IsSystemOne() {
+		t.Fatalf("GetConfig() = %+v, error = %v", got, err)
+	}
+	for _, name := range []string{"*", "jev-latest"} {
+		candidates, err := store.GetEnabledChannelsByModel(ctx, name)
+		if err != nil || len(candidates) != 0 {
+			t.Fatalf("chat candidates(%s) = %+v, error = %v", name, candidates, err)
+		}
+	}
+	got.URLs = append(got.URLs, model.ChannelURL{URL: "https://chat.example", Protocols: []string{"openai"}})
+	if _, err := store.UpdateConfig(ctx, cfg.ID, got); err == nil {
+		t.Fatal("System One URL protocols must be rejected")
 	}
 }

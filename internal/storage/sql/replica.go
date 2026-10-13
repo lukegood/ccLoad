@@ -157,10 +157,10 @@ func (s *SQLStore) replaceAPIKeysReplicaTx(ctx context.Context, tx *sql.Tx, chan
 			return fmt.Errorf("marshal API key replica detected models: %w", err)
 		}
 		if _, err := s.execTx(ctx, tx, `
-			INSERT INTO api_keys(channel_id, key_index, api_key, note, allowed_models, detected_models, model_scope_empty, key_strategy,
+			INSERT INTO api_keys(channel_id, key_index, api_key, note, allowed_models, detected_models, model_scope_empty, model_scope_auto, key_strategy,
 				cooldown_until, cooldown_duration_ms, disabled, cost_multiplier, priority, created_at, updated_at)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, channelID, key.KeyIndex, key.APIKey, key.Note, allowedModelsJSON, detectedModelsJSON, key.ModelScopeEmpty, strategy,
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, channelID, key.KeyIndex, key.APIKey, key.Note, allowedModelsJSON, detectedModelsJSON, key.ModelScopeEmpty, key.ModelScopeAuto, strategy,
 			key.CooldownUntil, key.CooldownDurationMs, key.Disabled, normalizeCostMultiplier(key.CostMultiplier), key.Priority, now, now); err != nil {
 			return fmt.Errorf("insert API key replica: %w", err)
 		}
@@ -213,6 +213,7 @@ func (s *SQLStore) deleteChannelReplicaTx(ctx context.Context, tx *sql.Tx, chann
 		`DELETE FROM channel_url_states WHERE channel_id = ?`,
 		`DELETE FROM debug_logs WHERE log_id IN (SELECT id FROM logs WHERE channel_id = ?)`,
 		`DELETE FROM logs WHERE channel_id = ?`,
+		`DELETE FROM oauth_quota_cost_ledger WHERE channel_id = ?`,
 		`DELETE FROM channels WHERE id = ?`,
 	}
 	for _, statement := range statements {

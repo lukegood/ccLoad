@@ -1,5 +1,17 @@
 package schema
 
+// DefineOAuthQuotaCostLedgerTable 定义独立于日志保留期的 OAuth 周期额度成本账本。
+func DefineOAuthQuotaCostLedgerTable() *TableBuilder {
+	return NewTable("oauth_quota_cost_ledger").
+		Column("channel_id INT NOT NULL").
+		Column("bucket_at BIGINT NOT NULL").
+		Column("model VARCHAR(191) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL").
+		Column("window_key VARCHAR(128) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT ''").
+		Column("cost_microusd BIGINT NOT NULL").
+		Column("PRIMARY KEY (channel_id, bucket_at, model, window_key)").
+		Index("idx_oauth_quota_cost_ledger_bucket", "bucket_at")
+}
+
 // DefineChannelsTable 定义channels表结构
 func DefineChannelsTable() *TableBuilder {
 	return NewTable("channels").
@@ -13,6 +25,7 @@ func DefineChannelsTable() *TableBuilder {
 		Column("auth_type VARCHAR(32) NOT NULL DEFAULT 'api_key'").
 		Column("oauth_credential TEXT").
 		Column("websockets TINYINT NOT NULL DEFAULT 0").
+		Column("oauth_quota_passthrough TINYINT NOT NULL DEFAULT 0").
 		Column("protocol_transform_mode VARCHAR(32) NOT NULL DEFAULT 'auto'").
 		Column("enabled TINYINT NOT NULL DEFAULT 1").
 		Column("scheduled_check_enabled TINYINT NOT NULL DEFAULT 0").
@@ -29,6 +42,7 @@ func DefineChannelsTable() *TableBuilder {
 		Column("available_time_start VARCHAR(5) NOT NULL DEFAULT ''").
 		Column("available_time_end VARCHAR(5) NOT NULL DEFAULT ''").
 		Column("retry_other_keys_on_failure TINYINT NOT NULL DEFAULT 0").
+		Column("same_channel_retries INT NOT NULL DEFAULT 0").
 		Column("created_at BIGINT NOT NULL").
 		Column("updated_at BIGINT NOT NULL").
 		Index("idx_channels_enabled", "enabled").
@@ -48,6 +62,7 @@ func DefineAPIKeysTable() *TableBuilder {
 		Column("allowed_models VARCHAR(2000) NOT NULL DEFAULT ''").
 		Column("detected_models TEXT"). // 可空 TEXT：MySQL utf8mb4 下两个 VARCHAR(8000) 会超过 65535 行长上限
 		Column("model_scope_empty TINYINT NOT NULL DEFAULT 0").
+		Column("model_scope_auto TINYINT NOT NULL DEFAULT 0").
 		Column("key_strategy VARCHAR(32) NOT NULL DEFAULT 'sequential'").
 		Column("cooldown_until BIGINT NOT NULL DEFAULT 0").
 		Column("cooldown_duration_ms BIGINT NOT NULL DEFAULT 0").
@@ -138,6 +153,7 @@ func DefineAuthTokensTable() *TableBuilder {
 		Column("allowed_channel_ids VARCHAR(2000) NOT NULL DEFAULT ''").
 		Column("channel_restriction_mode VARCHAR(16) NOT NULL DEFAULT 'allow'").
 		Column("max_concurrency INT NOT NULL DEFAULT 0").
+		Column("rpm_limit INT NOT NULL DEFAULT 0").
 		Index("idx_auth_tokens_active", "is_active").
 		Index("idx_auth_tokens_expires", "expires_at")
 }
@@ -198,6 +214,7 @@ func DefineLogsTable() *TableBuilder {
 		Column("base_url VARCHAR(500) NOT NULL DEFAULT ''").    // 请求使用的上游URL（多URL场景）
 		Column("service_tier VARCHAR(20) NOT NULL DEFAULT ''"). // OpenAI service_tier: priority/flex
 		Column("thinking_effort VARCHAR(32) NOT NULL DEFAULT ''").
+		Column("reasoning_decision TEXT NULL").
 		Column("input_tokens INT NOT NULL DEFAULT 0").
 		Column("output_tokens INT NOT NULL DEFAULT 0").
 		Column("reasoning_tokens INT NOT NULL DEFAULT 0").

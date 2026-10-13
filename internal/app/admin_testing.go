@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,8 +52,9 @@ func (s *Server) HandleChannelURLTest(c *gin.Context) {
 }
 
 type channelWebsocketProbeRequest struct {
+	ChannelID          int64                     `json:"channel_id,omitempty"`
 	URL                string                    `json:"url" binding:"required"`
-	APIKey             string                    `json:"api_key" binding:"required"`
+	APIKey             string                    `json:"api_key,omitempty"`
 	ProxyURL           string                    `json:"proxy_url,omitempty"`
 	CustomRequestRules *model.CustomRequestRules `json:"custom_request_rules,omitempty"`
 }
@@ -64,7 +66,10 @@ func (r *channelWebsocketProbeRequest) Validate() error {
 		return err
 	}
 	r.APIKey = strings.TrimSpace(r.APIKey)
-	if r.APIKey == "" {
+	if r.ChannelID < 0 {
+		return errors.New("channel_id must be positive")
+	}
+	if r.APIKey == "" && r.ChannelID == 0 {
 		return errors.New("api_key cannot be empty")
 	}
 	r.ProxyURL, err = normalizeChannelProxyURL(r.ProxyURL)
@@ -81,7 +86,7 @@ type channelWebsocketProbeResult struct {
 }
 
 // HandleChannelWebsocketProbe 只探测 Codex Responses WebSocket 握手能力。
-// 它不发送模型请求，不写日志、冷却或渠道配置。
+// 不发送模型请求、不写冷却；OAuth 凭据按需刷新。
 func (s *Server) HandleChannelWebsocketProbe(c *gin.Context) {
 	var probe channelWebsocketProbeRequest
 	if err := BindAndValidate(c, &probe); err != nil {
@@ -93,6 +98,28 @@ func (s *Server) HandleChannelWebsocketProbe(c *gin.Context) {
 		URLs:               model.ChannelURLs{{URL: model.StripExactUpstreamURLMarker(probe.URL), Exact: model.HasExactUpstreamURLMarker(probe.URL)}},
 		ProxyURL:           probe.ProxyURL,
 		CustomRequestRules: probe.CustomRequestRules,
+	}
+	if probe.ChannelID != 0 {
+		stored, err := s.store.GetConfig(c.Request.Context(), probe.ChannelID)
+		if err != nil {
+			RespondError(c, http.StatusNotFound, err)
+			return
+		}
+		if !stored.UsesCodexOAuth() {
+			RespondErrorMsg(c, http.StatusBadRequest, "channel_id must identify a Codex OAuth channel")
+			return
+		}
+		// 使用草稿的连接设置刷新凭据，凭据本身仅从服务端读取。
+		stored = stored.Clone()
+		stored.ProxyURL = probe.ProxyURL
+		runtimeCfg, _, _, err := s.prepareOAuthChannelTestAuth(c.Request.Context(), stored, oauthCredentialRefreshIfNeeded)
+		if err != nil {
+			RespondError(c, http.StatusBadGateway, err)
+			return
+		}
+		runtimeCfg.URLs = cfg.URLs
+		runtimeCfg.CustomRequestRules = cfg.CustomRequestRules
+		cfg = runtimeCfg
 	}
 	testReq := &testutil.TestChannelRequest{Model: "websocket-probe", Stream: true, Content: "probe"}
 	fullURL, headers, _, err := (&testutil.CodexTester{}).Build(cfg, probe.APIKey, testReq)
@@ -165,8 +192,10 @@ type channelTestRequestPlan struct {
 	clientBody                []byte
 	anthropicOAuthFingerprint *anthropicOAuthFingerprint
 	anthropicMappedSessionID  string
+	anthropicTestBody         []byte
 	zedWire                   *zedWirePlan
 	openCodeResponses         *openCodeResponsesPlan
+	xaiTools                  *xaiResponsesToolsPlan
 	timeout                   *channelTestTimeout
 	debugCapture              *debugCapture
 	antigravityOAuth          bool
@@ -234,6 +263,21 @@ func newChannelTester(protocolName string) testutil.ChannelTester {
 	default:
 		return &testutil.AnthropicTester{}
 	}
+}
+
+// validateTestClientProtocol 校验测试请求的客户端协议：决策渠道固定发原生 POST /v1/systemone，
+// 不模拟客户端协议；其余渠道必须声明。
+func validateTestClientProtocol(cfg *model.Config, testReq *testutil.TestChannelRequest) error {
+	if cfg.IsSystemOne() {
+		if testReq.ClientProtocol != "" {
+			return errors.New("client_protocol is not supported for System One channels")
+		}
+		return nil
+	}
+	if testReq.ClientProtocol == "" {
+		return errors.New("client_protocol cannot be empty")
+	}
+	return nil
 }
 
 func resolveClientProtocol(testReq *testutil.TestChannelRequest) string {
@@ -452,6 +496,14 @@ func (s *Server) buildChannelTestRequestPlan(
 	if err != nil {
 		return nil, err
 	}
+	// 测试器只保留显式参数；模型默认值复用正式 Anthropic 构造层的目录。
+	if clientProtocol == util.ProtocolAnthropic && !gjson.GetBytes(body, "max_tokens").Exists() {
+		body = setJSONRaw(body, "max_tokens", anthropicClaudeCodeDefaultMaxTokens(testReq.Model))
+	}
+	if clientProtocol == util.ProtocolAnthropic && testReq.ThinkingEffort == "" &&
+		!anthropicModelSupportsEffort(testReq.Model) {
+		body = deleteAnthropicOutputEffort(body)
+	}
 	body = applyThinkingSuffixForModel(body, protocol.Protocol(clientProtocol), requestedModel, testReq.Model)
 
 	plan := &channelTestRequestPlan{
@@ -634,6 +686,10 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 		RespondError(c, http.StatusNotFound, fmt.Errorf("channel not found"))
 		return
 	}
+	if err := validateTestClientProtocol(cfg, &testReq); err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	if forcedBaseURL != "" {
 		normalizedBaseURL, err := validateChannelBaseURL(forcedBaseURL, cfg.GetAuthType())
 		if err != nil {
@@ -709,7 +765,7 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 		c.Request.Context(), runtimeCfg, keySelection.keyIndex, &testReq,
 		keySelection.updatePersistedCooldown, testResult,
 	)
-	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualTest, logModel, channelTestActualModel(testResult, testReq.Model), keySelection.apiKey, c.ClientIP(), logThinking, testResult))
+	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualTest, logModel, channelTestActualModel(testResult, testReq.Model), keySelection, c.ClientIP(), logThinking, testResult))
 	testResult["tested_key_index"] = keySelection.keyIndex
 	testResult["total_keys"] = len(apiKeys)
 
@@ -834,6 +890,8 @@ type channelTestKeySelection struct {
 	apiKey                  string
 	requestCredential       string
 	updatePersistedCooldown bool
+	// costMultiplier 是检测日志的倍率快照，与代理一致：api_key 取所选 Key，OAuth 取渠道级。
+	costMultiplier float64
 }
 
 type oauthCredentialLoadMode uint8
@@ -913,6 +971,7 @@ func (s *Server) prepareOAuthChannelTestAuthForRejectedToken(
 	if cfg == nil || !cfg.UsesOAuth() {
 		return nil, selection, false, nil
 	}
+	selection.costMultiplier = cfg.CostMultiplier
 
 	cfg = withAntigravityDefaultFallbackURLs(cfg)
 	cfg = s.withOAuthBaseURLOverride(cfg)
@@ -1111,11 +1170,17 @@ func (s *Server) selectChannelTestKey(
 			keyIndex = *requestedKeyIndex
 		}
 		matchedKey, ok := findAPIKeyByIndex(apiKeys, keyIndex)
+		persisted := ok && matchedKey.APIKey == requestAPIKey
+		costMultiplier := cfg.CostMultiplier
+		if persisted {
+			costMultiplier = matchedKey.CostMultiplier
+		}
 		return channelTestKeySelection{
 			keyIndex:                keyIndex,
 			apiKey:                  requestAPIKey,
 			requestCredential:       requestAPIKey,
-			updatePersistedCooldown: ok && matchedKey.APIKey == requestAPIKey,
+			updatePersistedCooldown: persisted,
+			costMultiplier:          costMultiplier,
 		}, nil
 	}
 	if requestedKeyIndex == nil {
@@ -1128,6 +1193,7 @@ func (s *Server) selectChannelTestKey(
 			apiKey:                  apiKey,
 			requestCredential:       apiKey,
 			updatePersistedCooldown: true,
+			costMultiplier:          apiKeyCostMultiplierAt(cfg, apiKeys, keyIndex),
 		}, nil
 	}
 
@@ -1143,7 +1209,16 @@ func (s *Server) selectChannelTestKey(
 		apiKey:                  requestedKey.APIKey,
 		requestCredential:       requestedKey.APIKey,
 		updatePersistedCooldown: true,
+		costMultiplier:          requestedKey.CostMultiplier,
 	}, nil
+}
+
+// apiKeyCostMultiplierAt 按语义索引取 Key 倍率；找不到时回落渠道级，与代理 attempt 的默认值一致。
+func apiKeyCostMultiplierAt(cfg *model.Config, apiKeys []*model.APIKey, keyIndex int) float64 {
+	if key, ok := findAPIKeyByIndex(apiKeys, keyIndex); ok {
+		return key.CostMultiplier
+	}
+	return cfg.CostMultiplier
 }
 
 func findAPIKeyByIndex(apiKeys []*model.APIKey, keyIndex int) (*model.APIKey, bool) {
@@ -1153,10 +1228,6 @@ func findAPIKeyByIndex(apiKeys []*model.APIKey, keyIndex int) (*model.APIKey, bo
 		}
 	}
 	return nil, false
-}
-
-func (s *Server) executeChannelTest(ctx context.Context, cfg *model.Config, keyIndex int, apiKey string, testReq *testutil.TestChannelRequest) map[string]any {
-	return s.executeChannelTestWithCooldown(ctx, cfg, keyIndex, apiKey, testReq, true)
 }
 
 func (s *Server) executeChannelTestWithCooldown(ctx context.Context, cfg *model.Config, keyIndex int, apiKey string, testReq *testutil.TestChannelRequest, updatePersistedCooldown bool) map[string]any {
@@ -1212,6 +1283,7 @@ func (s *Server) applyChannelTestResultCooldown(ctx context.Context, cfg *model.
 	input := httpErrorInputFromParts(cfg.ID, keyIndex, statusCode, errorBody, headers)
 	if upstreamStatusCode, ok := getResultInt(result["status_code"]); ok {
 		input.UpstreamStatusCode = upstreamStatusCode
+		input.ModelScoped = isAntigravityModelNotFound(cfg, upstreamStatusCode)
 	}
 	action := s.applyCooldownDecision(
 		ctx,
@@ -1306,6 +1378,25 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 	keyIndex int,
 	updatePersistedCooldown bool,
 ) map[string]any {
+	// 决策调用固定非流式：忽略 stream，前端流式开关不影响决策渠道测试。
+	if cfg.IsSystemOne() {
+		testCfg := cfg
+		if baseURL := strings.TrimSpace(testReq.BaseURL); baseURL != "" {
+			idx := slices.IndexFunc(cfg.URLs, func(endpoint model.ChannelURL) bool {
+				return endpoint.RuntimeURL() == baseURL || endpoint.URL == baseURL
+			})
+			if idx < 0 {
+				return map[string]any{"success": false, "error": "System One test URL must belong to the channel"}
+			}
+			testCfg = cfg.Clone()
+			testCfg.URLs = model.ChannelURLs{cfg.URLs[idx]}
+		}
+		ctx, timeout := s.newChannelTestTimeoutContextWithTimeouts(reqCtx, false, s.resolveProtocolTimeouts(protocol.TransformPlan{
+			UpstreamProtocol: protocol.Protocol(util.ProtocolSystemOne),
+		}))
+		defer timeout.cancelAll()
+		return s.testSystemOneChannel(ctx, testCfg, apiKey, testReq.Model, testReq.Content)
+	}
 	// 设置默认测试内容（从配置读取）
 	if strings.TrimSpace(testReq.Content) == "" {
 		testReq.Content = configuredChannelTestContent(s.configService)
@@ -1383,7 +1474,7 @@ func (s *Server) testChannelAPIWithCooldownTarget(
 				}
 				return lastResult
 			}
-			if !isChannelTestProtocolEndpointMissing(lastResult) {
+			if !isChannelTestProtocolEndpointMissing(cfg, lastResult) {
 				break
 			}
 			capabilityExhausted = protocolIdx == len(upstreamProtocols)-1
@@ -1789,6 +1880,10 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 		})
 	}
 	wrapCodexSSEResponseBody(resp, protocol.Protocol(requestPlan.upstreamProtocol), isEventStream)
+	if requestPlan.xaiOAuth {
+		prepareXAIResponsesResponse(resp, requestPlan.upstreamStreaming || isEventStream)
+		prepareXAIResponsesToolsResponse(resp, requestPlan.xaiTools, requestPlan.upstreamStreaming || isEventStream)
+	}
 	prepareOpenCodeResponsesResponse(resp, requestPlan.openCodeResponses, requestPlan.upstreamStreaming)
 
 	// 通用结果初始化
@@ -2065,19 +2160,33 @@ func (s *Server) buildTestUpstreamRequestPlan(
 	if err != nil {
 		return nil, nil, fmt.Errorf("构造测试请求失败: %w", err)
 	}
+	requestPath := downstreamEndpointPath(requestPlan.fullURL, selectedURL)
+	upstreamProtocolValue := protocol.Protocol(requestPlan.upstreamProtocol)
+	if isAnthropicClaudeCodeMessagesRequest(cfgForBuild, upstreamProtocolValue, requestPath) {
+		// name.txt 的轻量请求结构用于正常问答；不注入主循环 billing/system/cache，
+		// 指纹与账号身份仍由共享 wire 层生成，避免模板硬编码版本与身份。
+		requestPlan.requestBody = injectClaudeCodeFallbackTools(requestPlan.requestBody)
+		requestPlan.requestBody, err = injectAnthropicClaudeCodeMetadata(
+			requestPlan.requestBody, cfgForBuild, requestPlan.apiKey, requestPlan.headers)
+		if err != nil {
+			return nil, nil, fmt.Errorf("构造 Anthropic 测试身份失败: %w", err)
+		}
+		applyAnthropicClaudeCodeHeaders(&http.Request{Header: requestPlan.headers},
+			anthropicClaudeCodeMimicBetas(requestPlan.requestBody, cfgForBuild.UsesAnthropicOAuth()),
+			anthropicSessionIDFromBody(requestPlan.requestBody), anthropicEffectiveCLIVersion(), false)
+		requestPlan.anthropicTestBody = requestPlan.requestBody
+	}
 	for key, value := range testReq.Headers {
 		requestPlan.headers.Set(key, value)
 	}
 
-	requestPath := downstreamEndpointPath(requestPlan.fullURL, selectedURL)
-	upstreamProtocolValue := protocol.Protocol(requestPlan.upstreamProtocol)
 	xaiResponsesRequest := isXAIOAuthResponsesRequest(cfgForBuild, upstreamProtocolValue, requestPath)
 	if xaiResponsesRequest {
 		requestPlan.fullURL = buildXAIResponsesURL(selectedURL, "")
 		requestPath = downstreamEndpointPath(requestPlan.fullURL, selectedURL)
 	}
-	if isAnthropicOAuthMessagesRequest(cfgForBuild, upstreamProtocolValue, requestPath) {
-		requestPlan.fullURL = buildAnthropicOAuthURL(selectedURL, requestPath, "")
+	if isAnthropicClaudeCodeMessagesRequest(cfgForBuild, upstreamProtocolValue, requestPath) {
+		requestPlan.fullURL = buildAnthropicClaudeCodeURL(selectedURL, requestPath, "")
 	}
 	requestedStreaming := isStreamingRequest(requestPath, requestPlan.requestBody)
 	// 与代理链路一致：Anthropic CCH 签名按上游 origin 分流，最终化前必须先有 URL。
@@ -2086,10 +2195,13 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		return nil, nil, fmt.Errorf("parse test upstream URL: %w", err)
 	}
 	callerBody := requestPlan.clientBody
+	if len(requestPlan.anthropicTestBody) > 0 {
+		callerBody = requestPlan.anthropicTestBody
+	}
 	if len(callerBody) == 0 {
 		callerBody = requestPlan.requestBody
 	}
-	callerBodyIsAnthropic := requestPlan.clientProtocol == string(protocol.Anthropic)
+	callerBodyIsAnthropic := requestPlan.clientProtocol == string(protocol.Anthropic) || len(requestPlan.anthropicTestBody) > 0
 	callerWire := classifyAnthropicRequestCallerWire(
 		callerBody, requestPlan.headers, upstreamProtocolValue, requestPath, callerBodyIsAnthropic)
 	if cfgForBuild.UsesAnthropicOAuth() {
@@ -2099,8 +2211,8 @@ func (s *Server) buildTestUpstreamRequestPlan(
 		}
 		requestPlan.anthropicOAuthFingerprint = s.getAnthropicOAuthFingerprint(ctx, cfgForBuild, fingerprintSource)
 	}
-	requestPlan.requestBody, err = s.prepareTranslatedUpstreamBody(
-		cfgForBuild, upstreamProtocolValue, requestPath, testReq.Model, requestPlan.requestBody, requestPlan.clientBody,
+	requestPlan.requestBody, _, err = s.prepareTranslatedUpstreamBody(
+		cfgForBuild, upstreamProtocolValue, requestPath, testReq.Model, requestPlan.requestBody, callerBody,
 		requestPlan.apiKey, requestPlan.headers, false, parsedTestURL,
 		false, callerBodyIsAnthropic,
 	)
@@ -2133,6 +2245,10 @@ func (s *Server) buildTestUpstreamRequestPlan(
 	}
 	if xaiResponsesRequest {
 		requestPlan.xaiConversationID = testReq.ResolveSessionID()
+		requestPlan.requestBody, requestPlan.xaiTools, err = prepareXAIResponsesToolsRequest(requestPlan.requestBody, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("adapt xAI test tools: %w", err)
+		}
 		requestPlan.requestBody, err = finalizeXAIResponsesBody(
 			requestPlan.requestBody,
 			testReq.Model,
@@ -2191,6 +2307,9 @@ func (s *Server) newTestUpstreamRequest(
 	sourceHeaders := cloneHeaders(requestPlan.headers)
 	requestPlan.upstreamHeaders = sourceHeaders
 	callerBody := requestPlan.clientBody
+	if len(requestPlan.anthropicTestBody) > 0 {
+		callerBody = requestPlan.anthropicTestBody
+	}
 	if len(callerBody) == 0 {
 		callerBody = requestPlan.requestBody
 	}
@@ -2282,7 +2401,10 @@ func (s *Server) newTestUpstreamRequest(
 			return nil, nil, err
 		}
 	}
-	setAdminTestAcceptEncoding(cfgForBuild, req)
+	// Anthropic 与代理链路共用显式响应解压，保留 provider 的压缩协商头。
+	if !isAnthropicClaudeCodeMessagesRequest(cfgForBuild, requestProtocol, requestPlan.endpointPath) {
+		setAdminTestAcceptEncoding(cfgForBuild, req)
+	}
 	requestPlan.debugCapture = s.captureDebugRequest(req, requestPlan.requestBody)
 	if requestPlan.clientProtocol != requestPlan.upstreamProtocol || cfgForBuild.UsesZedOAuth() {
 		originalHeaders := cloneHeaders(requestPlan.clientHeaders)
@@ -2350,7 +2472,10 @@ func (s *Server) parseTestTranslatedSSEResponse(
 	translatedWriter.WriteHeader(resp.StatusCode)
 	var rawUpstreamBuf bytes.Buffer
 	upstreamTee := io.TeeReader(resp.Body, &rawUpstreamBuf)
-	streamReader := readerWithCloser{Reader: upstreamTee, Closer: resp.Body}
+	var streamReader io.ReadCloser = readerWithCloser{Reader: upstreamTee, Closer: resp.Body}
+	if requestPlan.antigravityOAuth {
+		streamReader = terminateAntigravitySSE(streamReader)
+	}
 	firstContentCaptured := false
 	upstreamParser := newSSEUsageParser(requestPlan.upstreamProtocol)
 	var translatedComplete bool
@@ -2373,7 +2498,7 @@ func (s *Server) parseTestTranslatedSSEResponse(
 			if requestPlan.antigravityOAuth {
 				var err error
 				parserEvent, err = unwrapAntigravitySSEEvent(rawEvent)
-				if err != nil {
+				if err != nil || parserEvent == nil {
 					return err
 				}
 			}
@@ -2392,9 +2517,13 @@ func (s *Server) parseTestTranslatedSSEResponse(
 				rawEvent = normalizeCodeBuddySSEEvent(rawEvent)
 			}
 			if requestPlan.antigravityOAuth {
+				// 与代理链路一致：后端错误帧只交给 usage parser，不进转换器。
+				if isAntigravityErrorPayload(antigravityEventPayload(rawEvent)) {
+					return nil, nil
+				}
 				var err error
 				rawEvent, err = unwrapAntigravitySSEEvent(rawEvent)
-				if err != nil {
+				if err != nil || rawEvent == nil {
 					return nil, err
 				}
 				translatedRequestBody, err = unwrapAntigravityRequest(requestPlan.requestBody)
@@ -2671,6 +2800,7 @@ func (s *Server) bindChannelTestBilling(cfg *model.Config, testReq *testutil.Tes
 		return
 	}
 	testReq.RequestModel = testReq.Model
+	testReq.CodexOAuth = cfg.UsesCodexOAuth()
 	if selected, ok := s.firstModelRow(cfg, testReq.Model); ok {
 		testReq.ChannelModelPrice = selected.entry.Pricing
 	}
@@ -2700,6 +2830,7 @@ func channelTestCostUSD(testReq *testutil.TestChannelRequest, actualModel, reque
 		Cache5mInputTokens:       cache5m,
 		Cache1hInputTokens:       cache1h,
 		ServiceTier:              serviceTier,
+		RateCard:                 openAIRateCard(testReq.CodexOAuth, parser.GetCodexHasCredits()),
 		ToolCostUSD:              toolCost,
 	}), true
 }
@@ -2948,12 +3079,12 @@ func (s *Server) applyChannelTestCapacityCooldown(
 	result["antigravity_capacity_cooldown_applied"] = true
 }
 
-func isChannelTestProtocolEndpointMissing(result map[string]any) bool {
+func isChannelTestProtocolEndpointMissing(cfg *model.Config, result map[string]any) bool {
 	if missing, _ := result["protocol_capability_missing"].(bool); missing {
 		return true
 	}
 	statusCode, ok := getResultInt(result["status_code"])
-	if !ok {
+	if !ok || isAntigravityModelNotFound(cfg, statusCode) {
 		return false
 	}
 	_, errorBody, _ := buildTestFailureClassificationInput(result)

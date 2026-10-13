@@ -2,6 +2,7 @@ package responses
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -26,7 +27,7 @@ func TestConvertSystemRoleToDeveloper_BasicConversion(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Check that system role was converted to developer
@@ -71,7 +72,7 @@ func TestConvertSystemRoleToDeveloper_MultipleSystemMessages(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Check that both system roles were converted
@@ -110,7 +111,7 @@ func TestConvertSystemRoleToDeveloper_NoSystemMessages(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Check that user and assistant roles are unchanged
@@ -132,7 +133,7 @@ func TestConvertSystemRoleToDeveloper_EmptyInput(t *testing.T) {
 		"input": []
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Check that input is still an empty array
@@ -152,7 +153,7 @@ func TestConvertSystemRoleToDeveloper_NoInputField(t *testing.T) {
 		"stream": false
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Check that other fields are still set correctly
@@ -187,7 +188,7 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 		"stream": false
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Verify system role was converted to developer
@@ -222,7 +223,7 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 func TestConvertOpenAIResponsesRequestToCodexReusesNormalizedPayload(t *testing.T) {
 	inputJSON := []byte(`{"model":"gpt-5.6","stream":true,"store":false,"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"service_tier":"priority","input":[{"type":"message","role":"user","content":"hello"}]}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
 
 	if &output[0] != &inputJSON[0] {
 		t.Fatal("normalized request payload was copied")
@@ -251,7 +252,7 @@ func TestConvertOpenAIResponsesRequestToCodexNormalizesRequiredFields(t *testing
 		"input":[{"type":"message","role":"system","content":"hello"}]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
 
 	if stream := gjson.GetBytes(output, "stream"); stream.Type != gjson.True {
 		t.Fatalf("stream = %s, want true", stream.Raw)
@@ -289,9 +290,28 @@ func TestConvertOpenAIResponsesRequestToCodexNormalizesRequiredFields(t *testing
 func TestConvertOpenAIResponsesRequestToCodexPreservesUltrafastServiceTier(t *testing.T) {
 	inputJSON := []byte(`{"model":"gpt-5.3-codex","service_tier":"ultrafast","input":[]}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.3-codex", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.3-codex", inputJSON, false)
 	if got := gjson.GetBytes(output, "service_tier").String(); got != "ultrafast" {
 		t.Fatalf("service_tier = %q, want ultrafast; body=%s", got, output)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToCodexReusesNormalizedPayloadWithSources(t *testing.T) {
+	for _, includeJSON := range []string{
+		`["reasoning.encrypted_content","web_search_call.action.sources"]`,
+		`[ "reasoning.encrypted_content" , "web_search_call.action.sources" ]`,
+		`[ "reasoning.encrypted_content" ]`,
+	} {
+		inputJSON := []byte(`{"model":"gpt-5.6","stream":true,"store":false,"parallel_tool_calls":true,"include":` + includeJSON + `,"service_tier":"priority","input":[{"type":"message","role":"user","content":"hello"}]}`)
+
+		output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
+
+		if &output[0] != &inputJSON[0] {
+			t.Fatalf("normalized request payload with include %s was copied", includeJSON)
+		}
+		if string(output) != string(inputJSON) {
+			t.Fatalf("normalized request changed:\n got: %s\nwant: %s", output, inputJSON)
+		}
 	}
 }
 
@@ -304,7 +324,7 @@ func TestConvertOpenAIResponsesRequestToCodex_FiltersPromptCacheRetention(t *tes
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6-terra", inputJSON, true)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6-terra", inputJSON, true)
 	if gjson.GetBytes(output, "prompt_cache_retention").Exists() {
 		t.Fatalf("prompt_cache_retention should be removed: %s", string(output))
 	}
@@ -340,7 +360,7 @@ func TestConvertOpenAIResponsesRequestToCodexAddsReasoningIncludeIncrementally(t
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", []byte(tt.input), true)
+			output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", []byte(tt.input), true)
 			if got := gjson.GetBytes(output, "include").Raw; got != tt.wantInclude {
 				t.Fatalf("include = %s, want %s; body=%s", got, tt.wantInclude, output)
 			}
@@ -371,7 +391,7 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Check system -> developer
@@ -409,7 +429,7 @@ func TestConvertOpenAIResponsesRequestToCodex_NormalizesWebSearchPreview(t *test
 		}
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
 
 	if got := gjson.GetBytes(output, "tools.0.type").String(); got != "web_search" {
 		t.Fatalf("tools.0.type = %q, want %q: %s", got, "web_search", string(output))
@@ -432,7 +452,7 @@ func TestConvertOpenAIResponsesRequestToCodex_NormalizesTopLevelToolChoicePrevie
 		"tool_choice": {"type": "web_search_preview_2025_03_11"}
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.4-mini", inputJSON, false)
 
 	if got := gjson.GetBytes(output, "tool_choice.type").String(); got != "web_search" {
 		t.Fatalf("tool_choice.type = %q, want %q: %s", got, "web_search", string(output))
@@ -446,7 +466,7 @@ func TestUserFieldDeletion(t *testing.T) {
 		"input": [{"role": "user", "content": "Hello"}]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	// Verify user field is deleted
@@ -468,7 +488,7 @@ func TestContextManagementCompactionCompatibility(t *testing.T) {
 		"input": [{"role":"user","content":"hello"}]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	if gjson.Get(outputStr, "context_management").Exists() {
@@ -486,7 +506,7 @@ func TestTruncationRemovedForCodexCompatibility(t *testing.T) {
 		"input": [{"role":"user","content":"hello"}]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	if gjson.Get(outputStr, "truncation").Exists() {
@@ -504,7 +524,7 @@ func TestStripCodexResponsesCacheBreakpoints(t *testing.T) {
 		]}]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	if strings.Contains(string(output), "prompt_cache") {
 		t.Fatalf("cache hints should not exist in output: %s", string(output))
 	}
@@ -540,7 +560,7 @@ func TestStripCodexResponsesCacheBreakpoints_FunctionCallOutputParts(t *testing.
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	if strings.Contains(outputStr, "prompt_cache_breakpoint") {
@@ -570,7 +590,7 @@ func TestStripCodexResponsesCacheBreakpoints_ItemLevel(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	if strings.Contains(outputStr, "prompt_cache_breakpoint") {
@@ -607,7 +627,7 @@ func TestStripCodexResponsesCacheBreakpoints_CombinedItemAndPartLevel(t *testing
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	outputStr := string(output)
 
 	if strings.Contains(outputStr, "prompt_cache_breakpoint") {
@@ -636,7 +656,7 @@ func TestStripCodexResponsesCacheBreakpoints_WithSystemRole(t *testing.T) {
 		]
 	}`)
 
-	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
 	if got := gjson.GetBytes(output, "input.0.role").String(); got != "developer" {
 		t.Fatalf("role = %q, want developer", got)
 	}
@@ -733,7 +753,7 @@ func TestConvertOpenAIResponsesRequestToCodex_ServiceTier(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			inputJSON := []byte(fmt.Sprintf(`{"model":"gpt-5.6","service_tier":%s,"input":[{"type":"message","role":"user","content":"hello"}]}`, tt.tierJSON))
-			output := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
+			output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
 			res := gjson.GetBytes(output, "service_tier")
 			if res.Exists() != tt.wantExists {
 				t.Fatalf("service_tier exists = %v, want %v; output: %s", res.Exists(), tt.wantExists, string(output))
@@ -742,5 +762,55 @@ func TestConvertOpenAIResponsesRequestToCodex_ServiceTier(t *testing.T) {
 				t.Fatalf("service_tier = %q, want %q; output: %s", res.String(), tt.wantTier, string(output))
 			}
 		})
+	}
+}
+
+// TestConvertOpenAIResponsesRequestToCodex_NormalizesEmptyFunctionCallArguments
+// covers the parameter-less tool call shape that strict Codex Responses
+// upstreams reject with "`arguments` must be valid JSON": only blank string
+// arguments on function_call history items become "{}", everything else is
+// preserved byte-for-byte in intent.
+func TestConvertOpenAIResponsesRequestToCodex_NormalizesEmptyFunctionCallArguments(t *testing.T) {
+	inputJSON := []byte(`{"model":"gpt-5.6","input":[
+		{"type":"function_call","id":"fc_empty","call_id":"call_empty","name":"create_worktree","arguments":""},
+		{"type":"function_call","id":"fc_blank","call_id":"call_blank","name":"list_artifacts","arguments":"   \t\n"},
+		{"type":"function_call","id":"fc_kept","call_id":"call_kept","name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"},
+		{"type":"function_call","id":"fc_broken","call_id":"call_broken","name":"exec_command","arguments":"not-json"},
+		{"type":"function_call","id":"fc_missing","call_id":"call_missing","name":"no_args"},
+		{"type":"function_call","id":"fc_null","call_id":"call_null","name":"null_args","arguments":null},
+		{"type":"function_call","id":"fc_num","call_id":"call_num","name":"num_args","arguments":123},
+		{"type":"function_call_output","call_id":"call_empty","output":"worktree created"},
+		{"type":"custom_tool_call","id":"ctc_1","call_id":"call_custom","name":"apply_patch","input":"exact patch"},
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+	]}`)
+	output, _ := ConvertOpenAIResponsesRequestToCodex("gpt-5.6", inputJSON, true)
+	for index, want := range []string{"{}", "{}", `{"cmd":"pwd"}`, "not-json"} {
+		if got := gjson.GetBytes(output, "input."+strconv.Itoa(index)+".arguments").String(); got != want {
+			t.Fatalf("input.%d.arguments = %q, want %q; output: %s", index, got, want, string(output))
+		}
+	}
+	if gjson.GetBytes(output, "input.4.arguments").Exists() {
+		t.Fatalf("input.4 (missing arguments) should not gain arguments field; output: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "input.5.arguments").Type; got != gjson.Null {
+		t.Fatalf("input.5.arguments type = %v, want null; output: %s", got, string(output))
+	}
+	if got := gjson.GetBytes(output, "input.6.arguments").Int(); got != 123 {
+		t.Fatalf("input.6.arguments = %d, want 123; output: %s", got, string(output))
+	}
+	if got := gjson.GetBytes(output, "input.7.type").String(); got != "function_call_output" || gjson.GetBytes(output, "input.7.output").String() != "worktree created" {
+		t.Fatalf("input.7 should be function_call_output with unchanged output; output: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "input.8.type").String(); got != "custom_tool_call" {
+		t.Fatalf("input.8.type = %q, want custom_tool_call; output: %s", got, string(output))
+	}
+	if got := gjson.GetBytes(output, "input.8.input").String(); got != "exact patch" {
+		t.Fatalf("input.8.input = %q, want exact patch; output: %s", got, string(output))
+	}
+	if gjson.GetBytes(output, "input.8.arguments").Exists() {
+		t.Fatalf("custom_tool_call must not gain arguments; output: %s", string(output))
+	}
+	if got := gjson.GetBytes(output, "input.9.type").String(); got != "message" {
+		t.Fatalf("input.9.type = %q, want message; output: %s", got, string(output))
 	}
 }

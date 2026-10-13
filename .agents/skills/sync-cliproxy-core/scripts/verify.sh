@@ -113,7 +113,7 @@ audit_provider_imports() {
     if [[ "$import_path" == "ccLoad/internal/protocol/cliproxy/providers/$provider" || "$import_path" == "ccLoad/internal/protocol/cliproxy/providers/$provider/"* ]]; then
       continue
     fi
-    if [[ "$import_path" =~ ^ccLoad/internal/protocol/cliproxy/(claude|codex|common|gemini|misc|openai|registry|signature|thinking|util)(/|$) ]]; then
+    if [[ "$import_path" =~ ^ccLoad/internal/protocol/cliproxy/(applypatch|claude|codex|common|gemini|misc|openai|registry|signature|thinking|util)(/|$) ]]; then
       continue
     fi
     if [[ "$import_path" == ccLoad/* ]]; then
@@ -187,7 +187,7 @@ if [[ -d "$snapshot" ]]; then
   for entry in "$snapshot"/*; do
     base="$(basename "$entry")"
     case "$base" in
-      LICENSE|UPSTREAM.md|claude|codex|common|gemini|misc|openai|providers|registry|signature|thinking|util)
+      LICENSE|UPSTREAM.md|applypatch|claude|codex|common|gemini|misc|openai|providers|registry|signature|thinking|util)
         ;;
       *)
         fail "unexpected top-level snapshot entry: $entry"
@@ -512,11 +512,13 @@ else
   [[ "$synchronized_provider_count" == "$provider_count" ]] || fail "UPSTREAM.md must record one synchronized status per imported provider"
 fi
 
+module_source_path=""
 if [[ -f "$upstream_doc" ]]; then
   if ! grep -Fq -- "- Repository: \`https://github.com/caidaoli/CLIProxyAPI\`" "$upstream_doc"; then
     fail "UPSTREAM.md repository is missing or unexpected"
   fi
-  if ! grep -Fq -- "- Module source path: \`github.com/router-for-me/CLIProxyAPI/v7\`" "$upstream_doc"; then
+  module_source_path="$(sed -nE 's#^- Module source path: `([^`]+)`$#\1#p' "$upstream_doc")"
+  if [[ ! "$module_source_path" =~ ^github\.com/router-for-me/CLIProxyAPI/v[0-9]+$ ]]; then
     fail "UPSTREAM.md module source path is missing or unexpected"
   fi
 
@@ -569,12 +571,9 @@ if grep -Eq 'github.com/(router-for-me|caidaoli)/CLIProxyAPI' go.mod; then
 fi
 
 if [[ -f "$register_file" ]]; then
-  request_count="$(grep -c 'reg\.RegisterRequest' "$register_file" || true)"
-  stream_count="$(grep -c 'reg\.RegisterStreamResponse' "$register_file" || true)"
-  non_stream_count="$(grep -c 'reg\.RegisterNonStreamResponse' "$register_file" || true)"
-  [[ "$request_count" == "12" ]] || fail "expected 12 request registrations, found $request_count"
-  [[ "$stream_count" == "12" ]] || fail "expected 12 stream response registrations, found $stream_count"
-  [[ "$non_stream_count" == "12" ]] || fail "expected 12 non-stream response registrations, found $non_stream_count"
+  # Each register(...) call installs the request, stream and non-stream transforms of one pair.
+  pair_count="$(grep -Ec '^[[:space:]]*register\(protocol\.' "$register_file" || true)"
+  [[ "$pair_count" == "12" ]] || fail "expected 12 protocol pair registrations, found $pair_count"
 fi
 
 test_count="$(find "$snapshot" -type f -name '*_test.go' 2>/dev/null | wc -l | tr -d '[:space:]')"
@@ -605,6 +604,10 @@ if [[ -n "$upstream_repo" ]]; then
   elif ! git -C "$upstream_repo" cat-file -e "${synchronized_commit}^{commit}" 2>/dev/null; then
     fail "recorded commit $synchronized_commit is absent from $upstream_repo"
   elif [[ -n "$provider_test_lister_bin" ]]; then
+    upstream_module_path="$(git -C "$upstream_repo" show "${synchronized_commit}:go.mod" | awk '$1 == "module" { print $2 }')"
+    if [[ "$module_source_path" != "$upstream_module_path" ]]; then
+      fail "UPSTREAM.md module source path differs from the recorded commit: expected $upstream_module_path"
+    fi
     core_scope_args=(
       --upstream-repo "$upstream_repo"
       --target-commit "$synchronized_commit"

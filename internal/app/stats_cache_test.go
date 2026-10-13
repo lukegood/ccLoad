@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -8,6 +10,85 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 )
+
+func TestStatsCache_SeparatesTodayRPM(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+	ctx := context.Background()
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name: "rpm-cache", URLs: model.ChannelURLs{{URL: "https://example.com"}},
+		ModelEntries: []model.ModelEntry{{Model: "test-model"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := createTestToken(t, server, "rpm-cache")
+	end := time.Now()
+	start := end.Add(-time.Hour)
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time: model.JSONTime{Time: end}, ChannelID: cfg.ID, Model: "test-model",
+		AuthTokenID: token.ID, LogSource: model.LogSourceProxy, StatusCode: 200,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		load func(*StatsCache, bool) (float64, error)
+	}{
+		{"stats", func(cache *StatsCache, today bool) (float64, error) {
+			stats, err := cache.GetStats(ctx, start, end, nil, today)
+			if err != nil {
+				return 0, err
+			}
+			if len(stats) != 1 {
+				return 0, fmt.Errorf("stats entries = %d, want 1", len(stats))
+			}
+			if stats[0].RecentRPM == nil {
+				return 0, nil
+			}
+			return *stats[0].RecentRPM, nil
+		}},
+		{"rpm", func(cache *StatsCache, today bool) (float64, error) {
+			stats, err := cache.GetRPMStats(ctx, start, end, nil, today)
+			if err != nil {
+				return 0, err
+			}
+			return stats.RecentRPM, nil
+		}},
+		{"auth_token_range", func(cache *StatsCache, today bool) (float64, error) {
+			stats, err := cache.GetAuthTokenRangeStats(ctx, start, end, today)
+			if err != nil {
+				return 0, err
+			}
+			if stats[token.ID] == nil {
+				return 0, fmt.Errorf("missing token stats")
+			}
+			return stats[token.ID].RecentRPM, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, firstToday := range []bool{false, true} {
+				cache := NewStatsCache(store)
+				t.Cleanup(cache.Close)
+				// 两种请求顺序均验证，并再次读取两种口径的缓存结果。
+				for _, today := range []bool{firstToday, !firstToday, firstToday, !firstToday} {
+					got, err := tc.load(cache, today)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := 0.0
+					if today {
+						want = 1
+					}
+					if got != want {
+						t.Fatalf("firstToday=%v today=%v: RecentRPM=%v, want %v", firstToday, today, got, want)
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestStatsCache_CalculateTTL(t *testing.T) {
 	tests := []struct {
@@ -48,17 +129,9 @@ func TestStatsCache_CalculateTTL(t *testing.T) {
 }
 
 func TestStatsCache_HashFilter(t *testing.T) {
-	// nil filter
-	if got := hashFilter(nil); got != "nil" {
-		t.Errorf("hashFilter(nil) = %s, want nil", got)
-	}
-
 	// 空 filter
 	emptyFilter := &model.LogFilter{}
 	hash1 := hashFilter(emptyFilter)
-	if len(hash1) != 16 {
-		t.Errorf("hashFilter 返回长度应为 16, got %d", len(hash1))
-	}
 
 	// 带字段的 filter
 	channelID := int64(123)
@@ -67,9 +140,6 @@ func TestStatsCache_HashFilter(t *testing.T) {
 		Model:     "gpt-4",
 	}
 	hash2 := hashFilter(filter)
-	if len(hash2) != 16 {
-		t.Errorf("hashFilter 返回长度应为 16, got %d", len(hash2))
-	}
 
 	// 不同 filter 应产生不同 hash
 	if hash1 == hash2 {

@@ -7,7 +7,7 @@ function flushAsyncWork() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } = {}) {
+async function loadSettingsPage(t, settings, inputValues, { filterModels = [], channels = [], reasoningLoadError = null, initialLoadError = null, extraElements = {} } = {}) {
   const clickListeners = [];
   const bodyListeners = new Map();
   const multimodalModalListeners = new Map();
@@ -43,10 +43,6 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
     removeAttribute(name) {
       this.attributes.delete(name);
     }
-  };
-  const typeSafeButton = {
-    ...updateButton, attributes: new Map(),
-    closest(selector) { return selector === '[data-action="test-typesafe"]' ? this : null; }
   };
   const settingsBody = {
     dataset: {},
@@ -212,8 +208,65 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
     ['customPricingRows', customPricingRowsContainer],
     ['customPricingSearch', customPricingSearch],
     ['customPricingEmpty', customPricingEmpty],
-    ['customPricingError', customPricingError]
+    ['customPricingError', customPricingError],
+    ...Object.entries(extraElements)
   ]);
+  const reasoningListeners = new Map();
+  const reasoningClasses = new Set();
+  let reasoningFields = [];
+  let reasoningModels = [];
+  // Parse rendered form controls so tests interact with the same values and disabled states as the browser.
+  function reasoningControl(tag) {
+    const attribute = name => tag.match(new RegExp(`(?:^|\\s)${name}="([^"]*)"`))?.[1] || '';
+    const attributes = new Map();
+    return {
+      id: attribute('id'), type: attribute('type'), value: attribute('value'),
+      checked: /\bchecked\b/.test(tag), disabled: /\bdisabled\b/.test(tag),
+      dataset: { reasoningField: attribute('data-reasoning-field') },
+      hasAttribute: name => new RegExp(`(?:^|\\s)${name}(?:=|\\s|$)`).test(tag),
+      setAttribute: (name, value) => attributes.set(name, String(value)),
+      removeAttribute: name => attributes.delete(name),
+      getAttribute: name => attributes.get(name) ?? null,
+      innerHTML: '',
+      insertAdjacentHTML(_position, html) { this.innerHTML += html; },
+      focus() { global.document.activeElement = this; }
+    };
+  }
+  const reasoningButton = {
+    dataset: {}, isConnected: true,
+    addEventListener(type, listener) { if (type === 'click') this.listener = listener; },
+    click() { this.listener?.({ currentTarget: this }); },
+    focus() { global.document.activeElement = this; }
+  };
+  const reasoningModal = {
+    dataset: {}, attributes: new Map(),
+    classList: {
+      add: name => reasoningClasses.add(name), remove: name => reasoningClasses.delete(name),
+      contains: name => reasoningClasses.has(name)
+    },
+    addEventListener: (type, listener) => reasoningListeners.set(type, listener),
+    setAttribute(name, value) { this.attributes.set(name, String(value)); },
+    querySelector: selector => selector === '.close-btn' ? { focus() {} } : null
+  };
+  const reasoningContent = {
+    set innerHTML(html) {
+      reasoningFields = [...html.matchAll(/<(?:input|select)\b([^>]*)>/g)].map(match => reasoningControl(match[1]));
+      for (const field of reasoningFields) if (field.id) elements.set(field.id, field);
+      elements.set('reasoningAutoEditor', { querySelectorAll: () => [...reasoningFields, ...reasoningModels] });
+      elements.set('reasoningBusinessModels', {
+        querySelectorAll: () => reasoningModels,
+        set innerHTML(rows) {
+          reasoningModels = [...rows.matchAll(/<input\b([^>]*)>/g)].map(match => reasoningControl(match[1]));
+        }
+      });
+      elements.set('reasoningModelsEmpty', { hidden: true });
+    }
+  };
+  const reasoningError = { textContent: '', hidden: true };
+  elements.set('reasoning-auto-btn', reasoningButton);
+  elements.set('reasoningAutoModal', reasoningModal);
+  elements.set('reasoningAutoContent', reasoningContent);
+  elements.set('reasoningAutoError', reasoningError);
   const definitions = new Map(settings.map((setting) => [setting.key, setting]));
   for (const [key, value] of Object.entries(inputValues)) {
     const row = {
@@ -264,7 +317,9 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
   }
 
   let bootstrap;
+  let unsavedGuard = null;
   let allowSave = false;
+  let failNextLoad = null;
   const prompts = [];
   const notifications = [];
   const requests = [];
@@ -279,19 +334,33 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
   global.window = {
     t(key, params = {}) {
       if (key === 'settings.msg.confirmSave') return confirmMessage;
-      if (key === 'settings.msg.invalidValue') return `请检查 ${params.key}：${params.reason}`;
+      if (key === 'settings.msg.invalidValue') return `请检查 ${params.name}：${params.reason}`;
+      if (key === 'settings.msg.invalidValues') return `${params.count} 项无效：${params.details}`;
+      if (key === 'settings.msg.savedRestart') return `需重启：${params.names}`;
+      if (key === 'settings.msg.listSeparator') return '、';
+      if (key === 'settings.msg.detailSeparator') return '；';
       if (key === 'settings.validation.oauthURLDuplicatedScheme') return `协议头重复，请改为 ${params.url}。`;
       return key;
     },
     showNotification(message, type) {
       notifications.push({ message, type });
     },
+    async showConfirm(options) {
+      prompts.push(options.message);
+      return allowSave;
+    },
+    guardUnsavedChanges(isDirty) {
+      unsavedGuard = isDirty;
+      return () => {};
+    },
     initPageBootstrap(config) {
       bootstrap = config;
     }
   };
+  const documentListeners = new Map();
   global.document = {
     activeElement: null,
+    addEventListener: (type, listener) => documentListeners.set(type, listener),
     documentElement: { lang: 'zh-CN' },
     getElementById(id) {
       return elements.get(id) || null;
@@ -318,10 +387,6 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
   global.escapeHtml = (value) => String(value);
   global.showError = (error) => { errors.push(error); };
   global.showSuccess = (message) => { successes.push(message); };
-  global.confirm = (message) => {
-    prompts.push(message);
-    return allowSave;
-  };
   global.fetchDataWithAuth = async (url, options) => {
     requests.push({ url, options });
     if (url.startsWith('/admin/model-pricing?')) {
@@ -329,7 +394,18 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
         resolveModelPricingRequest = resolve;
       });
     }
-    if (!options) return settings;
+    if (url === '/admin/channels' || url === '/admin/channels/filter-options?status=enabled') {
+      if (reasoningLoadError) throw new Error(reasoningLoadError);
+      return url === '/admin/channels' ? channels : { models: filterModels };
+    }
+    if (!options) {
+      if (failNextLoad) {
+        const error = failNextLoad;
+        failNextLoad = null;
+        throw error;
+      }
+      return settings;
+    }
     if (url === '/admin/update/check') {
       if (nextUpdateError) {
         const error = nextUpdateError;
@@ -338,15 +414,11 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
       }
       return nextUpdateResult;
     }
-    if (url === '/admin/channels/filter-options?status=enabled') {
-      return { models: filterModels };
-    }
     if (nextSaveError) {
       const error = nextSaveError;
       nextSaveError = null;
       throw error;
     }
-    if (url === '/admin/typesafe/test') return { valid: true };
     return { message: 'saved' };
   };
 
@@ -360,7 +432,6 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
       'escapeHtml',
       'showError',
       'showSuccess',
-      'confirm',
       'fetchDataWithAuth'
     ]) {
       delete global[name];
@@ -368,6 +439,7 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
   });
 
   require(settingsModule);
+  if (initialLoadError) failNextLoad = new Error(initialLoadError);
   bootstrap.run();
   await flushAsyncWork();
 
@@ -381,9 +453,62 @@ async function loadSettingsPage(t, settings, inputValues, { filterModels = [] } 
     renderCalls,
     requests,
     saveButton,
+    settingsBody,
+    hasUnsavedChanges: () => unsavedGuard?.(),
+    editInput(key, value) {
+      const input = inputs[key];
+      input.value = value;
+      bodyListeners.get('input')?.({ target: { closest: () => input } });
+    },
+    reasoningModal,
+    reasoningError,
+    reasoningModels: () => reasoningModels,
+    reasoningField: id => elements.get(id),
+    async openReasoning() {
+      reasoningButton.click();
+      await flushAsyncWork();
+    },
+    pressDocumentKey(key, { defaultPrevented = false } = {}) {
+      const event = { key, defaultPrevented, preventDefault() { this.defaultPrevented = true; } };
+      documentListeners.get('keydown')?.(event);
+      return event;
+    },
+    reasoningAction(action) {
+      const button = { dataset: { action }, closest: () => button };
+      reasoningListeners.get('click')?.({ target: button });
+    },
+    editReasoningField(field, value) {
+      const target = reasoningFields.find(input => input.dataset.reasoningField === field);
+      assert.ok(target, field);
+      if (target.disabled) return;
+      if (field === 'enabled') target.checked = value;
+      else target.value = String(value);
+      reasoningListeners.get(field === 'timeout_ms' ? 'input' : 'change')?.({ target });
+    },
+    selectReasoningModel(model, checked) {
+      const target = reasoningModels.find(input => input.value === model);
+      assert.ok(target, model);
+      if (target.disabled) return;
+      target.checked = checked;
+      reasoningListeners.get('change')?.({ target });
+    },
+    toggleReasoningModels(checked) {
+      const target = elements.get('reasoningModelsSelectAll');
+      if (target.disabled) return;
+      target.checked = checked;
+      reasoningListeners.get('change')?.({ target });
+    },
+    filterReasoningModels(value) {
+      const target = elements.get('reasoningModelSearch');
+      target.value = value;
+      reasoningListeners.get('input')?.({ target });
+    },
+    clickRetryLoad() {
+      bodyListeners.get('click')?.({
+        target: { closest: (selector) => (selector === '[data-action="retry-load-settings"]' ? { disabled: false } : null) }
+      });
+    },
     updateButton,
-    typeSafeButton,
-    clickTypeSafe() { bodyListeners.get('click')?.({ target: typeSafeButton }); },
     clickUpdate() {
       bodyListeners.get('click')?.({ target: updateButton });
     },
@@ -899,39 +1024,6 @@ test('非容器更新渠道显示手动检测按钮并触发完整更新流程',
   assert.equal(page.updateButton.getAttribute('aria-busy'), null);
 });
 
-test('仅发现更新时不提示已开始下载', async (t) => {
-  const page = await loadSettingsPage(t, [{
-    key: 'auto_update_channel',
-    value: 'stable',
-    value_type: 'string',
-    description: ''
-  }], {
-    auto_update_channel: 'stable'
-  });
-
-  page.setUpdateResult({
-    has_update: true,
-    latest_version: 'v2.0.0',
-    pending_restart: false
-  });
-  page.clickUpdate();
-  await flushAsyncWork();
-
-  assert.equal(page.successes.length, 1);
-  assert.equal(page.successes[0], 'settings.updateCheck.found');
-
-  page.setUpdateResult({
-    has_update: false,
-    latest_version: 'v2.0.0',
-    pending_restart: false
-  });
-  page.clickUpdate();
-  await flushAsyncWork();
-
-  assert.equal(page.successes.length, 2);
-  assert.equal(page.successes[1], 'settings.updateCheck.upToDate');
-});
-
 test('手动检测更新失败时恢复按钮并显示错误', async (t) => {
   const page = await loadSettingsPage(t, [{
     key: 'auto_update_channel',
@@ -953,86 +1045,377 @@ test('手动检测更新失败时恢复按钮并显示错误', async (t) => {
   assert.equal(page.updateButton.getAttribute('aria-busy'), null);
 });
 
-test('容器内禁用更新设置并显示镜像切换说明', async (t) => {
+test('一次保存报告全部无效设置的可读名称并标记每个输入', async (t) => {
   const page = await loadSettingsPage(t, [
-    {
-      key: 'auto_update_channel',
-      value: 'stable',
-      value_type: 'string',
-      description: '',
-      editable: false,
-      disabled_reason: 'container_image_managed'
-    },
-    {
-      key: 'auto_update_interval_hours',
-      value: '12',
-      value_type: 'int',
-      description: '',
-      editable: false,
-      disabled_reason: 'container_image_managed'
-    }
-  ], {});
+    { key: 'max_key_retries', value: '3', value_type: 'int', description: '单渠道最大Key重试次数' },
+    { key: 'max_concurrency', value: '10', value_type: 'int', description: '最大并发请求数' },
+    { key: 'log_retention_days', value: '7', value_type: 'int', description: '日志保留天数' }
+  ], { max_key_retries: '0', max_concurrency: '0', log_retention_days: '30' });
+  page.setAllowSave(true);
 
-  const settingRows = page.renderCalls.filter(({ template }) => template === 'tpl-setting-row');
-  assert.equal(settingRows.length, 2);
-  for (const { data } of settingRows) {
-    assert.match(data.inputHtml, /\bdisabled\b/);
-    assert.equal(data.resetDisabledAttributes, 'disabled');
-  }
-  const channelRow = settingRows.find(({ data }) => data.key === 'auto_update_channel');
-  assert.ok(channelRow);
-  assert.doesNotMatch(channelRow.data.inputHtml, /data-action="check-for-updates"/);
+  page.saveButton.click();
+  await flushAsyncWork();
+
+  assert.equal(saveRequests(page).length, 0);
+  assert.equal(page.prompts.length, 0);
+  assert.equal(page.errors.length, 1);
+  assert.match(page.errors[0], /^2 项无效：/);
+  assert.match(page.errors[0], /请检查 单渠道最大Key重试次数：/);
+  assert.match(page.errors[0], /请检查 最大并发请求数：/);
+  assert.doesNotMatch(page.errors[0], /max_key_retries|max_concurrency/);
+  assert.equal(page.inputs.max_key_retries.getAttribute('aria-invalid'), 'true');
+  assert.equal(page.inputs.max_concurrency.getAttribute('aria-invalid'), 'true');
+  assert.equal(page.inputs.log_retention_days.getAttribute('aria-invalid'), null);
+  assert.equal(global.document.activeElement, page.inputs.max_key_retries);
+
+  page.editInput('max_key_retries', '5');
+  assert.equal(page.inputs.max_key_retries.getAttribute('aria-invalid'), null);
+  assert.equal(page.inputs.max_concurrency.getAttribute('aria-invalid'), 'true');
 });
 
-
-test('TypeSafe secret is omitted unless changed and explicit reset disables the service', async (t) => {
+test('保存成功后汇总需重启生效的设置', async (t) => {
   const page = await loadSettingsPage(t, [
-    { key: 'TypeSafe_api_key', value: '', default_value: '', value_type: 'string', configured: true },
-    { key: 'TypeSafe_enabled', value: 'true', default_value: 'false', value_type: 'bool' },
-    { key: 'auto_refresh_interval_seconds', value: '10', value_type: 'int' }
-  ], { TypeSafe_api_key: '', TypeSafe_enabled: 'true', auto_refresh_interval_seconds: '20' });
+    { key: 'max_concurrency', value: '10', value_type: 'int', description: '最大并发请求数' }
+  ], { max_concurrency: '20' });
+  page.setAllowSave(true);
+
+  page.saveButton.click();
+  await flushAsyncWork();
+
+  assert.equal(saveRequests(page).length, 1);
+  assert.deepEqual(page.successes, ['需重启：最大并发请求数']);
+});
+
+test('存在未保存修改时离开页面受保护，保存后解除', async (t) => {
+  const page = await loadSettingsPage(t, [
+    { key: 'max_concurrency', value: '10', value_type: 'int', description: '' }
+  ], { max_concurrency: '10' });
+  page.setAllowSave(true);
+
+  assert.equal(page.hasUnsavedChanges(), false);
+  page.editInput('max_concurrency', '20');
+  assert.equal(page.hasUnsavedChanges(), true);
+
+  page.saveButton.click();
+  await flushAsyncWork();
+  assert.equal(page.hasUnsavedChanges(), false);
+});
+
+test('设置加载失败时提供重试入口并重新加载', async (t) => {
+  const page = await loadSettingsPage(t, [
+    { key: 'max_concurrency', value: '10', value_type: 'int', description: '' }
+  ], { max_concurrency: '10' }, { initialLoadError: '网络错误' });
+
+  assert.match(page.settingsBody.innerHTML, /网络错误/);
+  assert.match(page.settingsBody.innerHTML, /data-action="retry-load-settings"/);
+  const loadsBefore = page.requests.filter(({ url }) => url === '/admin/settings').length;
+
+  page.clickRetryLoad();
+  await flushAsyncWork();
+
+  assert.equal(page.requests.filter(({ url }) => url === '/admin/settings').length, loadsBefore + 1);
+});
+
+test('dynamic reasoning setting validates and saves its JSON contract through the restart workflow', async (t) => {
+  const initial = JSON.stringify({ enabled: false, decision_channel_id: 0, decision_model: '', business_models: [], timeout_ms: 2000 });
+  const value = JSON.stringify({ enabled: true, decision_channel_id: 7, decision_model: 'jev-latest', business_models: ['gpt-5'], timeout_ms: 1500 });
+  const page = await loadSettingsPage(t, [{key: 'reasoning_auto', value: initial, value_type: 'string'}], {reasoning_auto: initial});
+  page.inputs.reasoning_auto.value = value;
   page.setAllowSave(true);
   page.saveButton.click();
   await flushAsyncWork();
-  assert.deepEqual(JSON.parse(saveRequests(page)[0].options.body), { auto_refresh_interval_seconds: '20' });
-  page.clickReset('TypeSafe_api_key');
+  assert.equal(saveRequests(page).length, 1);
+  assert.deepEqual(JSON.parse(JSON.parse(saveRequests(page)[0].options.body).reasoning_auto), JSON.parse(value));
+  assert.equal(page.prompts.length, 1);
+  page.inputs.reasoning_auto.value = JSON.stringify({...JSON.parse(value), timeout_ms: 99});
   page.saveButton.click();
   await flushAsyncWork();
-  assert.deepEqual(JSON.parse(saveRequests(page)[1].options.body), { TypeSafe_api_key: '', TypeSafe_enabled: 'false' });
-  page.inputs.TypeSafe_api_key.value = 'replacement-key';
-  page.saveButton.click();
-  await flushAsyncWork();
-  assert.deepEqual(JSON.parse(saveRequests(page)[2].options.body), { TypeSafe_api_key: 'replacement-key' });
-  assert.equal(page.inputs.TypeSafe_api_key.value, '');
+  assert.equal(saveRequests(page).length, 1);
+  assert.equal(page.inputs.reasoning_auto.getAttribute('aria-invalid'), 'true');
 });
 
-test('TypeSafe test sends entered or saved key without saving and restores button after errors', async (t) => {
+test('invalid persisted reasoning JSON leaves settings reload and repair usable', async (t) => {
+  const invalid = JSON.stringify({ enabled: false, business_models: null });
   const page = await loadSettingsPage(t, [
-    { key: 'TypeSafe_api_key', value: '', default_value: '', value_type: 'string', configured: true }
-  ], { TypeSafe_api_key: ' entered-key ' });
-  page.clickTypeSafe();
-  page.clickTypeSafe();
-  assert.equal(page.typeSafeButton.disabled, true);
+    { key: 'reasoning_auto', value: invalid, value_type: 'json' },
+    { key: 'max_concurrency', value: '10', value_type: 'int' }
+  ], { reasoning_auto: invalid, max_concurrency: '10' });
+  page.clickRetryLoad();
   await flushAsyncWork();
-  const calls = () => page.requests.filter(r => r.url === '/admin/typesafe/test');
-  assert.equal(calls().length, 1);
-  assert.deepEqual(JSON.parse(calls()[0].options.body), { api_key: 'entered-key' });
-  assert.equal(page.inputs.TypeSafe_api_key.value, ' entered-key ');
-  page.inputs.TypeSafe_api_key.value = '';
-  page.clickTypeSafe();
+  assert.equal(page.inputs.reasoning_auto.value, invalid);
+  assert.equal(page.inputs.max_concurrency.value, '10');
+  await page.openReasoning();
+  page.reasoningAction('reset-reasoning-auto');
+  page.reasoningAction('apply-reasoning-auto');
+  page.setAllowSave(true);
+  page.saveButton.click();
   await flushAsyncWork();
-  assert.deepEqual(JSON.parse(calls()[1].options.body), {});
-  page.clickReset('TypeSafe_api_key');
-  page.clickTypeSafe();
+  assert.equal(saveRequests(page).length, 1);
+  assert.deepEqual(JSON.parse(JSON.parse(saveRequests(page)[0].options.body).reasoning_auto), reasoningDefaults);
+});
+
+test('persisted reasoning JSON formatting does not mark the page dirty', async (t) => {
+  const persisted = '{ "enabled": false, "timeout_ms": 2000 }';
+  const rendered = JSON.stringify({ enabled: false, decision_channel_id: 0, decision_model: '', business_models: [], timeout_ms: 2000 });
+  const page = await loadSettingsPage(t, [{ key: 'reasoning_auto', value: persisted, value_type: 'json' }], { reasoning_auto: rendered });
+  assert.equal(page.hasUnsavedChanges(), false);
+});
+
+test('reasoning editor rejects explicit null and incorrect field types', async (t) => {
+  const initial = JSON.stringify({ enabled: false });
+  const page = await loadSettingsPage(t, [{ key: 'reasoning_auto', value: initial, value_type: 'json' }], { reasoning_auto: initial });
+  page.setAllowSave(true);
+  for (const [field, invalid] of Object.entries({ enabled: 'false', decision_channel_id: '0', decision_model: 0, business_models: {}, timeout_ms: '2000' })) {
+    for (const value of [null, invalid]) {
+      page.editInput('reasoning_auto', JSON.stringify({ enabled: false, [field]: value }));
+      page.saveButton.click();
+      await flushAsyncWork();
+      assert.equal(saveRequests(page).length, 0, field);
+      assert.equal(page.inputs.reasoning_auto.getAttribute('aria-invalid'), 'true', field);
+    }
+  }
+});
+
+test('reasoning business models reject only parseable thinking suffixes and wildcards', async (t) => {
+  const initial = JSON.stringify({ enabled: false });
+  const page = await loadSettingsPage(t, [{ key: 'reasoning_auto', value: initial, value_type: 'json' }], { reasoning_auto: initial });
+  page.setAllowSave(true);
+  for (const model of ['gpt-5(high)', 'gpt-5( Auto )', 'gpt-5(8192)', 'gpt-5(none)', 'gpt-*', 'gpt-5?']) {
+    page.editInput('reasoning_auto', JSON.stringify({ enabled: false, business_models: [model] }));
+    page.saveButton.click();
+    await flushAsyncWork();
+    assert.equal(saveRequests(page).length, 0, model);
+    assert.equal(page.inputs.reasoning_auto.getAttribute('aria-invalid'), 'true', model);
+  }
+  const accepted = JSON.stringify({ enabled: false, business_models: ['foo(bar)', 'gpt-5(preview)', '(high)'] });
+  page.editInput('reasoning_auto', accepted);
+  page.saveButton.click();
   await flushAsyncWork();
-  assert.deepEqual(JSON.parse(calls()[2].options.body), { api_key: '' });
-  assert.equal(page.typeSafeButton.disabled, false);
-  assert.equal(page.requests.filter(r => r.url === '/admin/settings/batch').length, 0);
-  assert.equal(page.prompts.length, 0);
-  assert.equal(page.successes.length, 3);
-  page.failNextSave('connection failed');
-  page.clickTypeSafe();
+  assert.equal(saveRequests(page).length, 1);
+  assert.deepEqual(JSON.parse(JSON.parse(saveRequests(page)[0].options.body).reasoning_auto), JSON.parse(accepted));
+});
+
+const reasoningDefaults = { enabled: false, decision_channel_id: 0, decision_model: '', business_models: [], timeout_ms: 2000 };
+const reasoningConfigured = { ...reasoningDefaults, enabled: true, decision_channel_id: 7, decision_model: 'judge', business_models: ['gpt-5'], timeout_ms: 1500 };
+
+async function loadReasoningPage(t, config = reasoningConfigured, options = {}) {
+  const value = JSON.stringify(config);
+  return loadSettingsPage(t, [{ key: 'reasoning_auto', value, value_type: 'json', default_value: JSON.stringify(reasoningDefaults) }],
+    { reasoning_auto: value }, {
+      channels: [
+        { id: 7, enabled: true, auth_type: 'system_one', name: 'Judge', models: ['judge'] },
+        { id: 8, enabled: true, auth_type: 'system_one', name: 'Other', models: ['other-judge'] },
+        { id: 9, enabled: true, auth_type: 'api_key', name: 'Chat', models: ['gpt-5'] }
+      ],
+      filterModels: ['gpt-5', 'claude', 'foo(bar)', 'gpt-5(high)', 'wild-*'], ...options
+    });
+}
+
+test('reasoning modal selected-count toggle lists only selected models and combines with the name filter', async (t) => {
+  const page = await loadReasoningPage(t);
+  await page.openReasoning();
+  page.selectReasoningModel('claude', true);
+  page.selectReasoningModel('gpt-5', true);
+  page.reasoningAction('toggle-reasoning-selected');
+  assert.deepEqual(page.reasoningModels().map(input => [input.value, input.checked]), [['claude', true], ['gpt-5', true]]);
+  page.selectReasoningModel('claude', false);
+  page.filterReasoningModels('GPT');
+  assert.deepEqual(page.reasoningModels().map(input => input.value), ['gpt-5']);
+  page.filterReasoningModels('');
+  assert.deepEqual(page.reasoningModels().map(input => input.value), ['gpt-5']);
+  page.reasoningAction('toggle-reasoning-selected');
+  assert.deepEqual(page.reasoningModels().map(input => input.value), ['claude', 'foo(bar)', 'gpt-5']);
+  page.reasoningAction('toggle-reasoning-selected');
+  page.reasoningAction('close-reasoning-auto');
+  await page.openReasoning();
+  assert.deepEqual(page.reasoningModels().map(input => input.value).sort(), ['claude', 'foo(bar)', 'gpt-5']);
+});
+
+test('reasoning modal preserves checked models across filters and applies through save-all', async (t) => {
+  const page = await loadReasoningPage(t);
+  await page.openReasoning();
+  assert.deepEqual(page.reasoningModels().map(input => input.value).sort(), ['claude', 'foo(bar)', 'gpt-5']);
+  page.selectReasoningModel('claude', true);
+  page.filterReasoningModels('GPT');
+  assert.deepEqual(page.reasoningModels().map(input => [input.value, input.checked]), [['gpt-5', true]]);
+  page.selectReasoningModel('gpt-5', false);
+  page.filterReasoningModels('');
+  assert.equal(page.reasoningModels().find(input => input.value === 'claude').checked, true);
+  assert.equal(page.reasoningModels().find(input => input.value === 'gpt-5').checked, false);
+  assert.equal(page.hasUnsavedChanges(), false);
+  page.reasoningAction('apply-reasoning-auto');
+  assert.equal(saveRequests(page).length, 0);
+  assert.equal(page.hasUnsavedChanges(), true);
+  page.setAllowSave(true);
+  page.saveButton.click();
   await flushAsyncWork();
-  assert.equal(page.typeSafeButton.disabled, false);
-  assert.match(page.errors.at(-1), /connection failed/);
+  const payload = JSON.parse(JSON.parse(saveRequests(page)[0].options.body).reasoning_auto);
+  assert.deepEqual(payload, { ...reasoningConfigured, business_models: ['claude'] });
+  assert.equal(page.prompts.length, 1);
+});
+
+test('reasoning modal cancellation discards edits and restores the persisted draft on reopen', async (t) => {
+  const page = await loadReasoningPage(t);
+  const original = page.inputs.reasoning_auto.value;
+  await page.openReasoning();
+  page.editReasoningField('timeout_ms', 3);
+  page.selectReasoningModel('claude', true);
+  page.reasoningAction('close-reasoning-auto');
+  assert.equal(page.inputs.reasoning_auto.value, original);
+  assert.equal(page.hasUnsavedChanges(), false);
+  await page.openReasoning();
+  assert.equal(page.reasoningField('reasoningTimeout').value, '1.5');
+  assert.equal(page.reasoningModels().find(input => input.value === 'claude').checked, false);
+});
+
+test('Escape closes the reasoning modal even when focus left the modal', async (t) => {
+  const page = await loadReasoningPage(t);
+  const original = page.inputs.reasoning_auto.value;
+  await page.openReasoning();
+  page.editReasoningField('timeout_ms', 3);
+  page.pressDocumentKey('Escape', { defaultPrevented: true });
+  assert.equal(page.reasoningModal.classList.contains('show'), true);
+  assert.equal(page.pressDocumentKey('Escape').defaultPrevented, true);
+  assert.equal(page.reasoningModal.classList.contains('show'), false);
+  assert.equal(page.inputs.reasoning_auto.value, original);
+});
+
+test('reasoning decision channel offers only System One channels', async (t) => {
+  const page = await loadReasoningPage(t);
+  await page.openReasoning();
+  const values = [...page.reasoningField('reasoningDecisionChannel').innerHTML.matchAll(/<option value="([^"]*)"/g)].map(match => match[1]);
+  assert.deepEqual(values, ['0', '7', '8']);
+});
+
+test('changing reasoning decision channel clears the old decision model', async (t) => {
+  const page = await loadReasoningPage(t);
+  await page.openReasoning();
+  page.editReasoningField('decision_channel_id', 8);
+  assert.equal(page.reasoningField('reasoningDecisionModel').value, '');
+  page.reasoningAction('apply-reasoning-auto');
+  assert.equal(page.hasUnsavedChanges(), false);
+  assert.equal(page.reasoningError.hidden, false);
+  page.editReasoningField('decision_model', 'other-judge');
+  page.reasoningAction('apply-reasoning-auto');
+  assert.deepEqual(JSON.parse(page.inputs.reasoning_auto.value), { ...reasoningConfigured, decision_channel_id: 8, decision_model: 'other-judge' });
+});
+
+test('invalid reasoning timeout cannot apply a modal draft', async (t) => {
+  const page = await loadReasoningPage(t);
+  const original = page.inputs.reasoning_auto.value;
+  await page.openReasoning();
+  for (const timeout of [0.099, 10.001, '']) {
+    page.editReasoningField('timeout_ms', timeout);
+    page.reasoningAction('apply-reasoning-auto');
+    assert.equal(page.inputs.reasoning_auto.value, original);
+    assert.equal(page.reasoningError.hidden, false);
+    assert.equal(page.reasoningModal.classList.contains('show'), true);
+  }
+  assert.equal(page.hasUnsavedChanges(), false);
+});
+
+test('stored reasoning request models remain selected when absent from available models', async (t) => {
+  const config = { ...reasoningConfigured, business_models: ['retired-model'] };
+  const page = await loadReasoningPage(t, config);
+  await page.openReasoning();
+  assert.equal(page.reasoningModels().find(input => input.value === 'retired-model').checked, true);
+  page.selectReasoningModel('retired-model', false);
+  page.filterReasoningModels('retired');
+  assert.deepEqual(page.reasoningModels().map(input => [input.value, input.checked]), [['retired-model', false]]);
+  page.filterReasoningModels('');
+  assert.equal(page.reasoningModels().find(input => input.value === 'retired-model').checked, false);
+  page.selectReasoningModel('retired-model', true);
+  page.selectReasoningModel('claude', true);
+  page.reasoningAction('apply-reasoning-auto');
+  assert.deepEqual(JSON.parse(page.inputs.reasoning_auto.value).business_models, ['retired-model', 'claude']);
+});
+
+test('invalid persisted reasoning is locked until reset and reset cancellation preserves original data', async (t) => {
+  const config = { ...reasoningConfigured, business_models: ['gpt-5(high)'] };
+  const page = await loadReasoningPage(t, config);
+  const original = page.inputs.reasoning_auto.value;
+  await page.openReasoning();
+  assert.equal(page.reasoningField('reasoningTimeout').disabled, true);
+  page.editReasoningField('timeout_ms', 3);
+  page.reasoningAction('apply-reasoning-auto');
+  assert.equal(page.inputs.reasoning_auto.value, original);
+  page.reasoningAction('reset-reasoning-auto');
+  assert.equal(page.reasoningField('reasoningTimeout').disabled, false);
+  page.editReasoningField('timeout_ms', 3);
+  assert.equal(page.inputs.reasoning_auto.value, original);
+  page.reasoningAction('close-reasoning-auto');
+  assert.equal(page.inputs.reasoning_auto.value, original);
+  assert.equal(page.hasUnsavedChanges(), false);
+  await page.openReasoning();
+  assert.equal(page.reasoningField('reasoningTimeout').disabled, true);
+  page.reasoningAction('reset-reasoning-auto');
+  page.editReasoningField('timeout_ms', 3);
+  page.reasoningAction('apply-reasoning-auto');
+  assert.deepEqual(JSON.parse(page.inputs.reasoning_auto.value), { ...reasoningDefaults, timeout_ms: 3000 });
+});
+
+test('reasoning option load failure preserves the stored decision and selected models', async (t) => {
+  const page = await loadReasoningPage(t, reasoningConfigured, { reasoningLoadError: 'offline' });
+  await page.openReasoning();
+  assert.equal(page.reasoningError.hidden, false);
+  assert.equal(page.reasoningField('reasoningDecisionChannel').value, '7');
+  assert.equal(page.reasoningField('reasoningDecisionModel').value, 'judge');
+  assert.deepEqual(page.reasoningModels().map(input => [input.value, input.checked]), [['gpt-5', true]]);
+  page.editReasoningField('timeout_ms', 2.5);
+  page.reasoningAction('apply-reasoning-auto');
+  assert.deepEqual(JSON.parse(page.inputs.reasoning_auto.value), { ...reasoningConfigured, timeout_ms: 2500 });
+});
+
+
+test('reasoning header checkbox selects visible models and preserves selections outside the filter', async (t) => {
+  const page = await loadReasoningPage(t);
+  await page.openReasoning();
+  const header = page.reasoningField('reasoningModelsSelectAll');
+  assert.equal(header.checked, false);
+  assert.equal(header.indeterminate, true);
+  page.toggleReasoningModels(true);
+  assert.equal(header.checked, true);
+  assert.equal(header.indeterminate, false);
+  assert.ok(page.reasoningModels().every(model => model.checked));
+  page.filterReasoningModels('GPT');
+  assert.equal(header.checked, true);
+  page.toggleReasoningModels(false);
+  assert.equal(header.checked, false);
+  assert.equal(header.indeterminate, false);
+  page.filterReasoningModels('');
+  assert.equal(header.indeterminate, true);
+  assert.equal(page.reasoningModels().find(model => model.value === 'claude').checked, true);
+  page.selectReasoningModel('foo(bar)', false);
+  assert.equal(header.indeterminate, true);
+  page.selectReasoningModel('claude', false);
+  assert.equal(header.indeterminate, false);
+  page.toggleReasoningModels(true);
+  page.filterReasoningModels('GPT');
+  page.toggleReasoningModels(false);
+  page.reasoningAction('apply-reasoning-auto');
+  page.setAllowSave(true);
+  page.saveButton.click();
+  await flushAsyncWork();
+  const saved = JSON.parse(JSON.parse(saveRequests(page)[0].options.body).reasoning_auto);
+  assert.deepEqual(saved.business_models.sort(), ['claude', 'foo(bar)']);
+});
+
+test('reasoning header checkbox is disabled for no matches and invalid stored configuration', async (t) => {
+  const page = await loadReasoningPage(t, { ...reasoningConfigured, business_models: ['gpt-5(high)'] });
+  await page.openReasoning();
+  assert.equal(page.reasoningField('reasoningModelsSelectAll').disabled, true);
+  page.reasoningAction('reset-reasoning-auto');
+  await flushAsyncWork();
+  const header = page.reasoningField('reasoningModelsSelectAll');
+  assert.equal(header.disabled, false);
+  page.filterReasoningModels('no-matches');
+  assert.equal(header.disabled, true);
+  assert.equal(header.checked, false);
+  assert.equal(header.indeterminate, false);
+  page.filterReasoningModels('GPT');
+  assert.equal(header.disabled, false);
+  page.toggleReasoningModels(true);
+  assert.equal(header.checked, true);
+  page.reasoningAction('close-reasoning-auto');
+  assert.equal(page.hasUnsavedChanges(), false);
 });

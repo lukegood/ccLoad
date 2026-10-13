@@ -11,7 +11,7 @@ import (
 func TestAPIKey_CreateAndGet(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "apikey.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "apikey-test-channel")
@@ -19,7 +19,7 @@ func TestAPIKey_CreateAndGet(t *testing.T) {
 	// 批量创建 API Keys
 	keys := []*model.APIKey{
 		{ChannelID: channelID, KeyIndex: 0, APIKey: "sk-key-0", KeyStrategy: model.KeyStrategySequential},
-		{ChannelID: channelID, KeyIndex: 1, APIKey: "sk-key-1", Priority: -8, AllowedModels: []string{"gpt-5", "gpt-4.1"}, KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: channelID, KeyIndex: 1, APIKey: "sk-key-1", Priority: -8, AllowedModels: []string{"gpt-5", "gpt-4.1"}, ModelScopeAuto: true, KeyStrategy: model.KeyStrategySequential},
 		{ChannelID: channelID, KeyIndex: 2, APIKey: "sk-key-2", ModelScopeEmpty: true, Disabled: true, KeyStrategy: model.KeyStrategySequential},
 	}
 	if err := store.CreateAPIKeysBatch(ctx, keys); err != nil {
@@ -43,6 +43,9 @@ func TestAPIKey_CreateAndGet(t *testing.T) {
 	if len(key.AllowedModels) != 2 || key.AllowedModels[0] != "gpt-5" || key.AllowedModels[1] != "gpt-4.1" {
 		t.Errorf("allowed models: got %v, want [gpt-5 gpt-4.1]", key.AllowedModels)
 	}
+	if !key.ModelScopeAuto {
+		t.Fatal("automatic scope source did not persist")
+	}
 
 	// 获取渠道所有 API Keys
 	allKeys, err := store.GetAPIKeys(ctx, channelID)
@@ -55,12 +58,15 @@ func TestAPIKey_CreateAndGet(t *testing.T) {
 	if !allKeys[2].ModelScopeEmpty || allKeys[2].AllowsModel("gpt-5") {
 		t.Fatalf("empty model scope did not persist: %+v", allKeys[2])
 	}
+	if allKeys[0].ModelScopeAuto || !allKeys[1].ModelScopeAuto || allKeys[2].ModelScopeAuto {
+		t.Fatalf("scope source changed on batch read: %+v", allKeys)
+	}
 }
 
 func TestAPIKey_UpdateAllowedModelsPreservesRuntimeState(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "allowed_models.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "allowed-models-channel")
 
@@ -72,7 +78,7 @@ func TestAPIKey_UpdateAllowedModelsPreservesRuntimeState(t *testing.T) {
 		t.Fatalf("create api key: %v", err)
 	}
 	if err := store.UpdateAPIKeyModelScopes(ctx, channelID, map[int]model.APIKeyModelScope{
-		0: {AllowedModels: []string{"gpt-5", "gpt-4.1"}, Disabled: true},
+		0: {AllowedModels: []string{"gpt-5", "gpt-4.1"}, ModelScopeAuto: true, Disabled: true},
 	}); err != nil {
 		t.Fatalf("update allowed models: %v", err)
 	}
@@ -83,6 +89,9 @@ func TestAPIKey_UpdateAllowedModelsPreservesRuntimeState(t *testing.T) {
 	}
 	if len(got.AllowedModels) != 2 || got.AllowedModels[0] != "gpt-5" || got.AllowedModels[1] != "gpt-4.1" {
 		t.Fatalf("allowed models = %v, want [gpt-5 gpt-4.1]", got.AllowedModels)
+	}
+	if !got.ModelScopeAuto {
+		t.Fatal("scope update lost automatic source")
 	}
 	if got.Note != "primary" || got.KeyStrategy != model.KeyStrategyRoundRobin || !got.Disabled ||
 		got.CooldownUntil != 1234 || got.CooldownDurationMs != 5678 {
@@ -99,15 +108,15 @@ func TestAPIKey_UpdateAllowedModelsPreservesRuntimeState(t *testing.T) {
 	if len(got.AllowedModels) != 0 {
 		t.Fatalf("allowed models after clear = %v, want unrestricted", got.AllowedModels)
 	}
-	if got.ModelScopeEmpty {
-		t.Fatal("explicit unrestricted scope remained deny-all")
+	if got.ModelScopeEmpty || got.ModelScopeAuto {
+		t.Fatal("explicit unrestricted scope remained deny-all or automatic")
 	}
 }
 
 func TestAPIKey_UpdateStrategy(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "strategy.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "strategy-test-channel")
@@ -138,7 +147,7 @@ func TestAPIKey_UpdateStrategy(t *testing.T) {
 func TestAPIKey_NotesPersistAndUpdate(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "notes.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "notes-test-channel")
@@ -176,7 +185,7 @@ func TestAPIKey_NotesPersistAndUpdate(t *testing.T) {
 func TestAPIKey_Delete(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "delete.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "delete-test-channel")
@@ -209,7 +218,7 @@ func TestAPIKey_Delete(t *testing.T) {
 func TestAPIKey_CompactIndices(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "compact.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "compact-test-channel")
@@ -254,7 +263,7 @@ func TestAPIKey_CompactIndices(t *testing.T) {
 func TestAPIKey_DeleteAll(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "delete_all.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "delete-all-test-channel")
@@ -286,7 +295,7 @@ func TestAPIKey_DeleteAll(t *testing.T) {
 func TestAPIKey_GetAllAPIKeys(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "get_all.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -323,7 +332,7 @@ func TestAPIKey_GetAllAPIKeys(t *testing.T) {
 func TestAPIKey_ImportChannelBatch(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "import.db")
+	store := newTestStore(t)
 
 	ctx := context.Background()
 
@@ -346,7 +355,7 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 				},
 			},
 			APIKeys: []model.APIKey{
-				{KeyIndex: 0, APIKey: "sk-import-key-1", KeyStrategy: model.KeyStrategySequential},
+				{KeyIndex: 0, APIKey: "sk-import-key-1", ModelScopeAuto: true, KeyStrategy: model.KeyStrategySequential},
 				{KeyIndex: 1, APIKey: "sk-import-key-2", KeyStrategy: model.KeyStrategySequential},
 			},
 		},
@@ -431,6 +440,9 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 	if len(keys1) != 2 {
 		t.Fatalf("expected 2 keys for imported-channel-1, got %d", len(keys1))
 	}
+	if !keys1[0].ModelScopeAuto || keys1[1].ModelScopeAuto || !allKeys[id1][0].ModelScopeAuto {
+		t.Fatal("import or all-channel read lost scope source")
+	}
 	keys2, err := store.GetAPIKeys(ctx, id2)
 	if err != nil {
 		t.Fatalf("get api keys for imported-channel-2: %v", err)
@@ -441,7 +453,7 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 }
 
 func TestAPIKey_ImportChannelBatchCannotReplaceCodexAuthentication(t *testing.T) {
-	store := newTestStore(t, "import-codex-auth-immutable.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	credential := `{"type":"codex","access_token":"at-secret","refresh_token":"rt-secret","expired":"2030-01-01T00:00:00Z"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -478,8 +490,28 @@ func TestAPIKey_ImportChannelBatchCannotReplaceCodexAuthentication(t *testing.T)
 	}
 }
 
+func TestAPIKey_ImportChannelBatchRejectsOAuthSystemOne(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	_, _, err := store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			Name: "decision-oauth", AuthType: model.AuthTypeSystemOne,
+			OAuthCredential: `{"type":"codex","access_token":"at","refresh_token":"rt","expired":"2030-01-01T00:00:00Z"}`,
+			URLs:            model.ChannelURLs{{URL: "https://one.example"}},
+			Enabled:         true, ModelEntries: []model.ModelEntry{{Model: "jev-latest"}},
+		},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "OAuth credential") {
+		t.Fatalf("ImportChannelBatch() error = %v, want OAuth credential rejection", err)
+	}
+	configs, err := store.ListConfigs(ctx)
+	if err != nil || len(configs) != 0 {
+		t.Fatalf("configs after rejected import = (%d, %v)", len(configs), err)
+	}
+}
+
 func TestAPIKey_ImportChannelBatchUpdatesExistingOAuthChannel(t *testing.T) {
-	store := newTestStore(t, "import-update-oauth-channel.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	original := `{"type":"codex","access_token":"at-original","refresh_token":"rt-original","expired":"2031-01-01T00:00:00Z"}`
 	created, err := store.CreateConfig(ctx, &model.Config{
@@ -533,7 +565,7 @@ func TestAPIKey_ImportChannelBatchUpdatesExistingOAuthChannel(t *testing.T) {
 func TestAPIKey_ImportChannelBatchPreservesScheduledCheckWithExplicitID(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "import-preserve-id.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	channel := &model.ChannelWithKeys{
@@ -577,7 +609,7 @@ func TestAPIKey_ImportChannelBatchPreservesScheduledCheckWithExplicitID(t *testi
 func TestAPIKey_ImportChannelBatchPreservesModelEntryOrder(t *testing.T) {
 	t.Parallel()
 
-	store := newTestStore(t, "import-preserve-model-order.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 
 	channel := &model.ChannelWithKeys{
@@ -623,7 +655,7 @@ func TestAPIKey_ImportChannelBatchPreservesModelEntryOrder(t *testing.T) {
 
 func TestAPIKey_ImportChannelBatchMigratesChannelManagementEnvelope(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "import-channel-management-migration.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	envelope := `{"kind":"channel_management","version":1,"profile":"sub2api","settings":{"base_url":"https://panel.example.com","access_token":"csv-private-token"},"state":{}}`
 	invalidCredential := `{"type":"codex","access_token":"must-not-persist"}`
@@ -713,7 +745,7 @@ func TestAPIKey_ImportChannelBatchMigratesChannelManagementEnvelope(t *testing.T
 
 func TestAPIKey_UpdatePrioritiesPreservesRuntimeState(t *testing.T) {
 	t.Parallel()
-	store := newTestStore(t, "priority.db")
+	store := newTestStore(t)
 	ctx := context.Background()
 	channelID := createTestChannel(t, ctx, store, "priority")
 	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{

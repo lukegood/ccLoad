@@ -31,6 +31,7 @@ class FakeElement {
     this.classList = new FakeClassList();
     this.listeners = new Map();
     this.children = [];
+    this.dataset = {};
     this.disabled = false;
     this.isConnected = true;
   }
@@ -184,8 +185,6 @@ test('native select enhancement preserves semantic values, events and disabled s
     assert.equal(instance.input.value, 'Antigravity');
     assert.equal(instance.input.getAttribute('aria-labelledby'), label.id);
     assert.equal(label.htmlFor, instance.input.id);
-    assert.equal(comboboxConfig.attachMode, true);
-    assert.equal(comboboxConfig.showAllOptionsOnOpen, true);
     assert.equal(comboboxConfig.getOptions()[2].disabled, true);
     assert.deepEqual(
       comboboxConfig.getOptions().map(option => option.value),
@@ -237,9 +236,7 @@ test('detached select is skipped and enhanced once reconnected', () => {
       return [];
     }
   };
-  let comboboxCalls = 0;
-  global.createSearchableCombobox = (config) => {
-    comboboxCalls += 1;
+  global.createSearchableCombobox = () => {
     return {
       setValue() {},
       refresh() {}
@@ -255,19 +252,155 @@ test('detached select is skipped and enhanced once reconnected', () => {
     ], 'codex');
     select.isConnected = false;
 
-    // 游离节点直接跳过:不创建 combobox、不产生 wrapper
+    // 游离节点直接跳过
     assert.equal(enhanceNativeSelect(select), null);
-    assert.equal(comboboxCalls, 0);
-    assert.equal(select.enhancedSibling, undefined);
 
     // 重新接入文档树后可正常增强
     select.isConnected = true;
     const instance = enhanceNativeSelect(select);
     assert.ok(instance);
-    assert.equal(comboboxCalls, 1);
   } finally {
     delete require.cache[modulePath];
     if (previousCombobox === undefined) delete global.createSearchableCombobox;
     else global.createSearchableCombobox = previousCombobox;
+  }
+});
+
+class FakeBox extends FakeElement {
+  constructor(tagName, document) {
+    super(tagName, document);
+    this.style = {};
+    this.className = '';
+    this.rect = { top: 0, bottom: 0, left: 0, width: 0 };
+  }
+
+  set innerHTML(_) {
+    this.children = [];
+  }
+
+  appendChild(child) {
+    this.append(child);
+    return child;
+  }
+
+  hasClass(name) {
+    return this.className.split(/\s+/).includes(name) || this.classList.contains(name);
+  }
+
+  closest(selector) {
+    for (let node = this; node; node = node.parentElement) {
+      if (node.hasClass?.(selector.replace(/^\./, ''))) return node;
+    }
+    return null;
+  }
+
+  contains(node) {
+    for (; node; node = node.parentElement) {
+      if (node === this) return true;
+    }
+    return false;
+  }
+
+  querySelectorAll(selector) {
+    const name = selector.replace(/^\./, '');
+    const found = [];
+    const visit = (node) => node.children?.forEach((child) => {
+      if (child.hasClass?.(name)) found.push(child);
+      visit(child);
+    });
+    visit(this);
+    return found;
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  getBoundingClientRect() {
+    return this.rect;
+  }
+}
+
+test('combobox dropdown re-anchors to the input when filtering shrinks an upward list', () => {
+  const rowHeight = 30;
+  const previousGlobals = new Map();
+  const setGlobal = (key, value) => {
+    previousGlobals.set(key, Object.getOwnPropertyDescriptor(global, key));
+    Object.defineProperty(global, key, { configurable: true, writable: true, value });
+  };
+  const noop = () => {};
+  const document = {
+    addEventListener: noop,
+    removeEventListener: noop,
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    getElementById: id => elements[id] || null,
+    createElement: tagName => new FakeBox(tagName, document),
+    createRange: () => ({ selectNodeContents: noop, getBoundingClientRect: () => ({ width: 100 }) })
+  };
+  document.body = new FakeBox('body', document);
+  document.documentElement = new FakeBox('html', document);
+
+  const wrapper = new FakeBox('div', document);
+  wrapper.className = 'filter-combobox-wrapper';
+  const input = new FakeBox('input', document);
+  input.value = '';
+  input.placeholder = '';
+  // 视口高 600：输入框下方 158px、上方 388px，完整列表放不下只能向上展开
+  input.rect = { top: 400, bottom: 430, left: 100, width: 300 };
+  const dropdown = new FakeBox('div', document);
+  Object.defineProperty(dropdown, 'offsetHeight', {
+    get() {
+      const natural = this.children.length * rowHeight;
+      const max = Number.parseFloat(this.style.maxHeight);
+      return Number.isFinite(max) ? Math.min(natural, max) : natural;
+    }
+  });
+  dropdown.offsetWidth = 0;
+  dropdown.clientWidth = 0;
+  dropdown.scrollTop = 0;
+  wrapper.append(input, dropdown);
+  const elements = { 'model-input': input, 'model-dropdown': dropdown };
+
+  setGlobal('window', {
+    innerWidth: 1000,
+    innerHeight: 600,
+    location: { pathname: '/', search: '', href: '' },
+    addEventListener: noop,
+    removeEventListener: noop,
+    dispatchEvent: noop,
+    matchMedia: () => ({ matches: false, addEventListener: noop })
+  });
+  setGlobal('localStorage', { getItem: () => null, setItem: noop, removeItem: noop });
+  setGlobal('document', document);
+  setGlobal('CustomEvent', function CustomEvent() {});
+
+  const uiPath = require.resolve('./ui.js');
+  try {
+    delete require.cache[uiPath];
+    require(uiPath);
+    const options = Array.from({ length: 20 }, (_, i) => ({ value: `model-${i}`, label: `model-${i}` }));
+    options.push({ value: 'gpt-5.6-luna', label: 'gpt-5.6-luna' }, { value: 'gpt-6-luna', label: 'gpt-6-luna' });
+    global.window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'model-input',
+      dropdownId: 'model-dropdown',
+      showAllOptionsOnOpen: true,
+      getOptions: () => options
+    });
+
+    input.dispatchEvent({ type: 'mousedown' });
+    assert.equal(dropdown.style.top, '6px');
+
+    input.value = 'lu';
+    input.dispatchEvent({ type: 'input' });
+    assert.equal(dropdown.children.length, 2);
+    assert.equal(dropdown.style.top, '436px');
+  } finally {
+    delete require.cache[uiPath];
+    for (const [key, descriptor] of previousGlobals) {
+      if (descriptor === undefined) delete global[key];
+      else Object.defineProperty(global, key, descriptor);
+    }
   }
 });

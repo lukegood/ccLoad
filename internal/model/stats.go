@@ -7,6 +7,7 @@ type MetricPoint struct {
 	Ts                      time.Time                `json:"ts"`
 	Success                 int                      `json:"success"`
 	Error                   int                      `json:"error"`
+	RateLimited             int                      `json:"rate_limited,omitempty"`                // 429 次数（Error 的子集）
 	AvgFirstByteTimeSeconds *float64                 `json:"avg_first_byte_time_seconds,omitempty"` // 平均首字节响应时间(秒)
 	AvgDurationSeconds      *float64                 `json:"avg_duration_seconds,omitempty"`        // 平均总耗时(秒)
 	TotalCost               *float64                 `json:"total_cost,omitempty"`                  // 标准成本（美元）
@@ -36,25 +37,26 @@ type ChannelMetric struct {
 
 // HealthPoint 健康状态数据点（用于健康状态指示器）
 type HealthPoint struct {
-	Ts                       time.Time `json:"ts"`                    // 时间点
-	SuccessRate              float64   `json:"rate"`                  // 成功率 (0-1), -1表示无数据
-	SuccessCount             int       `json:"success"`               // 成功次数
-	ErrorCount               int       `json:"error"`                 // 失败次数
-	RateLimitedCount         int       `json:"rate_limited"`          // 429限流次数（ErrorCount的子集）
-	AvgFirstByteTime         float64   `json:"avg_first_byte_time"`   // 平均上游首块响应体时间(秒)
-	AvgDuration              float64   `json:"avg_duration"`          // 平均耗时(秒)
-	TotalInputTokens         int64     `json:"input_tokens"`          // 输入Token
-	TotalOutputTokens        int64     `json:"output_tokens"`         // 输出Token
-	TotalCacheReadTokens     int64     `json:"cache_read_tokens"`     // 缓存读取Token
-	TotalCacheCreationTokens int64     `json:"cache_creation_tokens"` // 缓存创建Token
-	TotalCost                float64   `json:"cost"`                  // 标准成本(美元)
-	EffectiveCost            float64   `json:"effective_cost"`        // 倍率后成本(美元)
+	Ts                       time.Time `json:"ts"`                              // 时间点
+	SuccessRate              float64   `json:"rate"`                            // 成功率 (0-1), -1表示无数据
+	SuccessCount             int       `json:"success,omitempty"`               // 成功次数
+	ErrorCount               int       `json:"error,omitempty"`                 // 失败次数
+	RateLimitedCount         int       `json:"rate_limited,omitempty"`          // 429限流次数（ErrorCount的子集）
+	AvgFirstByteTime         float64   `json:"avg_first_byte_time,omitempty"`   // 平均上游首块响应体时间(秒)
+	AvgDuration              float64   `json:"avg_duration,omitempty"`          // 平均耗时(秒)
+	TotalInputTokens         int64     `json:"input_tokens,omitempty"`          // 输入Token
+	TotalOutputTokens        int64     `json:"output_tokens,omitempty"`         // 输出Token
+	TotalCacheReadTokens     int64     `json:"cache_read_tokens,omitempty"`     // 缓存读取Token
+	TotalCacheCreationTokens int64     `json:"cache_creation_tokens,omitempty"` // 缓存创建Token
+	TotalCost                float64   `json:"cost,omitempty"`                  // 标准成本(美元)
+	EffectiveCost            float64   `json:"effective_cost,omitempty"`        // 倍率后成本(美元)
 }
 
 // StatsEntry 统计数据条目
 type StatsEntry struct {
 	ChannelID               *int     `json:"channel_id,omitempty"`
 	ChannelName             string   `json:"channel_name"`
+	ChannelAuthType         string   `json:"channel_auth_type,omitempty"`   // 渠道认证类型（前端渠道头像）
 	ChannelPriority         *int     `json:"channel_priority,omitempty"`    // 渠道优先级（用于前端排序）
 	CostMultiplierMin       *float64 `json:"cost_multiplier_min,omitempty"` // 成本倍率区间下限（默认1，api_key 渠道为启用 Key 的最小倍率）
 	CostMultiplierMax       *float64 `json:"cost_multiplier_max,omitempty"` // 成本倍率区间上限；min 与 max 都为 1 时不下发
@@ -75,6 +77,8 @@ type StatsEntry struct {
 	PeakRPM   *float64 `json:"peak_rpm,omitempty"`   // 峰值RPM（该渠道+模型的最大每分钟请求数）
 	AvgRPM    *float64 `json:"avg_rpm,omitempty"`    // 平均RPM
 	RecentRPM *float64 `json:"recent_rpm,omitempty"` // 最近一分钟RPM（仅本日有效）
+	// 渠道峰值RPM（该渠道所有模型合并后的最大每分钟请求数，同渠道各条目相同；峰值不可按模型相加）
+	ChannelPeakRPM *float64 `json:"channel_peak_rpm,omitempty"`
 
 	// Token统计（2025-11新增）
 	TotalInputTokens              *int64   `json:"total_input_tokens,omitempty"`                // 总输入Token

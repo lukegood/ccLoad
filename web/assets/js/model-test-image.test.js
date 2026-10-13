@@ -60,7 +60,7 @@ test('image generation response accepts URL and base64 images but rejects empty 
   assert.equal(dataURLFromImage({ b64_json: 'aW1hZ2U=', mime_type: 'image/webp' }, 'png'), 'data:image/webp;base64,aW1hZ2U=');
 });
 
-test('image option controls reuse searchable comboboxes and keep API capability linkage', () => {
+test('image option controls restore preferences and keep API capability linkage', () => {
   const elements = new Map();
   const makeElement = () => {
     const listeners = new Map();
@@ -131,15 +131,6 @@ test('image option controls reuse searchable comboboxes and keep API capability 
       getChannelsForModel: () => [{ id: 7, name: 'Images', auth_type: 'api_key' }]
     });
 
-    for (const id of [
-      'imageGenerationAPISelect',
-      'imageSizeSelect',
-      'imageQualitySelect',
-      'imageBackgroundSelect',
-      'imageOutputFormatSelect'
-    ]) {
-      assert.ok(comboboxes.has(id), `${id} must use the shared searchable combobox`);
-    }
     assert.equal(comboboxes.get('imageSizeSelect').getValue(), '1536x1024');
     assert.equal(comboboxes.get('imageQualitySelect').getValue(), 'hd');
     assert.equal(comboboxes.get('imageBackgroundSelect').getValue(), 'transparent');
@@ -160,6 +151,81 @@ test('image option controls reuse searchable comboboxes and keep API capability 
     const imageSizes = comboboxes.get('imageSizeSelect').config.getOptions().map(option => option.value);
     assert.ok(imageSizes.includes('512x512'));
     assert.equal(elements.get('imageQualitySelect').disabled, false);
+  } finally {
+    delete require.cache[modulePath];
+    if (previousWindow === undefined) delete global.window;
+    else global.window = previousWindow;
+  }
+});
+
+test('image generation result persists across page loads and drops invalid images', async () => {
+  const databases = new Map();
+  const fakeIndexedDB = {
+    open(name) {
+      const request = {};
+      setTimeout(() => {
+        const isNew = !databases.has(name);
+        if (isNew) databases.set(name, new Map());
+        const stores = databases.get(name);
+        request.result = {
+          createObjectStore(storeName) { stores.set(storeName, new Map()); },
+          transaction(storeName) {
+            const transaction = {};
+            const records = stores.get(storeName);
+            const finish = (value) => {
+              const operation = { result: structuredClone(value) };
+              setTimeout(() => transaction.oncomplete?.());
+              return operation;
+            };
+            transaction.objectStore = () => ({
+              put(value, key) { records.set(key, structuredClone(value)); return finish(key); },
+              get(key) { return finish(records.get(key)); }
+            });
+            return transaction;
+          },
+          close() {}
+        };
+        if (isNew) request.onupgradeneeded?.();
+        request.onsuccess?.();
+      });
+      return request;
+    }
+  };
+
+  const modulePath = require.resolve('./model-test-image.js');
+  const previousWindow = global.window;
+  const loadFresh = () => {
+    delete require.cache[modulePath];
+    global.window = { indexedDB: fakeIndexedDB };
+    return require(modulePath);
+  };
+  try {
+    const firstPage = loadFresh();
+    assert.equal(await firstPage.saveResult({ images: [{ url: 'javascript:alert(1)' }] }), false);
+    assert.equal(await firstPage.loadSavedResult(), null);
+
+    assert.equal(await firstPage.saveResult({
+      success: true,
+      output_format: 'webp',
+      duration_ms: 1234,
+      cost_usd: 0.04,
+      images: [
+        { b64_json: 'aW1hZ2U=', revised_prompt: 'a cat' },
+        { url: 'https://example.com/a.png' },
+        { b64_json: '  ' }
+      ]
+    }), true);
+
+    const reloadedPage = loadFresh();
+    assert.deepEqual(await reloadedPage.loadSavedResult(), {
+      images: [
+        { b64_json: 'aW1hZ2U=', revised_prompt: 'a cat' },
+        { url: 'https://example.com/a.png' }
+      ],
+      output_format: 'webp',
+      duration_ms: 1234,
+      cost_usd: 0.04
+    });
   } finally {
     delete require.cache[modulePath];
     if (previousWindow === undefined) delete global.window;

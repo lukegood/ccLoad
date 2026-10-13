@@ -38,15 +38,7 @@ const (
 
 var errInvalidSettingCombination = errors.New("invalid setting combination")
 
-type adminSystemSetting struct {
-	*model.SystemSetting
-	Configured     *bool  `json:"configured,omitempty"`
-	Editable       bool   `json:"editable"`
-	DisabledReason string `json:"disabled_reason,omitempty"`
-}
-
-const containerImageManagedDisabledReason = "container_image_managed"
-
+// 容器版由镜像标签管理升级，更新配置项既不展示也不可写。
 func isContainerManagedUpdateSetting(key string) bool {
 	if !runningInContainer() {
 		return false
@@ -54,23 +46,14 @@ func isContainerManagedUpdateSetting(key string) bool {
 	return key == autoUpdateIntervalSettingKey || key == autoUpdateChannelSettingKey
 }
 
-func systemSettingForAdmin(setting *model.SystemSetting) adminSystemSetting {
-	copySetting := *setting
-	view := adminSystemSetting{
-		SystemSetting: &copySetting,
-		Editable:      true,
-	}
-	if setting.Key == config.TypeSafeAPIKeySettingKey {
-		configured := setting.Value != ""
-		view.Configured = &configured
-		copySetting.Value = ""
-		copySetting.DefaultValue = ""
-	}
-	if isContainerManagedUpdateSetting(setting.Key) {
-		view.Editable = false
-		view.DisabledReason = containerImageManagedDisabledReason
-	}
-	return view
+// 已下线功能的设置：库中旧行保留不删，管理接口不再展示或写入。
+var retiredSettingKeys = map[string]bool{
+	"TypeSafe_enabled": true,
+	"TypeSafe_api_key": true,
+}
+
+func isHiddenSetting(key string) bool {
+	return retiredSettingKeys[key] || isContainerManagedUpdateSetting(key)
 }
 
 func rejectContainerManagedUpdateSetting(c *gin.Context, key string) bool {
@@ -126,47 +109,6 @@ func (s *Server) completeCooldownBoundUpdates(ctx context.Context, requested map
 	updates[cooldownMinSecondsSettingKey] = strconv.Itoa(minSeconds)
 	updates[cooldownMaxSecondsSettingKey] = strconv.Itoa(maxSeconds)
 	return updates, nil
-}
-
-// All settings writers hold settingsUpdateMu through validation and persistence.
-func (s *Server) completeSettingUpdates(ctx context.Context, updates map[string]string) (map[string]string, error) {
-	updates, err := s.completeCooldownBoundUpdates(ctx, updates)
-	if err != nil {
-		return nil, err
-	}
-	key, changesKey := updates[config.TypeSafeAPIKeySettingKey]
-	enabled, changesEnabled := updates[config.TypeSafeEnabledSettingKey]
-	if !changesKey && !changesEnabled {
-		return updates, nil
-	}
-	if changesKey {
-		key = strings.TrimSpace(key)
-		updates[config.TypeSafeAPIKeySettingKey] = key
-		if key == "" {
-			updates[config.TypeSafeEnabledSettingKey] = "false"
-			return updates, nil
-		}
-	}
-	if on, _ := parseSettingBool(enabled); changesEnabled && on {
-		if !changesKey {
-			setting, err := s.configService.GetSettingFresh(ctx, config.TypeSafeAPIKeySettingKey)
-			if err != nil {
-				return nil, err
-			}
-			key = setting.Value
-		}
-		if strings.TrimSpace(key) == "" {
-			return nil, fmt.Errorf("%w: TypeSafe requires an API key", errInvalidSettingCombination)
-		}
-	}
-	return updates, nil
-}
-
-func publicSettingValue(key, value string) string {
-	if key == config.TypeSafeAPIKeySettingKey {
-		return ""
-	}
-	return value
 }
 
 func respondSettingCombinationError(c *gin.Context, err error) bool {
@@ -244,9 +186,12 @@ func (s *Server) AdminListSettings(c *gin.Context) {
 	if settings == nil {
 		settings = make([]*model.SystemSetting, 0)
 	}
-	views := make([]adminSystemSetting, 0, len(settings))
+	views := make([]*model.SystemSetting, 0, len(settings))
 	for _, setting := range settings {
-		views = append(views, systemSettingForAdmin(setting))
+		if isHiddenSetting(setting.Key) {
+			continue
+		}
+		views = append(views, setting)
 	}
 	RespondJSON(c, http.StatusOK, views)
 }
@@ -262,7 +207,7 @@ func (s *Server) AdminGetSetting(c *gin.Context) {
 
 	// 管理接口必须返回持久化后的最新值，不能复用等待重启的运行时缓存。
 	setting, err := s.configService.GetSettingFresh(c.Request.Context(), key)
-	if errors.Is(err, model.ErrSettingNotFound) {
+	if errors.Is(err, model.ErrSettingNotFound) || isHiddenSetting(key) {
 		RespondErrorMsg(c, http.StatusNotFound, fmt.Sprintf("setting not found: %s", key))
 		return
 	}
@@ -274,126 +219,7 @@ func (s *Server) AdminGetSetting(c *gin.Context) {
 
 	// 配置项变更频率极低，允许浏览器缓存 5 分钟
 	c.Header("Cache-Control", "private, max-age=300")
-	RespondJSON(c, http.StatusOK, systemSettingForAdmin(setting))
-}
-
-// AdminUpdateSetting 更新配置项
-// PUT /admin/settings/:key
-func (s *Server) AdminUpdateSetting(c *gin.Context) {
-	s.settingsUpdateMu.Lock()
-	defer s.settingsUpdateMu.Unlock()
-	key := c.Param("key")
-	if key == "" {
-		RespondErrorMsg(c, http.StatusBadRequest, "missing setting key")
-		return
-	}
-	if rejectContainerManagedUpdateSetting(c, key) {
-		return
-	}
-	var req SettingUpdateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("invalid request: %v", err))
-		return
-	}
-
-	// 验证值的合法性
-	setting := s.configService.GetSetting(key)
-	if setting == nil {
-		RespondErrorMsg(c, http.StatusNotFound, fmt.Sprintf("setting not found: %s", key))
-		return
-	}
-
-	if err := validateSettingValue(key, setting.ValueType, req.Value); err != nil {
-		RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("invalid value for type %s: %v", setting.ValueType, err))
-		return
-	}
-
-	updates, err := s.completeSettingUpdates(c.Request.Context(), map[string]string{key: req.Value})
-	if respondSettingCombinationError(c, err) {
-		return
-	}
-
-	// 冷却上下限必须作为一个有效快照原子写入，其他设置保持单项更新。
-	restartRequired, err := s.commitSettingUpdates(updates, func() error {
-		if len(updates) == 1 {
-			return s.configService.UpdateSetting(c.Request.Context(), key, updates[key])
-		}
-		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
-	})
-	if err != nil {
-		log.Printf("[ERROR] AdminUpdateSetting key=%s 失败: %v", key, err)
-		RespondError(c, http.StatusInternalServerError, err)
-		return
-	}
-
-	message := "配置已保存并生效"
-	if restartRequired {
-		message = "配置已保存，程序将在2秒后重启"
-	}
-	RespondJSON(c, http.StatusOK, gin.H{
-		"message": message,
-		"key":     key,
-		"value":   publicSettingValue(key, req.Value),
-	})
-
-	if restartRequired {
-		go s.triggerRestart()
-	}
-}
-
-// AdminResetSetting 重置配置为默认值
-// POST /admin/settings/:key/reset
-func (s *Server) AdminResetSetting(c *gin.Context) {
-	s.settingsUpdateMu.Lock()
-	defer s.settingsUpdateMu.Unlock()
-	key := c.Param("key")
-	if key == "" {
-		RespondErrorMsg(c, http.StatusBadRequest, "missing setting key")
-		return
-	}
-	if rejectContainerManagedUpdateSetting(c, key) {
-		return
-	}
-	// 获取默认值
-	setting := s.configService.GetSetting(key)
-	if setting == nil {
-		RespondErrorMsg(c, http.StatusNotFound, fmt.Sprintf("setting not found: %s", key))
-		return
-	}
-
-	if err := validateSettingValue(key, setting.ValueType, setting.DefaultValue); err != nil {
-		RespondErrorMsg(c, http.StatusInternalServerError, fmt.Sprintf("invalid default value for %s: %v", key, err))
-		return
-	}
-	updates, err := s.completeSettingUpdates(c.Request.Context(), map[string]string{key: setting.DefaultValue})
-	if respondSettingCombinationError(c, err) {
-		return
-	}
-	restartRequired, err := s.commitSettingUpdates(updates, func() error {
-		if len(updates) == 1 {
-			return s.configService.UpdateSetting(c.Request.Context(), key, setting.DefaultValue)
-		}
-		return s.configService.BatchUpdateSettings(c.Request.Context(), updates)
-	})
-	if err != nil {
-		log.Printf("[ERROR] AdminResetSetting key=%s 失败: %v", key, err)
-		RespondError(c, http.StatusInternalServerError, err)
-		return
-	}
-
-	message := "配置已重置并生效"
-	if restartRequired {
-		message = "配置已重置为默认值，程序将在2秒后重启"
-	}
-	RespondJSON(c, http.StatusOK, gin.H{
-		"message": message,
-		"key":     key,
-		"value":   publicSettingValue(key, setting.DefaultValue),
-	})
-
-	if restartRequired {
-		go s.triggerRestart()
-	}
+	RespondJSON(c, http.StatusOK, setting)
 }
 
 // AdminBatchUpdateSettings 批量更新配置(事务保护)
@@ -418,17 +244,28 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 			return
 		}
 		setting := s.configService.GetSetting(key)
-		if setting == nil {
+		if setting == nil || retiredSettingKeys[key] {
 			RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("unknown setting: %s", key))
 			return
 		}
 
+		if key == reasoningAutoSettingKey {
+			policy, err := ParseReasoningAutoConfig(value)
+			if err == nil {
+				err = s.validateReasoningAutoChannel(c.Request.Context(), policy)
+			}
+			if err != nil {
+				RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("invalid value for %s: %v", key, err))
+				return
+			}
+			continue // already parsed; validateSettingValue would parse it again
+		}
 		if err := validateSettingValue(key, setting.ValueType, value); err != nil {
 			RespondErrorMsg(c, http.StatusBadRequest, fmt.Sprintf("invalid value for %s: %v", key, err))
 			return
 		}
 	}
-	updates, err := s.completeSettingUpdates(c.Request.Context(), req)
+	updates, err := s.completeCooldownBoundUpdates(c.Request.Context(), req)
 	if respondSettingCombinationError(c, err) {
 		return
 	}
@@ -462,9 +299,6 @@ func (s *Server) AdminBatchUpdateSettings(c *gin.Context) {
 
 // validateSettingValue 验证配置值的合法性
 func validateSettingValue(key, valueType, value string) error {
-	if key == config.TypeSafeAPIKeySettingKey && (len(value) > 4096 || strings.ContainsAny(value, "\r\n")) {
-		return errors.New("invalid TypeSafe API key")
-	}
 	if key == globalCooldownDetectionRulesSettingKey {
 		_, err := parseGlobalCooldownDetectionRules(value)
 		return err
@@ -606,6 +440,9 @@ func validateSettingValue(key, valueType, value string) error {
 
 	case "json":
 		switch key {
+		case reasoningAutoSettingKey:
+			_, err := ParseReasoningAutoConfig(value)
+			return err
 		case "antigravity_sensitive_words":
 			return validateJSONStringArray(value)
 		case modelCustomPricingSettingKey:

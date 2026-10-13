@@ -16,11 +16,6 @@ function buildPriorityRow(rowClass, valueClass, value) {
 
 const CHANNEL_PRIORITY_MIN = -99999;
 const CHANNEL_PRIORITY_MAX = 9999999;
-let channelPrioritySaveTimers = new Map();
-
-function uniqueChannelModelNames(models) {
-  return channelModelDisplayGroups(models).map((group) => group.model);
-}
 
 function channelModelDisplayGroups(models) {
   const groups = new Map();
@@ -41,21 +36,50 @@ function channelModelDisplayGroups(models) {
 
 function formatChannelModelLabel(group) {
   const targets = group.targets.filter((target) => target !== group.model);
-  if (targets.length === 0) return group.model;
-  const visible = targets.slice(0, 2).join(', ');
-  const suffix = targets.length > 2 ? ', ...' : '';
-  return `${group.model}(${visible}${suffix})`;
+  return targets.length > 0 ? `${group.model}(${targets.join(', ')})` : group.model;
 }
 
-function formatChannelModelSummary(models) {
-  return channelModelDisplayGroups(models).map(formatChannelModelLabel).join(', ');
+// 模型列只放数量按钮；标签在展开时按渠道数据生成，避免每行常驻全部模型 DOM。
+function buildChannelModelToggleHtml(channelID, models) {
+  const count = channelModelDisplayGroups(models).length;
+  if (count === 0) return '';
+  const label = escapeChannelRefreshText(window.t('channels.table.modelCount', { count }));
+  return `<div class="ch-model-picker"><button type="button" class="ch-model-toggle" data-channel-id="${channelID}" aria-expanded="false">${label}<span class="ch-model-toggle__caret" aria-hidden="true"></span></button></div>`;
 }
 
-function formatChannelModelTitle(models) {
-  return channelModelDisplayGroups(models).map((group) => {
-    const targets = group.targets.filter((target) => target !== group.model);
-    return targets.length > 0 ? `${group.model}(${targets.join(', ')})` : group.model;
-  }).join(', ');
+// 标签显示重定向目标，点击复制的是客户端请求用的模型名。
+function buildChannelModelPopoverHtml(models) {
+  const chips = channelModelDisplayGroups(models)
+    .map(group => `<button type="button" class="ch-model-chip" data-model="${escapeChannelRefreshText(group.model)}">${escapeChannelRefreshText(formatChannelModelLabel(group))}</button>`);
+  return `<div class="ch-model-popover">${chips.join('')}</div>`;
+}
+
+function copyChannelModelName(chip) {
+  const model = chip.dataset.model;
+  if (!model) return Promise.resolve();
+  return window.copyToClipboard(model).then(() => {
+    if (window.showSuccess) window.showSuccess(window.t('channels.modelCopied', { model }));
+  }).catch(() => {
+    if (window.showError) window.showError(window.t('channels.keyCopyFailed'));
+  });
+}
+
+function closeChannelModelPopovers() {
+  document.querySelectorAll('.ch-model-toggle[aria-expanded="true"]').forEach((btn) => {
+    btn.setAttribute('aria-expanded', 'false');
+    btn.parentElement.querySelector('.ch-model-popover')?.remove();
+  });
+}
+
+function toggleChannelModelPopover(btn) {
+  const wasOpen = btn.getAttribute('aria-expanded') === 'true';
+  closeChannelModelPopovers();
+  if (wasOpen) return;
+  const channelID = Number(btn.dataset.channelId);
+  const channel = channels.find(item => item.id === channelID);
+  if (!channel) return;
+  btn.insertAdjacentHTML('afterend', buildChannelModelPopoverHtml(channel.models));
+  btn.setAttribute('aria-expanded', 'true');
 }
 
 function escapeChannelRefreshText(value) {
@@ -104,47 +128,6 @@ function isOpenCodeGoChannel(channel) {
 
 function channelShowsOAuthUsage(channel) {
   return OAUTH_USAGE_AUTH_TYPES.includes(channel?.auth_type) || isOpenCodeGoChannel(channel);
-}
-
-// Codex plan_type → 用户可读标签；未登记的值原样返回。
-function codexPlanLabel(rawPlanType) {
-  const key = String(rawPlanType || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  switch (key) {
-    case 'self_serve_business_prolite': return 'Premium seat';
-    case 'team': return 'Standard seat';
-    default: return rawPlanType;
-  }
-}
-
-function buildOAuthPlanBadge(channel) {
-  let planType = '';
-  if (channel?.auth_type === 'codex_oauth') {
-    planType = String(channel.codex_plan_type || '').trim();
-  } else if (channel?.auth_type === 'antigravity_oauth') {
-    planType = String(channel.antigravity_paid_tier || '').trim();
-  } else if (channel?.auth_type === 'xai_oauth') {
-    planType = String(channel.xai_subscription_tier || '').trim();
-  } else if (channel?.auth_type === 'anthropic_oauth') {
-    planType = String(channel.anthropic_plan_type || '').trim();
-    const usageState = typeof getOAuthUsageState === 'function'
-      ? getOAuthUsageState(channel.id)
-      : null;
-    if (usageState?.status === 'ready' && String(usageState.data?.plan_type || '').trim()) {
-      planType = String(usageState.data.plan_type).trim();
-    }
-  }
-  if (!planType) return '';
-
-  const planTokens = planType.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  if (channel?.auth_type !== 'xai_oauth' && planTokens.includes('free')) return '';
-
-  const planTone = channel?.auth_type === 'codex_oauth' &&
-    String(planType).toLowerCase().replace(/[^a-z0-9]+/g, '_') === 'self_serve_business_prolite'
-    ? 'pro'
-    : ['plus', 'pro', 'team'].find(tier => planTokens.includes(tier));
-  const toneClass = planTone ? ` ch-oauth-plan-badge--${planTone}` : '';
-  const displayLabel = channel?.auth_type === 'codex_oauth' ? codexPlanLabel(planType) : planType;
-  return `<span class="ch-oauth-plan-badge${toneClass}">${escapeChannelRefreshText(displayLabel)}</span>`;
 }
 
 function normalizeBatchRefreshChannelID(channelID) {
@@ -355,6 +338,7 @@ function buildPriorityEditorRow(channelId, priority, priorityLabel) {
       <div class="ch-priority-editor">
         <input class="ch-priority-input" type="number" min="${CHANNEL_PRIORITY_MIN}" max="${CHANNEL_PRIORITY_MAX}" step="1" value="${priority}" data-channel-id="${channelId}" data-original-priority="${priority}" aria-label="${priorityLabel}"${disabledAttr}>
       </div>
+      <div class="ch-priority-hint" aria-hidden="true">${escapeChannelRefreshText(window.t('channels.priorityEditHint'))}</div>
     </div>
   </div>`;
 }
@@ -429,152 +413,73 @@ async function saveInlineChannelPriority(input) {
   }
 }
 
-function queueInlineChannelPrioritySave(input, delay = 1000) {
-  if (!input || isTokenChannelsReadOnly()) return;
-  const channelId = Number(input.dataset.channelId);
-  if (!Number.isFinite(channelId) || channelId <= 0) return;
-  input.classList.add('is-dirty');
-  const existingTimer = channelPrioritySaveTimers.get(channelId);
-  if (existingTimer) clearTimeout(existingTimer);
-  const timer = setTimeout(() => {
-    channelPrioritySaveTimers.delete(channelId);
-    saveInlineChannelPriority(input);
-  }, delay);
-  channelPrioritySaveTimers.set(channelId, timer);
-}
+const CHANNEL_METRIC_ICONS = {
+  clock: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  bolt: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M13 2 3 14h9l-1 8 10-12h-9z"/></svg>',
+  coin: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M14.5 9.5c-.5-1-1.5-1.5-2.5-1.5-1.4 0-2.5.8-2.5 2s1.1 1.6 2.5 2 2.5.8 2.5 2-1.1 2-2.5 2c-1 0-2-.5-2.5-1.5M12 6.5v1.5M12 16v1.5"/></svg>',
+  check: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m5 12 5 5L20 7"/></svg>'
+};
 
-function flushInlineChannelPrioritySave(input) {
-  if (!input || isTokenChannelsReadOnly()) return;
-  const channelId = Number(input.dataset.channelId);
-  const existingTimer = channelPrioritySaveTimers.get(channelId);
-  if (existingTimer) {
-    clearTimeout(existingTimer);
-    channelPrioritySaveTimers.delete(channelId);
-  }
-  return saveInlineChannelPriority(input);
-}
-
-function buildInlineNameBadgeStyle({ background, color, borderColor, borderStyle = 'solid' }) {
-  return [
-    'display: inline-flex',
-    'align-items: center',
-    `background: ${background}`,
-    `color: ${color}`,
-    'padding: 2px 6px',
-    'border-radius: 999px',
-    'font-size: 0.68rem',
-    'font-weight: 600',
-    `border: 1px ${borderStyle} ${borderColor}`,
-    'line-height: 1'
-  ].join('; ');
+function channelSuccessRateLevel(rate) {
+  if (rate >= 0.95) return 'good';
+  if (rate >= 0.8) return 'warn';
+  return 'bad';
 }
 
 /**
- * 构建渠道健康状态指示器 HTML（参考 stats.js buildHealthIndicator）
- * @param {Array} timeline - health_timeline 数组
- * @param {number} currentRate - 当前成功率 (0-1)
- * @returns {string} HTML字符串
+ * 渠道名下方的指标行：首字/总耗时、速度、成功/失败·成功率、消耗。
+ * 统计窗口内没有调用时整行不渲染；omitCalls 用于成功率已单独成条的场景。
  */
-function buildChannelHealthIndicator(timeline, currentRate) {
-  if (!timeline || timeline.length === 0) return '';
-
-  const fixedBucketCount = 48;
-  const normalizedTimeline = timeline.length >= fixedBucketCount
-    ? timeline.slice(-fixedBucketCount)
-    : [...Array(fixedBucketCount - timeline.length).fill(null), ...timeline];
-  const blocks = new Array(fixedBucketCount);
-
-  for (let i = 0; i < fixedBucketCount; i++) {
-    const point = normalizedTimeline[i];
-    if (!point || point.rate < 0) {
-      blocks[i] = `<span class="health-block unknown" title="${window.t('stats.healthNoData')}"></span>`;
-      continue;
-    }
-
-    const rate = point.rate;
-    const rateLimited = point.rate_limited || 0;
-    const realErrors = (point.error || 0) - rateLimited;
-
-    // 配色：所有失败都是限流 → 蓝色；有真实错误 → 按成功率分级(绿/橙/红)
-    const className = (realErrors === 0 && rateLimited > 0)
-      ? 'rate-limited'
-      : rate >= 0.95 ? 'healthy' : rate >= 0.80 ? 'warning' : 'critical';
-
-    const d = new Date(point.ts);
-    const timeStr = `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-
-    let title = `${timeStr}\n${window.t('stats.tooltipSuccess')}: ${point.success || 0} / ${window.t('stats.tooltipFailed')}: ${point.error || 0}`;
-    if (rateLimited > 0) title += ` (${window.t('stats.tooltipRateLimited')}: ${rateLimited})`;
-    if (point.avg_first_byte_time > 0) title += `\n${window.t('stats.tooltipTTFT')}: ${point.avg_first_byte_time.toFixed(2)}s`;
-    if (point.avg_duration > 0) title += `\n${window.t('stats.tooltipDuration')}: ${point.avg_duration.toFixed(2)}s`;
-
-    // 简化 title 中内容：只显示关键性能指标
-    blocks[i] = `<span class="health-block ${className}" title="${title.replace(/"/g, '&quot;')}"></span>`;
-  }
-
-  const ratePercent = (currentRate * 100).toFixed(1);
-  const rateColor = currentRate >= 0.95 ? 'var(--success-600)' :
-                    currentRate >= 0.80 ? 'var(--warning-600)' : 'var(--error-600)';
-
-  return `<div class="health-indicator"><span class="health-track">${blocks.join('')}</span><span class="health-rate" style="color: ${rateColor}">${ratePercent}%</span></div>`;
-}
-
-function buildChannelTimingHtml(stats) {
+function buildChannelMetricsHtml(stats, { omitCalls = false } = {}) {
   if (!stats) return '';
-
-  const avgFirstByte = stats.avgFirstByteTimeSeconds || 0;
-  const avgDuration = stats.avgDurationSeconds || 0;
   const successCount = Number.isFinite(Number(stats.success)) ? Number(stats.success) : 0;
   const failureCount = Number.isFinite(Number(stats.error)) ? Number(stats.error) : 0;
-  const firstByteColor = window.getFirstByteTimingColor(avgFirstByte);
-  const durationColor = window.getDurationTimingColor(avgDuration);
+  const total = successCount + failureCount;
+  if (total <= 0) return '';
 
-  const rows = [];
-  if (avgFirstByte > 0) {
-    rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('channels.stats.firstByte')}</span><span class="ch-timing-value" style="color: ${firstByteColor};">${avgFirstByte.toFixed(2)}${window.t('common.seconds')}</span></div>`);
-  }
-  if (avgDuration > 0) {
-    rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('stats.tooltipDuration')}</span><span class="ch-timing-value" style="color: ${durationColor};">${avgDuration.toFixed(2)}${window.t('common.seconds')}</span></div>`);
+  const items = [];
+  const seconds = window.t('common.seconds');
+  const avgFirstByte = stats.avgFirstByteTimeSeconds || 0;
+  const avgDuration = stats.avgDurationSeconds || 0;
+  if (avgFirstByte > 0 || avgDuration > 0) {
+    const values = [];
+    if (avgFirstByte > 0) {
+      values.push(`<b style="color: ${window.getFirstByteTimingColor(avgFirstByte)};">${avgFirstByte.toFixed(2)}${seconds}</b>`);
+    }
+    if (avgDuration > 0) {
+      values.push(`<b style="color: ${window.getDurationTimingColor(avgDuration)};">${avgDuration.toFixed(2)}${seconds}</b>`);
+    }
+    const label = avgFirstByte > 0 ? window.t('channels.stats.firstByte') : window.t('stats.tooltipDuration');
+    items.push(`<span class="ch-metric" title="${escapeChannelRefreshText(window.t('channels.stats.timingTitle'))}">${CHANNEL_METRIC_ICONS.clock}${escapeChannelRefreshText(label)} ${values.join(' / ')}</span>`);
   }
   if (Number.isFinite(stats.outputTokensPerSecond) && stats.outputTokensPerSecond > 0) {
-    rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('channels.stats.speed')}</span><span class="ch-timing-value">${stats.outputTokensPerSecond.toFixed(1)} tok/s</span></div>`);
+    items.push(`<span class="ch-metric" title="${escapeChannelRefreshText(window.t('channels.stats.speed'))}">${CHANNEL_METRIC_ICONS.bolt}<b>${stats.outputTokensPerSecond.toFixed(1)}</b> tok/s</span>`);
   }
-  rows.push(`<div class="ch-timing-row"><span class="ch-timing-label">${window.t('channels.stats.calls')}</span><span class="ch-timing-value"><span style="color: var(--success-600);">${successCount}</span>/<span style="color: var(--error-600);">${failureCount}</span>${window.t('stats.unitTimes')}</span></div>`);
 
-  return rows.length > 0 ? `<div class="ch-timing">${rows.join('')}</div>` : '';
-}
+  const rate = successCount / total;
+  if (!omitCalls) items.push(`<span class="ch-metric" title="${escapeChannelRefreshText(window.t('channels.stats.callsTitle'))}">${CHANNEL_METRIC_ICONS.check}<b class="ch-metric__ok">${successCount}</b> / <b class="ch-metric__err">${failureCount}</b> ${escapeChannelRefreshText(window.t('stats.unitTimes'))} · <b class="ch-metric__rate--${channelSuccessRateLevel(rate)}">${(rate * 100).toFixed(1)}%</b></span>`);
 
-/**
- * 构建渠道消耗列（token 与成本统一放在同一列）。
- * 缓存行按实际数据渲染：协议声明无法判定渠道是否缓存——CodeBuddy 等上游同样
- * 声明 openai 且返回缓读，用协议白名单会把真实数据永久隐藏。
- */
-function buildChannelUsageHtml(stats) {
-  if (!stats) return '';
-
-  const inputTokensText = formatMetricNumber(stats.totalInputTokens);
-  const outputTokensText = formatMetricNumber(stats.totalOutputTokens);
-  const cacheReadTokens = stats.totalCacheReadInputTokens || 0;
-  const cacheCreationTokens = stats.totalCacheCreationInputTokens || 0;
-
-  const parts = [];
-  parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.input')}</span><span class="ch-usage-value" style="color: var(--warning-500);">${inputTokensText}</span></div>`);
-  parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.output')}</span><span class="ch-usage-value" style="color: var(--warning-500);">${outputTokensText}</span></div>`);
-  if (cacheReadTokens > 0) {
-    parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.cacheRead')}</span><span class="ch-usage-value" style="color: var(--success-500);">${formatMetricNumber(cacheReadTokens)}</span></div>`);
+  // 缓存行按实际数据显示：协议声明无法判定渠道是否缓存，CodeBuddy 等上游同样声明 openai 且返回缓读。
+  const usageLines = [
+    `${window.t('channels.stats.input')} ${formatMetricNumber(stats.totalInputTokens)}`,
+    `${window.t('channels.stats.output')} ${formatMetricNumber(stats.totalOutputTokens)}`
+  ];
+  if (stats.totalCacheReadInputTokens > 0) {
+    usageLines.push(`${window.t('channels.stats.cacheRead')} ${formatMetricNumber(stats.totalCacheReadInputTokens)}`);
   }
-  if (cacheCreationTokens > 0) {
-    parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.cacheCreate')}</span><span class="ch-usage-value" style="color: var(--primary-500);">${formatMetricNumber(cacheCreationTokens)}</span></div>`);
+  if (stats.totalCacheCreationInputTokens > 0) {
+    usageLines.push(`${window.t('channels.stats.cacheCreate')} ${formatMetricNumber(stats.totalCacheCreationInputTokens)}`);
   }
   const costHtml = buildCostStackHtml(stats.totalCost, stats.effectiveCost, {
     tone: 'warning',
     decimalPlaces: 2,
     inline: true
   });
-  if (costHtml) {
-    parts.push(`<div class="ch-usage-row ch-usage-cost-row" title="${escapeChannelRefreshText(window.t('channels.stats.cost'))}">${costHtml}</div>`);
-  }
-  return `<div class="ch-usage-list">${parts.join('')}</div>`;
+  const tokenTotal = (Number(stats.totalInputTokens) || 0) + (Number(stats.totalOutputTokens) || 0);
+  const usageValue = costHtml || `<b>${formatMetricNumber(tokenTotal)}</b> tok`;
+  items.push(`<span class="ch-metric ch-metric--usage" title="${escapeChannelRefreshText(usageLines.join(' · '))}">${CHANNEL_METRIC_ICONS.coin}${usageValue}</span>`);
+
+  return `<div class="ch-metrics">${items.join('')}</div>`;
 }
 
 function formatChannelRelativeTime(timestampMs, nowMs = Date.now()) {
@@ -600,14 +505,17 @@ function formatChannelRelativeTime(timestampMs, nowMs = Date.now()) {
   return window.t('channels.lastSuccess.daysAgo', { count: days });
 }
 
-function buildChannelLastRequestFailureHtml(stats) {
+// 最近一次请求：成功显示请求时间，失败显示错误码与详情；客户端取消（499）不展示。
+function buildChannelLastRequestHtml(stats) {
   if (!stats) return '';
 
   const lastRequestAt = Number(stats.lastRequestAt || 0);
   const status = Number(stats.lastRequestStatus);
-  const hasRequest = lastRequestAt > 0 && Number.isFinite(status) && status > 0;
-  const requestFailed = hasRequest && (status < 200 || status >= 300) && status !== 499;
-  if (!requestFailed) return '';
+  if (lastRequestAt <= 0 || !Number.isFinite(status) || status <= 0 || status === 499) return '';
+  if (status >= 200 && status < 300) {
+    const text = window.t('channels.lastSuccess.succeededAt', { time: formatChannelRelativeTime(lastRequestAt) });
+    return `<div class="ch-last-request ch-last-request--ok">${escapeChannelRefreshText(text)}</div>`;
+  }
 
   const statusText = escapeChannelRefreshText(window.t('channels.lastSuccess.failedStatus', { status }));
   const relativeTime = formatChannelRelativeTime(lastRequestAt);
@@ -615,8 +523,8 @@ function buildChannelLastRequestFailureHtml(stats) {
   const message = String(stats.lastRequestMessage || window.t('channels.lastSuccess.failedNoMessage'));
   const escapedMessage = escapeChannelRefreshText(message);
   return `<div class="ch-last-request">
-    <span class="ch-last-request__state">${statusText}</span>
     <span class="ch-last-request__time">${timeText}</span>
+    <span class="ch-last-request__state">${statusText}</span>
     <details class="ch-last-request__detail">
       <summary>${escapeChannelRefreshText(window.t('channels.lastSuccess.detail'))}</summary>
       <div class="ch-last-request__panel">
@@ -855,6 +763,60 @@ function buildOAuthUsageToolbar(channel, state = {}, usageLoading = false) {
   return `<div class="ch-oauth-usage__toolbar">${buttons.join('')}</div>`;
 }
 
+const OAUTH_RESET_CREDIT_ICON = '<svg class="ch-oauth-usage__credit-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true" focusable="false"><rect x="1.75" y="3.25" width="12.5" height="9.5" rx="1.75" stroke="currentColor" stroke-width="1.3"/><path d="M1.75 6.25H14.25M4.5 10H7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>';
+
+function buildAnthropicResetCreditsHtml(channelID) {
+  const state = typeof getAnthropicResetCreditsState === 'function'
+    ? getAnthropicResetCreditsState(channelID) : null;
+  const loading = state?.status === 'loading';
+  const resetting = state?.reset_status === 'loading';
+  const message = state?.reset_error || state?.reset_feedback;
+  const feedback = message ? `<div class="ch-oauth-usage__credits-summary" role="${state?.reset_status === 'reset' ? 'status' : 'alert'}">${escapeChannelRefreshText(message)}</div>` : '';
+  if (state?.status !== 'ready') {
+    if (state?.status !== 'error' && !feedback) return '';
+    return `<div class="ch-oauth-usage__credits">${state?.status === 'error' ? `<div class="ch-oauth-usage__error" role="alert">${escapeChannelRefreshText(state.error)}</div>` : ''}${feedback}</div>`;
+  }
+  const data = state.data;
+  const credits = data.credits.filter(credit => credit && typeof credit === 'object' &&
+    (!credit.expires_at || Date.parse(credit.expires_at) > Date.now()));
+  const total = credits.reduce((sum, credit) => sum + Math.max(0, Number(credit.resets_left) || 0), 0);
+  if (total <= 0) return feedback ? `<div class="ch-oauth-usage__credits">${feedback}</div>` : '';
+  const resetLabel = resetting ? 'resettingQuota' : 'resetQuota';
+  const resetButton = `<button type="button" class="ch-oauth-usage__reset-action channel-action-btn" data-action="reset-anthropic-quota" data-channel-id="${channelID}"${loading || resetting ? ' disabled' : ''}${resetting ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(window.t(`channels.oauth.${resetLabel}`))}</button>`;
+  const expiry = credit => {
+    const timestamp = Date.parse(String(credit.expires_at || ''));
+    return Number.isFinite(timestamp) ? timestamp : Infinity;
+  };
+  const primary = credits.find(credit => credit.redeemable) ||
+    [...credits].sort((left, right) => expiry(left) - expiry(right))[0];
+  const available = data.eligible && data.available_count > 0;
+  const status = !data.eligible ? 'channels.oauth.anthropicResetIneligible'
+    : available ? ''
+      : 'channels.oauth.anthropicResetUnavailable';
+  const expiryText = primary?.expires_at
+    ? window.t('channels.oauth.resetCreditExpires', { time: formatXAIUsageReset(primary.expires_at) })
+    : window.t('channels.oauth.resetCreditExpiresUnknown');
+  const details = credits.map(credit => {
+    const time = credit.expires_at ? formatXAIUsageReset(credit.expires_at) : '';
+    return `${String(credit.label || '')}: ${Math.max(0, Number(credit.resets_left) || 0)}${time ? ` · ${window.t('channels.oauth.resetCreditExpires', { time })}` : ''}`;
+  }).join('\n');
+  const cooldown = data.cooldown_until && Date.parse(data.cooldown_until) > Date.now()
+    ? formatXAIUsageReset(data.cooldown_until) : '';
+  return `<div class="ch-oauth-usage__credits ch-oauth-usage__credits--reset" role="status">
+    <div class="ch-oauth-usage__credits-summary">
+      ${OAUTH_RESET_CREDIT_ICON}
+      <span class="ch-oauth-usage__credit-count">${escapeChannelRefreshText(window.t('channels.oauth.resetCredits', { count: total }))}</span>
+      <span class="ch-oauth-usage__credit-expiry" title="${escapeChannelRefreshText(details)}">${escapeChannelRefreshText(expiryText)}</span>
+      ${resetButton}
+    </div>
+    ${status || cooldown ? `<div class="ch-oauth-usage__credits-summary">${[
+      status ? escapeChannelRefreshText(window.t(status)) : '',
+      cooldown ? escapeChannelRefreshText(window.t('channels.oauth.anthropicResetCooldown', { time: cooldown })) : ''
+    ].filter(Boolean).join(' · ')}</div>` : ''}
+    ${feedback}
+  </div>`;
+}
+
 function formatCodexResetCreditExpiry(expiresAt) {
   const date = new Date(String(expiresAt || '').trim());
   if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) return null;
@@ -890,11 +852,18 @@ function buildCodexResetCreditsHtml(data, state, channelID) {
         time: visibleExpiries.map(expiry => expiry.text).join('、')
       })
     : window.t('channels.oauth.resetCreditExpiresUnknown');
-  const escapedExpiryText = escapeChannelRefreshText(expiryText);
-  return `<div class="ch-oauth-usage__credits">
+  // 已购 Credit 的累计标准成本与重置次数同属额度信息，合并到同一行
+  const creditCost = formatOAuthAccumulatedCost(data?.quota_cost_usage?.credit_standard_cost_microusd);
+  const metaText = [
+    expiryText,
+    creditCost ? window.t('channels.oauth.codexCreditCostShort', { cost: creditCost }) : ''
+  ].filter(Boolean).join(' · ');
+  const escapedMetaText = escapeChannelRefreshText(metaText);
+  return `<div class="ch-oauth-usage__credits ch-oauth-usage__credits--reset">
     <div class="ch-oauth-usage__credits-summary">
+      ${OAUTH_RESET_CREDIT_ICON}
       <span class="ch-oauth-usage__credit-count">${escapeChannelRefreshText(window.t('channels.oauth.resetCredits', { count: availableCount }))}</span>
-      <span class="ch-oauth-usage__credit-expiry" title="${escapedExpiryText}">${escapedExpiryText}</span>
+      <span class="ch-oauth-usage__credit-expiry" title="${escapedMetaText}">${escapedMetaText}</span>
       <button type="button" class="ch-oauth-usage__reset-action channel-action-btn" data-action="reset-codex-quota" data-channel-id="${channelID}" data-reset-count="${availableCount}" data-reset-expiry="${escapeChannelRefreshText(earliest)}"${disabled ? ' disabled' : ''}${resetting ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(buttonText)}</button>
     </div>
     ${resetError ? `<div class="ch-oauth-usage__error" role="status">${escapeChannelRefreshText(resetError)}</div>` : ''}
@@ -1037,25 +1006,99 @@ function buildAntigravityCreditsHtml(credits) {
   return `<div class="ch-oauth-usage__credits"><div class="ch-oauth-usage__credits-summary">${escapeChannelRefreshText(text)}</div></div>`;
 }
 
-function buildCodeBuddyCreditsHtml(credits) {
+// 额度窗口行：左侧名称+金额，右侧主值+时间，悬浮展开明细；percent 为 null 时不画进度条。
+function buildOAuthUsageWindowHtml({ tooltipID, label, amount, value, time, detailLines, ariaLabel, percent = null, level = '' }) {
+  const id = escapeChannelRefreshText(tooltipID);
+  let track = '';
+  if (percent !== null) {
+    const clamped = Math.min(100, Math.max(0, percent));
+    track = `<div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeChannelRefreshText(formatOAuthUsagePercent(clamped))}">
+        <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${level || oauthUsageLevel(clamped)}" style="width:${clamped}%"></span>
+      </div>`;
+  }
+  return `<div class="ch-oauth-usage__window">
+      <div class="ch-oauth-usage__meta">
+        <span class="ch-oauth-usage__summary" tabindex="0" aria-describedby="${id}">
+          <span class="ch-oauth-usage__heading">
+            <span class="ch-oauth-usage__label">${escapeChannelRefreshText(label)}</span>
+            ${amount ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(amount)}</span>` : ''}
+          </span>
+          <span class="ch-oauth-usage__details">
+            ${value ? `<span class="ch-oauth-usage__percent">${escapeChannelRefreshText(value)}</span>` : ''}
+            ${time ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(time)}</span>` : ''}
+          </span>
+          <span id="${id}" class="ch-oauth-usage__tooltip" role="tooltip">
+            ${detailLines.filter(Boolean).map(line => `<span class="ch-oauth-usage__tooltip-line">${escapeChannelRefreshText(line)}</span>`).join('')}
+          </span>
+        </span>
+      </div>
+      ${track}
+    </div>`;
+}
+
+function oauthUsageTooltipID(prefix, channelID, index) {
+  return `${prefix}-${String(channelID).replace(/[^a-zA-Z0-9_-]/g, '')}-${index}`;
+}
+
+function buildCodeBuddyCreditsHtml(credits, channelID) {
   const remain = Number(credits?.remain);
   if (!Number.isFinite(remain)) return '';
   const formatCredits = value => value.toLocaleString(undefined, { maximumFractionDigits: 2 });
   const total = credits?.total;
   const used = credits?.used;
-  const usageBar = !credits?.unlimited && Number.isFinite(total) && Number.isFinite(used)
-    ? buildManagementUsageBar({
-      percent: total > 0 ? remain / total * 100 : 0,
-      used: formatCredits(used),
-      total: formatCredits(total)
-    }) : '';
-  if (usageBar) return usageBar;
+  if (!credits?.unlimited && Number.isFinite(total) && Number.isFinite(used)) {
+    const label = window.t('channels.codebuddy.credits');
+    const percent = total > 0 ? remain / total * 100 : 0;
+    const percentText = formatOAuthUsagePercent(Math.min(100, Math.max(0, percent)));
+    const usageText = window.t('channels.management.usage', { used: formatCredits(used), total: formatCredits(total) });
+    const availableText = window.t('channels.management.available', { percent: percentText });
+    return buildOAuthUsageWindowHtml({
+      tooltipID: oauthUsageTooltipID('ch-codebuddy-credits-tooltip', channelID, 0),
+      label,
+      amount: `${formatCredits(used)}/${formatCredits(total)}`,
+      value: formatCredits(Math.max(0, remain)),
+      detailLines: [label, usageText, availableText],
+      ariaLabel: availableText,
+      percent
+    });
+  }
   const text = credits?.unlimited
     ? window.t('channels.codebuddy.unlimitedCredits')
     : window.t('channels.oauth.codeBuddyCredits', { remain: formatCredits(Math.max(0, remain)) });
-  return `<div class="ch-management__balance">
-    <div class="ch-management__summary"><div class="ch-management__meta ch-management__meta--remaining"><span class="ch-management__amount">${escapeChannelRefreshText(text)}</span></div></div>
-  </div>`;
+  return `<div class="ch-oauth-usage__credits"><div class="ch-oauth-usage__credits-summary">${escapeChannelRefreshText(text)}</div></div>`;
+}
+
+const OAUTH_USAGE_VISIBLE_WINDOWS = 2;
+// 展开状态跨重渲染保留：列表在刷新额度、筛选后整体重建。
+const expandedOAuthUsageChannels = new Set();
+
+function oauthUsageWindowsToggleLabel(expanded, hiddenCount) {
+  return expanded
+    ? window.t('channels.oauthUsageLessWindows')
+    : window.t('channels.oauthUsageMoreWindows', { count: hiddenCount });
+}
+
+function buildOAuthUsageRowsHtml(channelID, rows) {
+  if (rows.length <= OAUTH_USAGE_VISIBLE_WINDOWS) return rows.join('');
+  const hiddenCount = rows.length - OAUTH_USAGE_VISIBLE_WINDOWS;
+  const expanded = expandedOAuthUsageChannels.has(Number(channelID));
+  return `${rows.slice(0, OAUTH_USAGE_VISIBLE_WINDOWS).join('')}
+    <div class="ch-oauth-usage__more"${expanded ? '' : ' hidden'}>${rows.slice(OAUTH_USAGE_VISIBLE_WINDOWS).join('')}</div>
+    <button type="button" class="ch-oauth-usage__toggle channel-action-btn" data-action="toggle-oauth-usage-windows" data-channel-id="${channelID}" data-hidden-count="${hiddenCount}" aria-expanded="${expanded}">${escapeChannelRefreshText(oauthUsageWindowsToggleLabel(expanded, hiddenCount))}</button>`;
+}
+
+function toggleOAuthUsageWindows(btn) {
+  const channelID = Number(btn.dataset.channelId);
+  const expanded = !expandedOAuthUsageChannels.has(channelID);
+  if (expanded) {
+    expandedOAuthUsageChannels.add(channelID);
+  } else {
+    expandedOAuthUsageChannels.delete(channelID);
+  }
+  const more = btn.parentElement && btn.parentElement.querySelector('.ch-oauth-usage__more');
+  if (more) more.hidden = !expanded;
+  btn.setAttribute('aria-expanded', String(expanded));
+  btn.textContent = oauthUsageWindowsToggleLabel(expanded, Number(btn.dataset.hiddenCount) || 0);
 }
 
 function buildOAuthUsageStatusHtml(channel) {
@@ -1066,16 +1109,17 @@ function buildOAuthUsageStatusHtml(channel) {
   const liveState = typeof getOAuthUsageState === 'function' ? getOAuthUsageState(channel.id) : null;
   const state = liveState || (channel?.oauth_usage ? { status: 'ready', data: channel.oauth_usage } : null);
   if (!state) {
-    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel)}</div>`;
+    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel)}${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}</div>`;
   }
   if (state.status === 'loading') {
-    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel, state, true)}</div>`;
+    return `<div class="ch-oauth-usage">${buildOAuthUsageToolbar(channel, state, true)}${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}</div>`;
   }
   if (state.status === 'error') {
     const fallback = window.t('channels.oauth.usageFailed');
     const message = formatOAuthUsageError(state.error) || fallback;
     return `<div class="ch-oauth-usage">
       ${buildOAuthUsageToolbar(channel, state)}
+      ${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}
       <div class="ch-oauth-usage__error" title="${escapeChannelRefreshText(message)}">${escapeChannelRefreshText(message)}</div>
     </div>`;
   }
@@ -1124,28 +1168,16 @@ function buildOAuthUsageStatusHtml(channel) {
       window.t('channels.oauth.usageDetailRemaining', { percent }),
       resetAt ? window.t('channels.oauth.usageReset', { time: resetAt }) : ''
     ].filter(Boolean);
-    const tooltipID = `ch-oauth-usage-tooltip-${String(channel.id).replace(/[^a-zA-Z0-9_-]/g, '')}-${windowIndex}`;
-    const ariaLabel = window.t('channels.oauth.usageRemaining', { label, percent });
-    return `<div class="ch-oauth-usage__window">
-      <div class="ch-oauth-usage__meta">
-        <span class="ch-oauth-usage__summary" tabindex="0" aria-describedby="${escapeChannelRefreshText(tooltipID)}">
-          <span class="ch-oauth-usage__heading">
-            <span class="ch-oauth-usage__label">${escapeChannelRefreshText(label)}</span>
-            ${compactAmount ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(compactAmount)}</span>` : ''}
-          </span>
-          <span class="ch-oauth-usage__details">
-            <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(compactRemaining)}</span>
-            ${resetAt ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(resetAt)}</span>` : ''}
-          </span>
-          <span id="${escapeChannelRefreshText(tooltipID)}" class="ch-oauth-usage__tooltip" role="tooltip">
-            ${detailLines.map(line => `<span class="ch-oauth-usage__tooltip-line">${escapeChannelRefreshText(line)}</span>`).join('')}
-          </span>
-        </span>
-      </div>
-      <div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeChannelRefreshText(percent)}">
-        <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${oauthUsageLevel(remaining)}" style="width:${remaining}%"></span>
-      </div>
-    </div>`;
+    return buildOAuthUsageWindowHtml({
+      tooltipID: oauthUsageTooltipID('ch-oauth-usage-tooltip', channel.id, windowIndex),
+      label,
+      amount: compactAmount,
+      value: compactRemaining,
+      time: resetAt,
+      detailLines,
+      ariaLabel: window.t('channels.oauth.usageRemaining', { label, percent }),
+      percent: remaining
+    });
   });
   const notice = isCursor
     ? formatCursorUsageNotice(state.data?.display_message)
@@ -1165,11 +1197,11 @@ function buildOAuthUsageStatusHtml(channel) {
     : '';
   return `<div class="ch-oauth-usage">
     ${buildOAuthUsageToolbar(channel, state)}
-    ${rows.join('')}
-    ${isCodex ? buildCodexPurchasedCreditsHtml(state.data) : ''}
-    ${isCodex ? buildCodexResetCreditsHtml(state.data, state, channel.id) : ''}
+    ${buildOAuthUsageRowsHtml(channel.id, rows)}
+    ${channel?.auth_type === 'anthropic_oauth' ? buildAnthropicResetCreditsHtml(channel.id) : ''}
+    ${isCodex ? (buildCodexResetCreditsHtml(state.data, state, channel.id) || buildCodexPurchasedCreditsHtml(state.data)) : ''}
     ${channel?.auth_type === 'antigravity_oauth' ? buildAntigravityCreditsHtml(state.data?.credits) : ''}
-    ${isCodeBuddy ? buildCodeBuddyCreditsHtml(state.data?.codebuddy_credits) : ''}
+    ${isCodeBuddy ? buildCodeBuddyCreditsHtml(state.data?.codebuddy_credits, channel.id) : ''}
     ${codeBuddyCheckinNotice ? `<div class="ch-oauth-usage__notice" role="status">${escapeChannelRefreshText(codeBuddyCheckinNotice)}</div>` : ''}
     ${codeBuddyCheckinError ? `<div class="ch-oauth-usage__error" role="status" title="${escapeChannelRefreshText(codeBuddyCheckinError)}">${escapeChannelRefreshText(codeBuddyCheckinError)}</div>` : ''}
     ${notice ? `<div class="ch-oauth-usage__notice" role="status">${escapeChannelRefreshText(notice)}</div>` : ''}
@@ -1184,7 +1216,7 @@ const MANAGEMENT_ACCOUNT_CHECKIN_STATUSES = [
 
 function buildManagementActionButton(action, channelID, labelKey, loadingKey, loading) {
   const text = loading ? window.t(loadingKey) : window.t(labelKey);
-  return `<button type="button" class="ch-management__action channel-action-btn" data-action="${action}" data-channel-id="${channelID}"${loading ? ' disabled aria-busy="true"' : ''}>${escapeChannelRefreshText(text)}</button>`;
+  return `<button type="button" class="ch-oauth-usage__refresh channel-action-btn" data-action="${action}" data-channel-id="${channelID}"${loading ? ' disabled aria-busy="true"' : ''}>${escapeChannelRefreshText(text)}</button>`;
 }
 
 function formatManagementAmount(value, unit) {
@@ -1204,68 +1236,62 @@ function formatManagementCheckinStatus(status) {
 }
 
 // 只有上游同时给出已用、总额和可用百分比才画进度条,缺失用量只展示剩余额度。
-function buildManagementUsageBar(usage) {
-  const percent = Number(usage?.percent);
-  const used = String(usage?.used || '').trim();
-  const total = String(usage?.total || '').trim();
-  if (!Number.isFinite(percent) || !used || !total) return '';
-  const clamped = Math.min(100, Math.max(0, percent));
-  const percentText = formatOAuthUsagePercent(clamped);
-  const usageText = window.t('channels.management.usage', { used, total });
-  const availableText = window.t('channels.management.available', { percent: percentText });
-  return `<div class="ch-management__usage">
-    <div class="ch-management__usage-meta">
-      <span class="ch-management__usage-text" title="${escapeChannelRefreshText(usageText)}">${escapeChannelRefreshText(usageText)}</span>
-      <span class="ch-management__usage-percent">${escapeChannelRefreshText(availableText)}</span>
-    </div>
-    <div class="ch-management__track" role="progressbar" aria-label="${escapeChannelRefreshText(availableText)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeChannelRefreshText(percentText)}">
-      <span class="ch-management__fill ch-management__fill--${oauthUsageLevel(clamped)}" style="width:${clamped}%"></span>
-    </div>
-  </div>`;
+function buildManagementWindowHtml(channelID, index, { label, remaining, used, total, percent, sampledAt }) {
+  const hasAmounts = Boolean(used && total);
+  const numericPercent = Number(percent);
+  const hasUsage = hasAmounts && Number.isFinite(numericPercent);
+  const percentText = hasUsage ? formatOAuthUsagePercent(Math.min(100, Math.max(0, numericPercent))) : '';
+  const availableText = hasUsage ? window.t('channels.management.available', { percent: percentText }) : '';
+  return buildOAuthUsageWindowHtml({
+    tooltipID: oauthUsageTooltipID('ch-management-tooltip', channelID, index),
+    label,
+    // 只有余额时金额紧跟名称，右侧只留采样时间。
+    amount: hasAmounts ? `${used}/${total}` : remaining,
+    value: hasAmounts ? (remaining || (hasUsage ? `${percentText}%` : '')) : '',
+    time: sampledAt,
+    detailLines: [
+      label,
+      hasAmounts ? window.t('channels.management.usage', { used, total }) : '',
+      remaining ? window.t('channels.management.remaining', { amount: remaining }) : '',
+      availableText,
+      sampledAt ? window.t('channels.management.sampledAt', { time: sampledAt }) : ''
+    ],
+    ariaLabel: availableText,
+    percent: hasUsage ? numericPercent : null
+  });
 }
 
-function buildManagementSubscriptionRows(subscriptions, unit) {
-  const entries = Array.isArray(subscriptions) ? subscriptions : [];
-  return entries.map(entry => {
-    const name = String(entry?.name || '').trim();
-    const windowName = String(entry?.window || '').trim();
-    const label = [name, windowName].filter(Boolean).join(' · ') || window.t('channels.management.subscription');
-    const used = formatManagementAmount(entry?.used_usd, unit);
-    const total = formatManagementAmount(entry?.limit_usd, unit);
-    const bar = buildManagementUsageBar({ percent: entry?.available_percent, used, total });
-    const detail = bar || !used || !total
-      ? ''
-      : `<span class="ch-management__usage-text">${escapeChannelRefreshText(window.t('channels.management.usage', { used, total }))}</span>`;
-    if (!bar && !detail) return '';
-    return `<div class="ch-management__subscription">
-      <span class="ch-management__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
-      ${bar}${detail}
-    </div>`;
-  }).filter(Boolean).join('');
-}
-
-function buildManagementBalanceHtml(balance) {
+function buildManagementBalanceRows(channelID, balance) {
   const unit = balance?.unit;
   const remaining = formatManagementAmount(balance?.remaining, unit);
-  const sampledAt = formatXAIUsageReset(balance?.sampled_at);
-  const usageBar = buildManagementUsageBar({
-    percent: balance?.available_percent,
-    used: formatManagementAmount(balance?.used, unit),
-    total: formatManagementAmount(balance?.total, unit)
+  const used = formatManagementAmount(balance?.used, unit);
+  const total = formatManagementAmount(balance?.total, unit);
+  const rows = [];
+  if (remaining || (used && total)) {
+    rows.push(buildManagementWindowHtml(channelID, 0, {
+      label: window.t('channels.management.balance'),
+      remaining,
+      used,
+      total,
+      percent: balance?.available_percent,
+      sampledAt: formatXAIUsageReset(balance?.sampled_at)
+    }));
+  }
+  const subscriptions = Array.isArray(balance?.subscriptions) ? balance.subscriptions : [];
+  subscriptions.forEach((entry, index) => {
+    const subUsed = formatManagementAmount(entry?.used_usd, unit);
+    const subTotal = formatManagementAmount(entry?.limit_usd, unit);
+    if (!subUsed || !subTotal) return;
+    const name = String(entry?.name || '').trim();
+    const windowName = String(entry?.window || '').trim();
+    rows.push(buildManagementWindowHtml(channelID, index + 1, {
+      label: [name, windowName].filter(Boolean).join(' · ') || window.t('channels.management.subscription'),
+      used: subUsed,
+      total: subTotal,
+      percent: entry?.available_percent
+    }));
   });
-  const subscriptions = buildManagementSubscriptionRows(balance?.subscriptions, unit);
-  if (!remaining && !usageBar && !subscriptions) return '';
-  const balanceSummary = [
-    sampledAt ? `<span class="ch-management__sampled">${escapeChannelRefreshText(window.t('channels.management.sampledAt', { time: sampledAt }))}</span>` : '',
-    remaining ? `<div class="ch-management__meta ch-management__meta--remaining">
-      <span class="ch-management__label">${escapeChannelRefreshText(window.t('channels.management.remaining'))}</span>
-      <span class="ch-management__amount">${escapeChannelRefreshText(remaining)}</span>
-    </div>` : ''
-  ].filter(Boolean).join('');
-  return `<div class="ch-management__balance">
-    ${balanceSummary ? `<div class="ch-management__summary">${balanceSummary}</div>` : ''}
-    ${usageBar}${subscriptions}
-  </div>`;
+  return rows;
 }
 
 function buildManagementAccountStatusHtml(channel) {
@@ -1310,7 +1336,7 @@ function buildManagementAccountStatusHtml(channel) {
   }
 
   if (checkedInAt) {
-    buttons.push(`<span class="ch-management__checkin-time" role="status">${escapeChannelRefreshText(checkedInAt)}</span>`);
+    buttons.push(`<span class="ch-oauth-usage__reset" role="status">${escapeChannelRefreshText(checkedInAt)}</span>`);
   }
 
   const balanceError = balanceState?.status === 'error' ? String(balanceState.error || '').trim() : '';
@@ -1318,25 +1344,33 @@ function buildManagementAccountStatusHtml(channel) {
   const balanceData = balanceState?.status === 'ready'
     ? balanceState.data?.balance
     : (balanceState ? null : account?.balance);
-  const balanceBody = buildManagementBalanceHtml(balanceData);
+  const balanceRows = buildManagementBalanceRows(channel.id, balanceData);
 
   const checkinSummary = checkinStatus === 'already_checked'
     || checkinStatus === 'skipped_disabled'
     ? ''
     : [statusText, rewardText].filter(Boolean).join(' · ');
 
-  return `<div class="ch-management">
-    <div class="ch-management__toolbar">${buttons.join('')}</div>
-    ${balanceError ? `<div class="ch-management__error" role="status" title="${escapeChannelRefreshText(balanceError)}">${escapeChannelRefreshText(balanceError)}</div>` : ''}
-    ${balanceBody}
-    ${checkinSummary ? `<div class="ch-management__checkin" role="status">${escapeChannelRefreshText(checkinSummary)}</div>` : ''}
-    ${checkinError ? `<div class="ch-management__error" role="status" title="${escapeChannelRefreshText(checkinError)}">${escapeChannelRefreshText(checkinError)}</div>` : ''}
+  return `<div class="ch-oauth-usage">
+    <div class="ch-oauth-usage__toolbar">${buttons.join('')}</div>
+    ${balanceError ? `<div class="ch-oauth-usage__error" role="status" title="${escapeChannelRefreshText(balanceError)}">${escapeChannelRefreshText(balanceError)}</div>` : ''}
+    ${buildOAuthUsageRowsHtml(channel.id, balanceRows)}
+    ${checkinSummary ? `<div class="ch-oauth-usage__credits-summary" role="status">${escapeChannelRefreshText(checkinSummary)}</div>` : ''}
+    ${checkinError ? `<div class="ch-oauth-usage__error" role="status" title="${escapeChannelRefreshText(checkinError)}">${escapeChannelRefreshText(checkinError)}</div>` : ''}
   </div>`;
 }
 
 const COOLDOWN_CLOCK_ICON = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
 
-function buildChannelRuntimeStatusHtml(channel) {
+// 没有额度时：API 渠道给出配置管理账户的入口（只读身份不显示）。
+function buildChannelQuotaHintHtml(channel) {
+  const readOnly = typeof isTokenChannelsReadOnly === 'function' && isTokenChannelsReadOnly();
+  if (channel?.auth_type !== 'api_key' || readOnly) return '';
+  return `<div class="ch-quota-hint"><button type="button" class="ch-oauth-usage__refresh channel-action-btn" data-action="configure-management-account" data-channel-id="${channel.id}">${escapeChannelRefreshText(window.t('channels.status.configureManagement'))}</button></div>`;
+}
+
+// 冷却状态以轻量徽标排在健康度列顶部。
+function buildChannelCooldownStatusHtml(channel) {
   const statuses = [];
   const channelCooldownMS = Number(channel.cooldown_remaining_ms || 0);
   if (channelCooldownMS > 0) {
@@ -1350,43 +1384,47 @@ function buildChannelRuntimeStatusHtml(channel) {
     .filter(remainingMS => remainingMS > 0);
   if (coolingKeys.length > 0) {
     const nextRecoveryMS = Math.min(...coolingKeys);
-    const text = window.t('channels.status.keyCooldowns', {
-      count: coolingKeys.length,
-      time: formatCooldownRecoveryTime(nextRecoveryMS, 'channels.status.daysHoursUntilRecovery')
-    });
+    const text = escapeChannelRefreshText(window.t('channels.status.keyCooldowns', { count: coolingKeys.length }));
+    const timeText = escapeChannelRefreshText(formatCooldownRecoveryTime(nextRecoveryMS, 'channels.status.daysHoursUntilRecovery'));
     const label = window.t('channels.status.viewKeyCooldowns', { count: coolingKeys.length });
-    statuses.push(`<button type="button" class="ch-runtime-status ch-runtime-status--keys channel-action-btn" data-action="edit-cooling-keys" data-channel-id="${channel.id}" aria-label="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(text)}</button>`);
+    statuses.push(`<button type="button" class="ch-runtime-status ch-runtime-status--keys channel-action-btn" data-action="edit-cooling-keys" data-channel-id="${channel.id}" aria-label="${escapeChannelRefreshText(label)}"><span>${text}</span><span class="ch-runtime-status__clock">${COOLDOWN_CLOCK_ICON}</span><span>${timeText}</span></button>`);
   }
 
-  const coolingModels = (Array.isArray(channel.model_cooldowns) ? channel.model_cooldowns : [])
+  // 渠道级冷却已覆盖全部模型，模型冷却不再重复展示。
+  const coolingModels = channelCooldownMS > 0 ? [] : (Array.isArray(channel.model_cooldowns) ? channel.model_cooldowns : [])
     .map(model => Number(model?.cooldown_remaining_ms || 0))
     .filter(remainingMS => remainingMS > 0);
   if (coolingModels.length > 0) {
     const nextRecoveryMS = Math.min(...coolingModels);
-    const countText = escapeChannelRefreshText(window.t('channels.status.modelCooldownsCount', { count: coolingModels.length }));
+    const text = escapeChannelRefreshText(window.t('channels.status.modelCooldowns', { count: coolingModels.length }));
     const timeText = escapeChannelRefreshText(formatCooldownRecoveryTime(nextRecoveryMS, 'channels.status.daysHoursUntilRecovery'));
-    statuses.push(`<div class="ch-runtime-status ch-runtime-status--models"><span>${countText}</span><span class="ch-runtime-status__clock">${COOLDOWN_CLOCK_ICON}</span><span>${timeText}</span></div>`);
+    statuses.push(`<div class="ch-runtime-status ch-runtime-status--models"><span>${text}</span><span class="ch-runtime-status__clock">${COOLDOWN_CLOCK_ICON}</span><span>${timeText}</span></div>`);
   }
-
-  const protocolProbeRetryCount = Number(channel.protocol_probe_retry_count || 0);
-  const protocolProbeRetryRemainingMS = Number(channel.protocol_probe_retry_remaining_ms || 0);
-  if (protocolProbeRetryCount > 0 && protocolProbeRetryRemainingMS > 0) {
-    const text = window.t('channels.status.protocolProbeRetries', {
-      count: protocolProbeRetryCount,
-      time: formatProtocolProbeRetryTime(protocolProbeRetryRemainingMS)
-    });
-    statuses.push(`<div class="ch-runtime-status ch-runtime-status--protocols">${escapeChannelRefreshText(text)}</div>`);
-  }
-
-  const oauthUsageHtml = buildOAuthUsageStatusHtml(channel);
-  if (oauthUsageHtml) statuses.push(oauthUsageHtml);
-
-  const managementHtml = buildManagementAccountStatusHtml(channel);
-  if (managementHtml) statuses.push(managementHtml);
 
   return statuses.length > 0
-    ? `<div class="ch-runtime-status-list">${statuses.join('')}</div>`
+    ? `<div class="ch-cooldown-line">${statuses.join('')}</div>`
     : '';
+}
+
+function buildChannelProtocolProbeHtml(channel) {
+  const count = Number(channel.protocol_probe_retry_count || 0);
+  const remainingMS = Number(channel.protocol_probe_retry_remaining_ms || 0);
+  if (count <= 0 || remainingMS <= 0) return '';
+  const text = window.t('channels.status.protocolProbeRetries', {
+    count,
+    time: formatProtocolProbeRetryTime(remainingMS)
+  });
+  return `<div class="ch-runtime-status ch-runtime-status--protocols">${escapeChannelRefreshText(text)}</div>`;
+}
+
+// 健康度列：冷却、调用指标、协议重探与最近一次失败。
+function buildChannelHealthHtml(channel, stats) {
+  return [
+    buildChannelCooldownStatusHtml(channel),
+    buildChannelMetricsHtml(stats),
+    buildChannelProtocolProbeHtml(channel),
+    buildChannelLastRequestHtml(stats)
+  ].join('');
 }
 
 /**
@@ -1399,25 +1437,15 @@ function createChannelCard(channel) {
   const stats = channelStatsById[channel.id] || null;
   const batchRefreshResult = getBatchRefreshResult(channel.id);
 
-  // 一对多模型显示前两个重定向目标，悬停时显示全部目标。
-  const modelsText = formatChannelModelSummary(channel.models);
-  const modelsTitle = formatChannelModelTitle(channel.models);
-
-  const durationHtml = buildChannelTimingHtml(stats);
-  const runtimeStatusHtml = buildChannelRuntimeStatusHtml(channel);
-  const lastRequestFailureHtml = buildChannelLastRequestFailureHtml(stats);
-  const usageHtml = buildChannelUsageHtml(stats);
-
-  // 健康指示器
-  let healthHtml = '';
-  if (stats && stats.healthTimeline && stats.total > 0) {
-    const successRate = stats.total > 0 ? stats.success / stats.total : 0;
-    healthHtml = buildChannelHealthIndicator(stats.healthTimeline, successRate);
-  }
+  const quotaHtml = buildOAuthUsageStatusHtml(channel) + buildManagementAccountStatusHtml(channel)
+    || buildChannelQuotaHintHtml(channel);
+  const healthHtml = buildChannelHealthHtml(channel, stats);
+  const modelsHtml = buildChannelModelToggleHtml(channel.id, channel.models);
 
   // 行class
   const rowClasses = ['channel-table-row'];
   if (isCooldown) rowClasses.push('channel-card-cooldown');
+  if (!channel.enabled) rowClasses.push('channel-card-disabled');
   if (batchRefreshResult && batchRefreshResult.status) {
     rowClasses.push(`channel-row-refresh-${batchRefreshResult.status}`);
   }
@@ -1434,36 +1462,37 @@ function createChannelCard(channel) {
     rowClasses: rowClasses.join(' '),
     id: channel.id,
 		name: channel.name,
+    authType: channel.auth_type || 'api_key',
+    avatarHtml: window.channelAvatarContentHTML(channel.auth_type || 'api_key', channel.name),
 		nameMultiplierBadge: buildCornerMultiplierBadge(channel.cost_multiplier_min, channel.cost_multiplier_max),
     oauthPlanBadge: buildOAuthPlanBadge(channel),
     url: configuredURLs.join('\n'),
     batchRefreshStatusHtml: buildBatchRefreshStatusHtml(batchRefreshResult),
-    modelsText: modelsText,
-    modelsTitle: modelsTitle,
-    priority: channel.priority,
+    modelsHtml,
     effectivePriorityHtml: buildEffectivePriorityHtml(channel),
-    durationHtml: durationHtml,
-    usageHtml: usageHtml,
-    runtimeStatusHtml: runtimeStatusHtml,
-    lastRequestFailureHtml: lastRequestFailureHtml,
-    healthHtml: healthHtml,
+    quotaHtml,
+    healthHtml,
     enabled: channel.enabled,
     toggleTitle: channel.enabled ? window.t('channels.toggleDisable') : window.t('channels.toggleEnable'),
     toggleSwitchClass: channel.enabled ? 'channel-enable-switch--on' : 'channel-enable-switch--off',
-    durationCellClass: durationHtml ? '' : 'ch-mobile-empty',
-    usageCellClass: usageHtml ? '' : 'ch-mobile-empty',
-    lastSuccessCellClass: runtimeStatusHtml ? '' : 'ch-mobile-empty',
+    modelsCellClass: modelsHtml ? '' : 'ch-mobile-empty',
+    quotaCellClass: quotaHtml ? '' : 'ch-mobile-empty',
+    healthCellClass: healthHtml ? '' : 'ch-mobile-empty',
     mobileLabelModels: window.t('channels.table.models'),
+    mobileLabelQuota: window.t('channels.table.quota'),
+    mobileLabelHealth: window.t('channels.table.health'),
     mobileLabelPriority: window.t('channels.table.priority'),
-    mobileLabelDuration: window.t('channels.table.duration'),
-    mobileLabelUsage: window.t('channels.table.usage'),
-    mobileLabelLastSuccess: window.t('common.status'),
-    mobileLabelEnabled: window.t('channels.table.enabled'),
     mobileLabelActions: window.t('channels.table.actions')
   };
 
   const card = TemplateEngine.render('tpl-channel-card', cardData);
   return card;
+}
+
+async function editChannelManagementAccount(channelId) {
+  await editChannel(channelId);
+  if (editingChannelId !== channelId) return;
+  if (typeof revealChannelEditorSection === 'function') revealChannelEditorSection('management');
 }
 
 async function editChannelCoolingKeys(channelId) {
@@ -1513,15 +1542,22 @@ function initChannelEventDelegation() {
   container.addEventListener('input', (e) => {
     const input = e.target.closest('.ch-priority-input');
     if (!input || isTokenChannelsReadOnly()) return;
-    queueInlineChannelPrioritySave(input);
+    // 只标记脏状态：保存会重渲染列表，输入中途自动保存会夺走焦点并吞掉后续按键
+    input.classList.add('is-dirty');
   });
 
   container.addEventListener('keydown', (e) => {
+    const sortHeader = e.target.closest('th[data-sort-key]');
+    if (sortHeader && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      toggleChannelsSort(sortHeader.dataset.sortKey);
+      return;
+    }
     const input = e.target.closest('.ch-priority-input');
     if (!input || isTokenChannelsReadOnly()) return;
     if (e.key === 'Enter') {
       e.preventDefault();
-      flushInlineChannelPrioritySave(input);
+      saveInlineChannelPriority(input);
     } else if (e.key === 'Escape') {
       const originalPriority = normalizeInlinePriorityValue(input.dataset.originalPriority, 0);
       input.value = String(originalPriority);
@@ -1532,11 +1568,29 @@ function initChannelEventDelegation() {
   container.addEventListener('focusout', (e) => {
     const input = e.target.closest('.ch-priority-input');
     if (!input || isTokenChannelsReadOnly()) return;
-    flushInlineChannelPrioritySave(input);
+    saveInlineChannelPriority(input);
   });
 
   // 事件委托：处理所有渠道操作按钮
   container.addEventListener('click', (e) => {
+    const sortHeader = e.target.closest('th[data-sort-key]');
+    if (sortHeader) {
+      toggleChannelsSort(sortHeader.dataset.sortKey);
+      return;
+    }
+
+    const modelToggle = e.target.closest('.ch-model-toggle');
+    if (modelToggle) {
+      toggleChannelModelPopover(modelToggle);
+      return;
+    }
+
+    const modelChip = e.target.closest('.ch-model-chip');
+    if (modelChip) {
+      copyChannelModelName(modelChip);
+      return;
+    }
+
     const lastRequestCopyBtn = e.target.closest('.ch-last-request__copy');
     if (lastRequestCopyBtn) {
       copyChannelLastRequestFailure(lastRequestCopyBtn);
@@ -1558,7 +1612,7 @@ function initChannelEventDelegation() {
     if (!btn) return;
 
     const action = btn.dataset.action;
-    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'checkin-codebuddy', 'reset-codex-quota', 'refresh-management-balance', 'run-management-checkin', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
+    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'configure-management-account', 'refresh-oauth-usage', 'reset-anthropic-quota', 'checkin-codebuddy', 'reset-codex-quota', 'refresh-management-balance', 'run-management-checkin', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
       return;
     }
     const channelId = parseInt(btn.dataset.channelId);
@@ -1569,14 +1623,25 @@ function initChannelEventDelegation() {
       case 'edit':
         editChannel(channelId);
         break;
+      case 'toggle-oauth-usage-windows':
+        toggleOAuthUsageWindows(btn);
+        break;
       case 'edit-cooling-keys':
         editChannelCoolingKeys(channelId);
+        break;
+      case 'configure-management-account':
+        editChannelManagementAccount(channelId);
         break;
       case 'refresh-oauth-usage':
         if (typeof refreshOAuthUsage === 'function') {
           refreshOAuthUsage(channelId).catch(error => {
             if (window.showError) window.showError(error?.message || window.t('channels.oauth.usageFailed'));
           });
+        }
+        break;
+      case 'reset-anthropic-quota':
+        if (typeof confirmAnthropicQuotaReset === 'function') {
+          confirmAnthropicQuotaReset(channelId).catch(() => {});
         }
         break;
       case 'checkin-codebuddy':
@@ -1609,16 +1674,20 @@ function initChannelEventDelegation() {
         if (typeof resetCodexQuota === 'function') {
           const count = Math.max(0, Number(btn.dataset.resetCount) || 0);
           const expiry = btn.dataset.resetExpiry || window.t('channels.oauth.resetCreditExpiresUnknown');
-          const confirmed = window.confirm(window.t('channels.oauth.resetConfirm', { count, time: expiry }));
-          if (!confirmed) break;
-          resetCodexQuota(channelId).then(result => {
-            const hasWarnings = Array.isArray(result?.warnings) && result.warnings.length > 0;
-            const message = !result?.usage || hasWarnings
-              ? window.t('channels.oauth.resetSuccessNeedsRefresh')
-              : window.t('channels.oauth.resetSuccess');
-            if (window.showSuccess) window.showSuccess(message);
+          window.showConfirm({
+            message: window.t('channels.oauth.resetConfirm', { count, time: expiry }),
+            danger: true
+          }).then(confirmed => {
+            if (!confirmed) return;
+            return resetCodexQuota(channelId).then(result => {
+              const hasWarnings = Array.isArray(result?.warnings) && result.warnings.length > 0;
+              const message = !result?.usage || hasWarnings
+                ? window.t('channels.oauth.resetSuccessNeedsRefresh')
+                : window.t('channels.oauth.resetSuccess');
+              window.showSuccess(message);
+            });
           }).catch(error => {
-            if (window.showError) window.showError(error?.message || window.t('channels.oauth.resetFailed'));
+            window.showError(error?.message || window.t('channels.oauth.resetFailed'));
           });
         }
         break;
@@ -1637,20 +1706,40 @@ function initChannelEventDelegation() {
     }
   });
 
-  // 点击 details 外部时自动关闭（仅注册一次）
+  // 点击失败详情、模型弹层外部或按 Esc 时自动关闭（仅注册一次）
   if (!document._chLastRequestDetailListener) {
     document._chLastRequestDetailListener = true;
     document.addEventListener('click', (e) => {
+      if (!e.target.closest('.ch-model-picker')) closeChannelModelPopovers();
       if (e.target.closest('.ch-last-request__detail')) return;
       document.querySelectorAll('.ch-last-request__detail[open]').forEach((d) => {
         d.removeAttribute('open');
       });
     }, true);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeChannelModelPopovers();
+    });
   }
+}
+
+function buildChannelSortHeader(key, className, label) {
+  const active = channelsSort.key === key;
+  const ariaSort = active ? (channelsSort.order === 'asc' ? 'ascending' : 'descending') : 'none';
+  return `<th class="${className} sortable${active ? ' sorted' : ''}" data-sort-key="${key}"${active ? ` data-sort-order="${channelsSort.order}"` : ''} aria-sort="${ariaSort}" tabindex="0">${label}<span class="sort-indicator" aria-hidden="true"></span></th>`;
 }
 
 function renderChannels(channelsToRender = channels) {
   const el = document.getElementById('channels-container');
+  if ((!channelsToRender || channelsToRender.length === 0) && typeof channelsLoadFailed !== 'undefined' && channelsLoadFailed) {
+    el.innerHTML = `<div class="glass-card channels-load-error" role="alert">
+      <p>${window.t('channels.loadChannelsFailed')}</p>
+      <button type="button" class="btn btn-secondary btn-sm" data-action="retry-load-channels">${window.t('common.retry')}</button>
+    </div>`;
+    if (typeof updateBatchChannelSelectionUI === 'function') {
+      updateBatchChannelSelectionUI();
+    }
+    return;
+  }
   if (!channelsToRender || channelsToRender.length === 0) {
     el.innerHTML = `<div class="glass-card">${window.t('channels.noChannels')}</div>`;
     if (typeof updateBatchChannelSelectionUI === 'function') {
@@ -1666,14 +1755,12 @@ function renderChannels(channelsToRender = channels) {
   const thead = `<thead>
     <tr>
       <th class="ch-col-checkbox"><label id="visibleSelectionToggle" class="channel-selection-toggle channel-table-selection-toggle" data-i18n-title="channels.batchSelectVisible" title="全选"><input id="visibleSelectionCheckbox" type="checkbox" data-change-action="toggle-visible-channels-selection"><span id="visibleSelectionToggleText" data-i18n="channels.batchSelectVisible">全选</span></label></th>
-      <th class="ch-col-name">${window.t('channels.table.nameAndUrl')}</th>
+      ${buildChannelSortHeader('name', 'ch-col-name', window.t('channels.table.nameAndUrl'))}
       <th class="ch-col-models">${window.t('channels.table.models')}</th>
-      <th class="ch-col-priority">${window.t('channels.table.priority')}</th>
-      <th class="ch-col-duration">${window.t('channels.table.duration')}</th>
-      <th class="ch-col-usage">${window.t('channels.table.usage')}</th>
-      <th class="ch-col-last-success">${window.t('common.status')}</th>
-      <th class="ch-col-enabled">${window.t('channels.table.enabled')}</th>
-      <th class="ch-col-actions">${window.t('channels.table.actions')}</th>
+      <th class="ch-col-health">${window.t('channels.table.health')}</th>
+      <th class="ch-col-quota">${window.t('channels.table.quota')}</th>
+      ${buildChannelSortHeader('priority', 'ch-col-priority', window.t('channels.table.priority'))}
+      ${buildChannelSortHeader('enabled', 'ch-col-actions', window.t('channels.table.enabledAndActions'))}
     </tr>
   </thead>`;
 
@@ -1685,16 +1772,15 @@ function renderChannels(channelsToRender = channels) {
 
   el.innerHTML = `<div class="table-container channel-table-container"><table class="modern-table channel-table">${thead}</table></div>`;
   el.querySelector('table').appendChild(tbody);
+  if (window.i18n && window.i18n.translatePage) {
+    window.i18n.translatePage(el);
+  }
 
   // 模板渲染后设置 checkbox 选中态
   el.querySelectorAll('.channel-select-checkbox').forEach(cb => {
     cb.checked = selectedChannelIds.has(normalizeSelectedChannelID(cb.dataset.channelId));
   });
 
-  // Translate dynamically rendered elements
-  if (window.i18n && window.i18n.translatePage) {
-    window.i18n.translatePage();
-  }
 
   if (typeof updateBatchChannelSelectionUI === 'function') {
     updateBatchChannelSelectionUI();
@@ -1703,14 +1789,14 @@ function renderChannels(channelsToRender = channels) {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    uniqueChannelModelNames,
-    formatChannelModelSummary,
-    formatChannelModelTitle,
-    buildChannelRuntimeStatusHtml,
-    buildChannelUsageHtml,
-    buildOAuthPlanBadge,
-    codexPlanLabel,
+    buildChannelModelToggleHtml,
+    buildChannelModelPopoverHtml,
+    copyChannelModelName,
+    buildChannelMetricsHtml,
+    buildChannelHealthHtml,
+    buildChannelQuotaHintHtml,
     buildOAuthUsageStatusHtml,
+    toggleOAuthUsageWindows,
     buildManagementAccountStatusHtml,
     formatCooldownRecoveryTime,
     isOpenCodeGoChannel,

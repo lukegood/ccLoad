@@ -44,7 +44,30 @@
     return 'critical';
   }
 
-  function buildModel(metrics, bucketMinutes = BUCKET_MINUTES) {
+  // 进行中的范围后端只返回到当前时间的桶；返回所选范围的结束时刻（含），
+  // 供健康条把尚未到达的时间段补成灰格。历史范围已由后端补齐，返回 null。
+  function rangeEndMs(rangeKey, customRange, nowMs = Date.now()) {
+    const now = new Date(nowMs);
+    switch (rangeKey || 'today') {
+      case 'today':
+        return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime() - 1;
+      case 'this_week': {
+        // 周一为一周起点，与后端 beginningOfWeek 一致
+        const daysUntilNextMonday = 7 - ((now.getDay() + 6) % 7);
+        return new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysUntilNextMonday).getTime() - 1;
+      }
+      case 'this_month':
+        return new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime() - 1;
+      case 'custom': {
+        const endMs = Number(customRange && customRange.endMs);
+        return Number.isFinite(endMs) ? endMs : null;
+      }
+      default:
+        return null;
+    }
+  }
+
+  function buildModel(metrics, bucketMinutes = BUCKET_MINUTES, untilMs = null) {
     const safeBucketMinutes = Number.isFinite(Number(bucketMinutes)) && Number(bucketMinutes) > 0
       ? Math.trunc(Number(bucketMinutes))
       : BUCKET_MINUTES;
@@ -57,33 +80,44 @@
       if (timestamp === null) continue;
       const bucketTs = Math.floor(timestamp / bucketMs) * bucketMs;
 
-      const current = totalsByBucket.get(bucketTs) || { success: 0, error: 0 };
+      const current = totalsByBucket.get(bucketTs) || { success: 0, error: 0, rateLimited: 0 };
       current.success += toCount(metric.success);
       current.error += toCount(metric.error);
+      current.rateLimited += toCount(metric.rate_limited);
       totalsByBucket.set(bucketTs, current);
       startBucketMs = Math.min(startBucketMs, bucketTs);
       endBucketMs = Math.max(endBucketMs, bucketTs);
     }
 
+    // 后端补齐到当前时间，之后补出的桶尚未到达
+    const lastReturnedBucketMs = endBucketMs;
+    if (totalsByBucket.size > 0 && untilMs !== null && Number.isFinite(Number(untilMs))) {
+      endBucketMs = Math.max(endBucketMs, Math.floor(Number(untilMs) / bucketMs) * bucketMs);
+    }
+
     let success = 0;
     let error = 0;
+    let rateLimited = 0;
     const pointCount = totalsByBucket.size === 0
       ? 0
       : Math.floor((endBucketMs - startBucketMs) / bucketMs) + 1;
     const points = new Array(pointCount);
     for (let index = 0; index < pointCount; index += 1) {
       const ts = startBucketMs + index * bucketMs;
-      const counts = totalsByBucket.get(ts) || { success: 0, error: 0 };
+      const counts = totalsByBucket.get(ts) || { success: 0, error: 0, rateLimited: 0 };
       const total = counts.success + counts.error;
       const rate = total > 0 ? counts.success / total : null;
       success += counts.success;
       error += counts.error;
+      rateLimited += counts.rateLimited;
       points[index] = {
         ts,
         success: counts.success,
         error: counts.error,
+        rateLimited: counts.rateLimited,
         rate,
-        state: classifyRate(rate)
+        state: classifyRate(rate),
+        pending: ts > lastReturnedBucketMs
       };
     }
 
@@ -93,6 +127,7 @@
       points,
       success,
       error,
+      rateLimited,
       rate,
       state: classifyRate(rate),
       bucketMs,
@@ -104,6 +139,7 @@
     BUCKET_MINUTES,
     buildRequest,
     buildModel,
-    classifyRate
+    classifyRate,
+    rangeEndMs
   };
 });
